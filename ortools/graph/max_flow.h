@@ -541,7 +541,7 @@ class GenericMaxFlow : public MaxFlowStatusClass {
   void ComputeReachableNodes(NodeIndex start, std::vector<NodeIndex>* result);
 
   // Maximum manageable flow.
-  static const FlowQuantity kMaxFlowQuantity;
+  //static const FlowQuantity kMaxFlowQuantity;
 
   // A pointer to the graph passed as argument.
   const Graph* graph_;

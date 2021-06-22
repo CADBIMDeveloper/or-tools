@@ -333,46 +333,7 @@ std::string GenericMaxFlow<Graph>::DebugString(const std::string& context,
 template <typename Graph>
 bool GenericMaxFlow<Graph>::Solve() {
   status_ = NOT_SOLVED;
-  if (check_input_ && !CheckInputConsistency()) {
-    status_ = BAD_INPUT;
-    return false;
-  }
-  InitializePreflow();
-
-  // Deal with the case when source_ or sink_ is not inside graph_.
-  // Since they are both specified independently of the graph, we do need to
-  // take care of this corner case.
-  const NodeIndex num_nodes = graph_->num_nodes();
-  if (sink_ >= num_nodes || source_ >= num_nodes) {
-    // Behave like a normal graph where source_ and sink_ are disconnected.
-    // Note that the arc flow is set to 0 by InitializePreflow().
-    status_ = OPTIMAL;
-    return true;
-  }
-  if (use_global_update_) {
-    RefineWithGlobalUpdate();
-  } else {
-    Refine();
-  }
-  if (check_result_) {
-    if (!CheckResult()) {
-      status_ = BAD_RESULT;
-      return false;
-    }
-    if (GetOptimalFlow() < kMaxFlowQuantity && AugmentingPathExists()) {
-      LOG(ERROR) << "The algorithm terminated, but the flow is not maximal!";
-      status_ = BAD_RESULT;
-      return false;
-    }
-  }
-  DCHECK_EQ(node_excess_[sink_], -node_excess_[source_]);
-  status_ = OPTIMAL;
-  if (GetOptimalFlow() == kMaxFlowQuantity && AugmentingPathExists()) {
-    // In this case, we are sure that the flow is > kMaxFlowQuantity.
-    status_ = INT_OVERFLOW;
-  }
-  IF_STATS_ENABLED(VLOG(1) << stats_.StatString());
-  return true;
+  return false;
 }
 
 template <typename Graph>
@@ -673,45 +634,46 @@ void GenericMaxFlow<Graph>::GlobalUpdate() {
 
 template <typename Graph>
 bool GenericMaxFlow<Graph>::SaturateOutgoingArcsFromSource() {
-  SCOPED_TIME_STAT(&stats_);
-  const NodeIndex num_nodes = graph_->num_nodes();
+	return false;
+  // SCOPED_TIME_STAT(&stats_);
+  // const NodeIndex num_nodes = graph_->num_nodes();
 
-  // If sink_ or source_ already have kMaxFlowQuantity, then there is no
-  // point pushing more flow since it will cause an integer overflow.
-  if (node_excess_[sink_] == kMaxFlowQuantity) return false;
-  if (node_excess_[source_] == -kMaxFlowQuantity) return false;
+  // // If sink_ or source_ already have kMaxFlowQuantity, then there is no
+  // // point pushing more flow since it will cause an integer overflow.
+  // if (node_excess_[sink_] == kMaxFlowQuantity) return false;
+  // if (node_excess_[source_] == -kMaxFlowQuantity) return false;
 
-  bool flow_pushed = false;
-  for (OutgoingArcIterator it(*graph_, source_); it.Ok(); it.Next()) {
-    const ArcIndex arc = it.Index();
-    const FlowQuantity flow = residual_arc_capacity_[arc];
+  // bool flow_pushed = false;
+  // for (OutgoingArcIterator it(*graph_, source_); it.Ok(); it.Next()) {
+    // const ArcIndex arc = it.Index();
+    // const FlowQuantity flow = residual_arc_capacity_[arc];
 
-    // This is a special IsAdmissible() condition for the source.
-    if (flow == 0 || node_potential_[Head(arc)] >= num_nodes) continue;
+    // // This is a special IsAdmissible() condition for the source.
+    // if (flow == 0 || node_potential_[Head(arc)] >= num_nodes) continue;
 
-    // We are careful in case the sum of the flow out of the source is greater
-    // than kMaxFlowQuantity to avoid overflow.
-    const FlowQuantity current_flow_out_of_source = -node_excess_[source_];
-    DCHECK_GE(flow, 0) << flow;
-    DCHECK_GE(current_flow_out_of_source, 0) << current_flow_out_of_source;
-    const FlowQuantity capped_flow =
-        kMaxFlowQuantity - current_flow_out_of_source;
-    if (capped_flow < flow) {
-      // We push as much flow as we can so the current flow on the network will
-      // be kMaxFlowQuantity.
+    // // We are careful in case the sum of the flow out of the source is greater
+    // // than kMaxFlowQuantity to avoid overflow.
+    // const FlowQuantity current_flow_out_of_source = -node_excess_[source_];
+    // DCHECK_GE(flow, 0) << flow;
+    // DCHECK_GE(current_flow_out_of_source, 0) << current_flow_out_of_source;
+    // const FlowQuantity capped_flow =
+        // kMaxFlowQuantity - current_flow_out_of_source;
+    // if (capped_flow < flow) {
+      // // We push as much flow as we can so the current flow on the network will
+      // // be kMaxFlowQuantity.
 
-      // Since at the beginning of the function, current_flow_out_of_source
-      // was different from kMaxFlowQuantity, we are sure to have pushed some
-      // flow before if capped_flow is 0.
-      if (capped_flow == 0) return true;
-      PushFlow(capped_flow, arc);
-      return true;
-    }
-    PushFlow(flow, arc);
-    flow_pushed = true;
-  }
-  DCHECK_LE(node_excess_[source_], 0);
-  return flow_pushed;
+      // // Since at the beginning of the function, current_flow_out_of_source
+      // // was different from kMaxFlowQuantity, we are sure to have pushed some
+      // // flow before if capped_flow is 0.
+      // if (capped_flow == 0) return true;
+      // PushFlow(capped_flow, arc);
+      // return true;
+    // }
+    // PushFlow(flow, arc);
+    // flow_pushed = true;
+  // }
+  // DCHECK_LE(node_excess_[source_], 0);
+  // return flow_pushed;
 }
 
 template <typename Graph>
@@ -923,9 +885,9 @@ bool GenericMaxFlow<Graph>::IsArcValid(ArcIndex arc) const {
   return Graphs<Graph>::IsArcValid(*graph_, arc);
 }
 
-template <typename Graph>
-const FlowQuantity GenericMaxFlow<Graph>::kMaxFlowQuantity =
-    std::numeric_limits<FlowQuantity>::max();
+// template <typename Graph>
+// const FlowQuantity GenericMaxFlow<Graph>::kMaxFlowQuantity =
+    // std::numeric_limits<FlowQuantity>::max();
 
 template <typename Graph>
 template <bool reverse>
