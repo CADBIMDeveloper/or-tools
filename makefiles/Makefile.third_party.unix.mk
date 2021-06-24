@@ -247,7 +247,6 @@ PROTOBUF_LNK = $(STATIC_PROTOBUF_LNK)
 DEPENDENCIES_INC += $(PROTOBUF_INC)
 SWIG_INC += $(PROTOBUF_SWIG)
 DEPENDENCIES_LNK += $(PROTOBUF_LNK)
-OR_TOOLS_LNK += $(PROTOBUF_LNK)
 
 # Define Protoc
 ifeq ($(PLATFORM),LINUX)
@@ -606,7 +605,6 @@ COIN_LNK = \
 DEPENDENCIES_INC += $(COIN_INC)
 SWIG_INC += $(COIN_SWIG)
 DEPENDENCIES_LNK += $(COIN_LNK)
-OR_TOOLS_LNK += $(COIN_LNK)
 endif  # USE_COINOR
 
 #########################
@@ -623,34 +621,31 @@ install_scip: dependencies/install/lib/libscip.a $(GEN_DIR)/ortools/linear_solve
 
 SCIP_SRCDIR = dependencies/sources/scip-$(SCIP_TAG)
 dependencies/install/lib/libscip.a: $(SCIP_SRCDIR)
-ifeq ($(PLATFORM),LINUX)
 	cd $(SCIP_SRCDIR) && \
-	$(SET_COMPILER) make install \
-		GMP=false \
-		ZIMPL=false \
-		READLINE=false \
-		TPI=tny \
-		LPS=none \
-		USRCFLAGS="-fPIC" \
-		USRCXXFLAGS="-fPIC" \
-		USRCPPFLAGS="-fPIC" \
-		PARASCIP=false \
-		INSTALLDIR="$(OR_TOOLS_TOP)/dependencies/install"
-endif
-ifeq ($(PLATFORM),MACOSX)
-	cd $(SCIP_SRCDIR) && \
-	$(SET_COMPILER) make install \
-		GMP=false \
-		ZIMPL=false \
-		READLINE=false \
-		TPI=tny \
-		LPS=none \
-		USRCFLAGS="$(MAC_VERSION)" \
-		USRCXXFLAGS="$(MAC_VERSION)" \
-		USRCPPFLAGS="$(MAC_VERSION)" \
-		INSTALLDIR="$(OR_TOOLS_TOP)/dependencies/install"
-endif
-	ar d "$(OR_TOOLS_TOP)"/dependencies/install/lib/liblpinone.a lpi_none.o
+	$(SET_COMPILER) $(CMAKE) -H. -Bbuild_cmake \
+    -DCMAKE_PREFIX_PATH="$(OR_TOOLS_TOP)/dependencies/install" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_STANDARD=17 \
+    -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+    -DCMAKE_CXX_EXTENSIONS=OFF \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DSHARED=OFF \
+    -DBUILD_STATIC_LIBS=ON \
+    -DBUILD_TESTING=OFF \
+    -DCMAKE_CXX_FLAGS="$(MAC_VERSION)" \
+    -DREADLINE=OFF \
+    -DGMP=OFF \
+    -DPAPILO=OFF \
+    -DZIMPL=OFF \
+    -DIPOPT=OFF \
+    -DTPI="tny" \
+    -DEXPRINT="none" \
+    -DLPS="none" \
+    -DSYM="none" \
+    -DCMAKE_INSTALL_PREFIX=../../install && \
+  $(CMAKE) --build build_cmake --config Release -v -- -j4 && \
+  $(CMAKE) --build build_cmake --config Release --target install
 
 $(SCIP_SRCDIR): | dependencies/sources
 	-$(DELREC) $(SCIP_SRCDIR)
@@ -663,18 +658,7 @@ $(GEN_DIR)/ortools/linear_solver/lpi_glop.cc: $(SCIP_SRCDIR) | $(GEN_DIR)/ortool
 
 SCIP_INC = -I$(UNIX_SCIP_DIR)/include -DUSE_SCIP -DNO_CONFIG_HEADER
 SCIP_SWIG = $(SCIP_INC)
-ifeq ($(PLATFORM),LINUX)
-SCIP_LNK = \
-$(UNIX_SCIP_DIR)/lib/libscip.a \
-$(UNIX_SCIP_DIR)/lib/libnlpi.cppad.a \
-$(UNIX_SCIP_DIR)/lib/libtpitny-7.0.1.linux.x86_64.gnu.opt.a
-endif
-ifeq ($(PLATFORM),MACOSX)
-SCIP_LNK = \
-$(UNIX_SCIP_DIR)/lib/libscip.a \
-$(UNIX_SCIP_DIR)/lib/libnlpi.cppad.a \
-$(UNIX_SCIP_DIR)/lib/libtpitny-7.0.1.darwin.x86_64.gnu.opt.a
-endif
+SCIP_LNK = $(UNIX_SCIP_DIR)/lib/libscip.a
 
 DEPENDENCIES_INC += $(SCIP_INC)
 SWIG_INC += $(SCIP_SWIG)
