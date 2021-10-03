@@ -39,6 +39,47 @@ bool VariablesInfo::LoadBoundsAndReturnTrueIfUnchanged(
   return false;
 }
 
+bool VariablesInfo::LoadBoundsAndReturnTrueIfUnchanged(
+    const DenseRow& variable_lower_bounds,
+    const DenseRow& variable_upper_bounds,
+    const DenseColumn& constraint_lower_bounds,
+    const DenseColumn& constraint_upper_bounds) {
+  const ColIndex num_cols = matrix_.num_cols();
+  const ColIndex num_variables = variable_upper_bounds.size();
+  const RowIndex num_rows = constraint_lower_bounds.size();
+
+  bool is_unchanged = (num_cols == lower_bounds_.size());
+  DCHECK_EQ(num_cols, num_variables + RowToColIndex(num_rows));
+  lower_bounds_.resize(num_cols, 0.0);
+  upper_bounds_.resize(num_cols, 0.0);
+  variable_type_.resize(num_cols, VariableType::FIXED_VARIABLE);
+
+  // Copy bounds of the variables.
+  for (ColIndex col(0); col < num_variables; ++col) {
+    if (lower_bounds_[col] != variable_lower_bounds[col] ||
+        upper_bounds_[col] != variable_upper_bounds[col]) {
+      lower_bounds_[col] = variable_lower_bounds[col];
+      upper_bounds_[col] = variable_upper_bounds[col];
+      is_unchanged = false;
+      variable_type_[col] = ComputeVariableType(col);
+    }
+  }
+
+  // Copy bounds of the slack.
+  for (RowIndex row(0); row < num_rows; ++row) {
+    const ColIndex col = num_variables + RowToColIndex(row);
+    if (lower_bounds_[col] != -constraint_upper_bounds[row] ||
+        upper_bounds_[col] != -constraint_lower_bounds[row]) {
+      lower_bounds_[col] = -constraint_upper_bounds[row];
+      upper_bounds_[col] = -constraint_lower_bounds[row];
+      is_unchanged = false;
+      variable_type_[col] = ComputeVariableType(col);
+    }
+  }
+
+  return is_unchanged;
+}
+
 void VariablesInfo::ResetStatusInfo() {
   const ColIndex num_cols = matrix_.num_cols();
   DCHECK_EQ(num_cols, lower_bounds_.size());
@@ -66,9 +107,7 @@ void VariablesInfo::InitializeFromBasisState(ColIndex first_slack_col,
                                              const BasisState& state) {
   ResetStatusInfo();
 
-  RowIndex num_basic_variables(0);
   const ColIndex num_cols = lower_bounds_.size();
-  const RowIndex num_rows = ColToRowIndex(num_cols - first_slack_col);
   DCHECK_LE(num_new_cols, first_slack_col);
   const ColIndex first_new_col(first_slack_col - num_new_cols);
 
@@ -90,21 +129,12 @@ void VariablesInfo::InitializeFromBasisState(ColIndex first_slack_col,
     // Remove incompatibilities between the warm status and the current state.
     switch (status) {
       case VariableStatus::BASIC:
-        // Do not allow more than num_rows VariableStatus::BASIC variables.
-        if (num_basic_variables == num_rows) {
-          VLOG(1) << "Too many basic variables in the warm-start basis."
-                  << "Only keeping the first ones as VariableStatus::BASIC.";
-          UpdateToNonBasicStatus(col, DefaultVariableStatus(col));
-        } else {
-          ++num_basic_variables;
-
-          // Because we just called ResetStatusInfo(), we optimize the call to
-          // UpdateToNonBasicStatus(col) here. In an incremental setting with
-          // almost no work per call, the update of all the DenseBitRow are
-          // visible.
-          variable_status_[col] = VariableStatus::BASIC;
-          is_basic_.Set(col, true);
-        }
+        // Because we just called ResetStatusInfo(), we optimize the call to
+        // UpdateToNonBasicStatus(col) here. In an incremental setting with
+        // almost no work per call, the update of all the DenseBitRow are
+        // visible.
+        variable_status_[col] = VariableStatus::BASIC;
+        is_basic_.Set(col, true);
         break;
       case VariableStatus::AT_LOWER_BOUND:
         if (lower_bounds_[col] == upper_bounds_[col]) {
@@ -128,6 +158,53 @@ void VariablesInfo::InitializeFromBasisState(ColIndex first_slack_col,
         UpdateToNonBasicStatus(col, DefaultVariableStatus(col));
     }
   }
+}
+
+int VariablesInfo::ChangeUnusedBasicVariablesToFree(
+    const RowToColMapping& basis) {
+  const ColIndex num_cols = lower_bounds_.size();
+  is_basic_.ClearAndResize(num_cols);
+  for (const ColIndex col : basis) {
+    UpdateToBasicStatus(col);
+  }
+  int num_no_longer_in_basis = 0;
+  for (ColIndex col(0); col < num_cols; ++col) {
+    if (!is_basic_[col] && variable_status_[col] == VariableStatus::BASIC) {
+      ++num_no_longer_in_basis;
+      if (variable_type_[col] == VariableType::FIXED_VARIABLE) {
+        UpdateToNonBasicStatus(col, VariableStatus::FIXED_VALUE);
+      } else {
+        UpdateToNonBasicStatus(col, VariableStatus::FREE);
+      }
+    }
+  }
+  return num_no_longer_in_basis;
+}
+
+int VariablesInfo::SnapFreeVariablesToBound(Fractional distance,
+                                            const DenseRow& starting_values) {
+  int num_changes = 0;
+  const ColIndex num_cols = lower_bounds_.size();
+  for (ColIndex col(0); col < num_cols; ++col) {
+    if (variable_status_[col] != VariableStatus::FREE) continue;
+    if (variable_type_[col] == VariableType::UNCONSTRAINED) continue;
+    const Fractional value =
+        col < starting_values.size() ? starting_values[col] : 0.0;
+    const Fractional diff_ub = upper_bounds_[col] - value;
+    const Fractional diff_lb = value - lower_bounds_[col];
+    if (diff_lb <= diff_ub) {
+      if (diff_lb <= distance) {
+        ++num_changes;
+        UpdateToNonBasicStatus(col, VariableStatus::AT_LOWER_BOUND);
+      }
+    } else {
+      if (diff_ub <= distance) {
+        ++num_changes;
+        UpdateToNonBasicStatus(col, VariableStatus::AT_UPPER_BOUND);
+      }
+    }
+  }
+  return num_changes;
 }
 
 void VariablesInfo::InitializeToDefaultStatus() {

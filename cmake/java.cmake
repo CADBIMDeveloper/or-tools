@@ -125,7 +125,7 @@ endforeach()
 ##  Java Native Maven Package  ##
 #################################
 set(JAVA_NATIVE_PROJECT_PATH ${PROJECT_BINARY_DIR}/java/${JAVA_NATIVE_PROJECT})
-file(MAKE_DIRECTORY ${JAVA_NATIVE_PROJECT_PATH}/${JAVA_RESOURCES_PATH}/${NATIVE_IDENTIFIER})
+file(MAKE_DIRECTORY ${JAVA_NATIVE_PROJECT_PATH}/${JAVA_RESOURCES_PATH}/${JAVA_NATIVE_PROJECT})
 
 configure_file(
   ${PROJECT_SOURCE_DIR}/ortools/java/pom-native.xml.in
@@ -138,7 +138,7 @@ add_custom_target(java_native_package
   COMMAND ${CMAKE_COMMAND} -E copy
     $<TARGET_FILE:jniortools>
     $<$<NOT:$<PLATFORM_ID:Windows>>:$<TARGET_SONAME_FILE:${PROJECT_NAME}>>
-    ${JAVA_RESOURCES_PATH}/${NATIVE_IDENTIFIER}/
+    ${JAVA_RESOURCES_PATH}/${JAVA_NATIVE_PROJECT}/
   COMMAND ${MAVEN_EXECUTABLE} compile -B
   COMMAND ${MAVEN_EXECUTABLE} package -B
   COMMAND ${MAVEN_EXECUTABLE} install -B $<$<BOOL:${SKIP_GPG}>:-Dgpg.skip=true>
@@ -234,7 +234,7 @@ endif()
 # e.g.:
 # add_java_sample(Foo.java)
 function(add_java_sample FILE_NAME)
-  message(STATUS "Building ${FILE_NAME}: ...")
+  message(STATUS "Configuring sample ${FILE_NAME}: ...")
   get_filename_component(SAMPLE_NAME ${FILE_NAME} NAME_WE)
   get_filename_component(SAMPLE_DIR ${FILE_NAME} DIRECTORY)
   get_filename_component(COMPONENT_DIR ${SAMPLE_DIR} DIRECTORY)
@@ -268,8 +268,7 @@ function(add_java_sample FILE_NAME)
       COMMAND ${MAVEN_EXECUTABLE} exec:java
       WORKING_DIRECTORY ${SAMPLE_PATH})
   endif()
-
-  message(STATUS "Building ${FILE_NAME}: ...DONE")
+  message(STATUS "Configuring sample ${FILE_NAME}: ...DONE")
 endfunction()
 
 # add_java_example()
@@ -279,7 +278,7 @@ endfunction()
 # e.g.:
 # add_java_example(Foo.java)
 function(add_java_example FILE_NAME)
-  message(STATUS "Building ${FILE_NAME}: ...")
+  message(STATUS "Configuring example ${FILE_NAME}: ...")
   get_filename_component(EXAMPLE_NAME ${FILE_NAME} NAME_WE)
   get_filename_component(COMPONENT_DIR ${FILE_NAME} DIRECTORY)
   get_filename_component(COMPONENT_NAME ${COMPONENT_DIR} NAME)
@@ -311,8 +310,7 @@ function(add_java_example FILE_NAME)
       COMMAND ${MAVEN_EXECUTABLE} exec:java
       WORKING_DIRECTORY ${EXAMPLE_PATH})
   endif()
-
-  message(STATUS "Building ${FILE_NAME}: ...DONE")
+  message(STATUS "Configuring example ${FILE_NAME}: ...DONE")
 endfunction()
 
 # add_java_test()
@@ -322,7 +320,7 @@ endfunction()
 # e.g.:
 # add_java_test(Foo.java)
 function(add_java_test FILE_NAME)
-  message(STATUS "Building ${FILE_NAME}: ...")
+  message(STATUS "Configuring test ${FILE_NAME}: ...")
   get_filename_component(TEST_NAME ${FILE_NAME} NAME_WE)
   get_filename_component(COMPONENT_DIR ${FILE_NAME} DIRECTORY)
   get_filename_component(COMPONENT_NAME ${COMPONENT_DIR} NAME)
@@ -352,6 +350,5 @@ function(add_java_test FILE_NAME)
       COMMAND ${MAVEN_EXECUTABLE} test
       WORKING_DIRECTORY ${TEST_PATH})
   endif()
-
-  message(STATUS "Building ${FILE_NAME}: ...DONE")
+  message(STATUS "Configuring test ${FILE_NAME}: ...DONE")
 endfunction()

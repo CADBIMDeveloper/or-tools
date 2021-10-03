@@ -60,7 +60,7 @@ DEFINE_INT_TYPE(IntegerValue, int64_t);
 //
 // It is symmetric so the set of possible ranges stays the same when we take the
 // negation of a variable. Moreover, we need some IntegerValue that fall outside
-// this range on both side so that we can usally take care of integer overflow
+// this range on both side so that we can usually take care of integer overflow
 // by simply doing "saturated arithmetic" and if one of the bound overflow, the
 // two bounds will "cross" each others and we will get an empty range.
 constexpr IntegerValue kMaxIntegerValue(
@@ -98,8 +98,11 @@ inline IntegerValue FloorRatio(IntegerValue dividend,
 }
 
 // Returns dividend - FloorRatio(dividend, divisor) * divisor;
-// This function should be faster thant the computation above and never causes
-// integer overflow.
+//
+// This function is around the same speed than the computation above, but it
+// never causes integer overflow. Note also that when calling FloorRatio() then
+// PositiveRemainder(), the compiler should optimize the modulo away and just
+// reuse the one from the first integer division.
 inline IntegerValue PositiveRemainder(IntegerValue dividend,
                                       IntegerValue positive_divisor) {
   DCHECK_GT(positive_divisor, 0);
@@ -144,6 +147,12 @@ inline IntegerVariable PositiveVariable(IntegerVariable i) {
 DEFINE_INT_TYPE(PositiveOnlyIndex, int32_t);
 inline PositiveOnlyIndex GetPositiveOnlyIndex(IntegerVariable var) {
   return PositiveOnlyIndex(var.value() / 2);
+}
+
+inline std::string IntegerTermDebugString(IntegerVariable var,
+                                          IntegerValue coeff) {
+  coeff = VariableIsPositive(var) ? coeff : -coeff;
+  return absl::StrCat(coeff.value(), "*X", var.value() / 2);
 }
 
 // Returns the vector of the negated variables.
@@ -201,6 +210,7 @@ inline std::ostream& operator<<(std::ostream& os, IntegerLiteral i_lit) {
 }
 
 using InlinedIntegerLiteralVector = absl::InlinedVector<IntegerLiteral, 2>;
+class IntegerTrail;
 
 // Represents [coeff * variable + constant] or just a [constant].
 //
@@ -234,11 +244,26 @@ struct AffineExpression {
     return var == o.var && coeff == o.coeff && constant == o.constant;
   }
 
+  // Getters on the bounds of the affine expression.
+  IntegerValue Min(IntegerTrail* integer_trail) const;
+  IntegerValue Max(IntegerTrail* integer_trail) const;
+  bool IsFixed(IntegerTrail* integer_trail) const;
+
   // Returns the affine expression value under a given LP solution.
   double LpValue(
       const absl::StrongVector<IntegerVariable, double>& lp_values) const {
     if (var == kNoIntegerVariable) return ToDouble(constant);
     return ToDouble(coeff) * lp_values[var] + ToDouble(constant);
+  }
+
+  const std::string DebugString() const {
+    if (var == kNoIntegerVariable) return absl::StrCat(constant.value());
+    if (constant == 0) {
+      return absl::StrCat("(", coeff.value(), " * X", var.value(), ")");
+    } else {
+      return absl::StrCat("(", coeff.value(), " * X", var.value(), " + ",
+                          constant.value(), ")");
+    }
   }
 
   // The coefficient MUST be positive. Use NegationOf(var) if needed.
@@ -336,6 +361,10 @@ class IntegerEncoder {
   // span the full domain of the given variable (but it might).
   std::vector<ValueLiteralPair> PartialDomainEncoding(
       IntegerVariable var) const;
+
+  // Raw encoding. May be incomplete and is not sorted. Contains all literals,
+  // true or false.
+  std::vector<ValueLiteralPair> RawDomainEncoding(IntegerVariable var) const;
 
   // Returns the "canonical" (i_lit, negation of i_lit) pair. This mainly
   // deal with domain with initial hole like [1,2][5,6] so that if one ask
@@ -480,7 +509,7 @@ class IntegerEncoder {
   // Arguments:
   //  - map is just encoding_by_var_[associated_lit.var] and is passed as a
   //    slight optimization.
-  //  - 'it' is the current position of associated_lit in map, i.e we must have
+  //  - 'it' is the current position of associated_lit in map, i.e. we must have
   //    it->second == associated_lit.
   void AddImplications(const std::map<IntegerValue, Literal>& map,
                        std::map<IntegerValue, Literal>::const_iterator it,
@@ -675,6 +704,11 @@ class IntegerTrail : public SatPropagator {
 
   // Returns true if the variable is fixed at level 0.
   bool IsFixedAtLevelZero(IntegerVariable var) const;
+
+  // Advanced usage.
+  // Returns the current lower bound assuming the literal is true.
+  IntegerValue ConditionalLowerBound(Literal l, IntegerVariable i) const;
+  IntegerValue ConditionalLowerBound(Literal l, AffineExpression expr) const;
 
   // Advanced usage. Given the reason for
   // (Sum_i coeffs[i] * reason[i].var >= current_lb) initially in reason,
@@ -937,7 +971,7 @@ class IntegerTrail : public SatPropagator {
     // The current bound on this variable.
     IntegerValue current_bound;
 
-    // Trail index of the last TrailEntry in the trail refering to this var.
+    // Trail index of the last TrailEntry in the trail referring to this var.
     int current_trail_index;
   };
   absl::StrongVector<IntegerVariable, VarInfo> vars_;
@@ -1057,6 +1091,12 @@ class IntegerTrail : public SatPropagator {
   IntegerEncoder* encoder_;
   Trail* trail_;
   const SatParameters& parameters_;
+
+  // Temporary "hash" to keep track of all the conditional enqueue that were
+  // done. Note that we currently do not keep any reason for them, and as such,
+  // we can only use this in heuristics. See ConditionalLowerBound().
+  absl::flat_hash_map<std::pair<LiteralIndex, IntegerVariable>, IntegerValue>
+      conditional_lbs_;
 
   DISALLOW_COPY_AND_ASSIGN(IntegerTrail);
 };
@@ -1314,14 +1354,26 @@ inline bool IntegerTrail::IsFixed(IntegerVariable i) const {
   return vars_[i].current_bound == -vars_[NegationOf(i)].current_bound;
 }
 
-// TODO(user): Use capped arithmetic? It might be slow though and we better just
-// make sure there is no overflow at model creation.
 inline IntegerValue IntegerTrail::LowerBound(AffineExpression expr) const {
   if (expr.var == kNoIntegerVariable) return expr.constant;
   return LowerBound(expr.var) * expr.coeff + expr.constant;
 }
 
-// TODO(user): Use capped arithmetic? same remark as for LowerBound().
+inline IntegerValue IntegerTrail::ConditionalLowerBound(
+    Literal l, IntegerVariable i) const {
+  const auto it = conditional_lbs_.find({l.Index(), i});
+  if (it != conditional_lbs_.end()) {
+    return std::max(vars_[i].current_bound, it->second);
+  }
+  return vars_[i].current_bound;
+}
+
+inline IntegerValue IntegerTrail::ConditionalLowerBound(
+    Literal l, AffineExpression expr) const {
+  if (expr.var == kNoIntegerVariable) return expr.constant;
+  return ConditionalLowerBound(l, expr.var) * expr.coeff + expr.constant;
+}
+
 inline IntegerValue IntegerTrail::UpperBound(AffineExpression expr) const {
   if (expr.var == kNoIntegerVariable) return expr.constant;
   return UpperBound(expr.var) * expr.coeff + expr.constant;

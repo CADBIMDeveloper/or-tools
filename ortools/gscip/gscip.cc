@@ -41,6 +41,7 @@
 #include "ortools/linear_solver/scip_helper_macros.h"
 #include "ortools/port/proto_utils.h"
 #include "scip/cons_linear.h"
+#include "scip/cons_quadratic.h"
 #include "scip/scip.h"
 #include "scip/scip_general.h"
 #include "scip/scip_param.h"
@@ -785,8 +786,8 @@ absl::StatusOr<GScipResult> GScip::Solve(
   // handler.
   using internal::CaptureMessageHandlerPtr;
   using internal::MessageHandlerPtr;
-  MessageHandlerPtr previous_handler = CaptureMessageHandlerPtr(nullptr);
-  MessageHandlerPtr new_handler = CaptureMessageHandlerPtr(nullptr);
+  MessageHandlerPtr previous_handler;
+  MessageHandlerPtr new_handler;
   if (message_handler != nullptr) {
     previous_handler = CaptureMessageHandlerPtr(SCIPgetMessagehdlr(scip_));
     ASSIGN_OR_RETURN(new_handler,

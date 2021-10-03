@@ -105,7 +105,7 @@ void DeleteVectorIndices(const std::vector<int>& indices, Vector* v) {
 }
 
 // In the Fu & Malik algorithm (or in WPM1), when two cores overlap, we
-// artifically introduce symmetries. More precisely:
+// artificially introduce symmetries. More precisely:
 //
 // The picture below shows two cores with index 0 and 1, with one blocking
 // variable per '-' and with the variables ordered from left to right (by their
@@ -224,6 +224,7 @@ void MinimizeCoreWithPropagation(TimeLimit* limit, SatSolver* solver,
 
   solver->Backtrack(0);
   solver->SetAssumptionLevel(0);
+  if (!solver->FinishPropagation()) return;
   while (!limit->LimitReached()) {
     // We want each literal in candidate to appear last once in our propagation
     // order. We want to do that while maximizing the reutilization of the
@@ -700,7 +701,7 @@ SatSolver::Status SolveWithWPM1(LogBehavior log,
         // If the soft clause protected by old_a has a cost greater than
         // min_cost then:
         // - its cost is disminished by min_cost.
-        // - an identical clause with cost min_cost is artifically added to
+        // - an identical clause with cost min_cost is artificially added to
         //   the problem.
         CHECK_GE(costs[index], min_cost);
         if (costs[index] == min_cost) {
@@ -1223,7 +1224,7 @@ SatSolver::Status FindCores(std::vector<Literal> assumptions,
     if (sat_solver->parameters().minimize_core()) {
       MinimizeCoreWithPropagation(limit, sat_solver, &core);
     }
-    CHECK(!core.empty());
+    if (core.empty()) return sat_solver->UnsatStatus();
     cores->push_back(core);
     if (!sat_solver->parameters().find_multiple_cores()) break;
 
@@ -1661,7 +1662,7 @@ SatSolver::Status CoreBasedOptimizer::Optimize() {
 
     // Solve under the assumptions.
     //
-    // TODO(user): If the "search" is interupted while computing cores, we
+    // TODO(user): If the "search" is interrupted while computing cores, we
     // currently do not resume it flawlessly. We however add any cores we found
     // before aborting.
     std::vector<std::vector<Literal>> cores;

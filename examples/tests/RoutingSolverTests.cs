@@ -141,7 +141,7 @@ namespace Google.OrTools.Tests
             // Create Routing Model.
             RoutingModel routing = new RoutingModel(manager);
             // Create a distance callback.
-            long[] vector = { 1, 1, 1, 1, 1 };
+            long[] vector = {1, 1, 1, 1, 1};
             int transitCallbackIndex = routing.RegisterUnaryTransitVector(vector);
             // Define cost of each arc.
             routing.SetArcCostEvaluatorOfAllVehicles(transitCallbackIndex);

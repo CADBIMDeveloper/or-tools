@@ -79,6 +79,29 @@ void PostsolveExactlyOne(const ConstraintProto& ct,
   }
 }
 
+// For now we set the first unset enforcement literal to false.
+// There must be one.
+void SetEnforcementLiteralToFalse(const ConstraintProto& ct,
+                                  std::vector<Domain>* domains) {
+  CHECK(!ct.enforcement_literal().empty());
+  bool has_free_enforcement_literal = false;
+  for (const int enf : ct.enforcement_literal()) {
+    if ((*domains)[PositiveRef(enf)].IsFixed()) continue;
+    has_free_enforcement_literal = true;
+    if (RefIsPositive(enf)) {
+      (*domains)[enf] = Domain(0);
+    } else {
+      (*domains)[PositiveRef(enf)] = Domain(1);
+    }
+    break;
+  }
+  if (!has_free_enforcement_literal) {
+    LOG(FATAL)
+        << "Unsatisfied linear constraint with no free enforcement literal: "
+        << ct.ShortDebugString();
+  }
+}
+
 // Here we simply assign all non-fixed variable to a feasible value. Which
 // should always exists by construction.
 void PostsolveLinear(const ConstraintProto& ct,
@@ -100,7 +123,13 @@ void PostsolveLinear(const ConstraintProto& ct,
       free_coeffs.push_back(coeff);
     }
   }
-  if (free_vars.empty()) return;
+  if (free_vars.empty()) {
+    const Domain rhs = ReadDomainFromProto(ct.linear());
+    if (!rhs.Contains(fixed_activity)) {
+      SetEnforcementLiteralToFalse(ct, domains);
+    }
+    return;
+  }
 
   // Fast track for the most common case.
   const Domain initial_rhs = ReadDomainFromProto(ct.linear());
@@ -109,6 +138,10 @@ void PostsolveLinear(const ConstraintProto& ct,
     const Domain domain = initial_rhs.AdditionWith(Domain(-fixed_activity))
                               .InverseMultiplicationBy(free_coeffs[0])
                               .IntersectionWith((*domains)[var]);
+    if (domain.IsEmpty()) {
+      SetEnforcementLiteralToFalse(ct, domains);
+      return;
+    }
     const int64_t value = prefer_lower_value[var] ? domain.Min() : domain.Max();
     (*domains)[var] = Domain(value);
     return;
@@ -157,6 +190,10 @@ void PostsolveLinear(const ConstraintProto& ct,
 
 // We assign any non fixed lhs variables to their minimum value. Then we assign
 // the target to the max. This should always be feasible.
+//
+// Note(user): Our heuristic is not feasible if x = max(-x, ...) but we made
+// sure we don't output such int_max here. Alternatively we could probably fix
+// the code here.
 void PostsolveIntMax(const ConstraintProto& ct, std::vector<Domain>* domains) {
   int64_t m = std::numeric_limits<int64_t>::min();
   for (const int ref : ct.int_max().vars()) {
@@ -193,12 +230,12 @@ void PostsolveElement(const ConstraintProto& ct, std::vector<Domain>* domains) {
   // whatever the value of the index and selected variable, we can choose a
   // valid target, so we just fix the index to its min value in this case.
   if (!(*domains)[target_var].IsFixed() && !(*domains)[index_var].IsFixed()) {
-    const int64_t index_value = (*domains)[index_var].Min();
-    (*domains)[index_var] = Domain(index_value);
+    const int64_t index_var_value = (*domains)[index_var].Min();
+    (*domains)[index_var] = Domain(index_var_value);
 
     // If the selected variable is not fixed, we also need to fix it.
     const int selected_ref = ct.element().vars(
-        RefIsPositive(index_ref) ? index_value : -index_value);
+        RefIsPositive(index_ref) ? index_var_value : -index_var_value);
     const int selected_var = PositiveRef(selected_ref);
     if (!(*domains)[selected_var].IsFixed()) {
       (*domains)[selected_var] = Domain((*domains)[selected_var].Min());
@@ -207,9 +244,9 @@ void PostsolveElement(const ConstraintProto& ct, std::vector<Domain>* domains) {
 
   // Deal with fixed index (and constant vars).
   if ((*domains)[index_var].IsFixed()) {
-    const int64_t index_value = (*domains)[index_var].FixedValue();
+    const int64_t index_var_value = (*domains)[index_var].FixedValue();
     const int selected_ref = ct.element().vars(
-        RefIsPositive(index_ref) ? index_value : -index_value);
+        RefIsPositive(index_ref) ? index_var_value : -index_var_value);
     const int selected_var = PositiveRef(selected_ref);
     const int64_t selected_value = (*domains)[selected_var].FixedValue();
     (*domains)[target_var] = (*domains)[target_var].IntersectionWith(
@@ -223,7 +260,10 @@ void PostsolveElement(const ConstraintProto& ct, std::vector<Domain>* domains) {
   // Deal with fixed target (and constant vars).
   const int64_t target_value = (*domains)[target_var].FixedValue();
   int selected_index_value = -1;
-  for (int i = 0; i < ct.element().vars().size(); ++i) {
+  for (const int64_t v : (*domains)[index_var].Values()) {
+    const int64_t i = index_var == index_ref ? v : -v;
+    if (i < 0 || i >= ct.element().vars_size()) continue;
+
     const int ref = ct.element().vars(i);
     const int var = PositiveRef(ref);
     const int64_t value = (*domains)[var].FixedValue();
@@ -242,7 +282,7 @@ void PostsolveElement(const ConstraintProto& ct, std::vector<Domain>* domains) {
 
   CHECK_NE(selected_index_value, -1);
   (*domains)[index_var] = (*domains)[index_var].IntersectionWith(Domain(
-      RefIsPositive(index_var) ? selected_index_value : -selected_index_value));
+      RefIsPositive(index_ref) ? selected_index_value : -selected_index_value));
   DCHECK(!(*domains)[index_var].IsEmpty());
 }
 
@@ -302,16 +342,20 @@ void PostsolveResponse(const int64_t num_variables_in_original_model,
   for (int i = num_constraints - 1; i >= 0; i--) {
     const ConstraintProto& ct = mapping_proto.constraints(i);
 
-    // We should only encounter assigned enforcement literal.
-    bool enforced = true;
-    for (const int ref : ct.enforcement_literal()) {
-      if (domains[PositiveRef(ref)].FixedValue() ==
-          (RefIsPositive(ref) ? 0 : 1)) {
-        enforced = false;
+    // We ignore constraint with an enforcement literal set to false. If the
+    // enforcement is still unclear, we still process this constraint.
+    bool constraint_can_be_ignored = false;
+    for (const int enf : ct.enforcement_literal()) {
+      const int var = PositiveRef(enf);
+      const bool is_false =
+          domains[var].IsFixed() &&
+          RefIsPositive(enf) == (domains[var].FixedValue() == 0);
+      if (is_false) {
+        constraint_can_be_ignored = true;
         break;
       }
     }
-    if (!enforced) continue;
+    if (constraint_can_be_ignored) continue;
 
     switch (ct.constraint_case()) {
       case ConstraintProto::kBoolOr:

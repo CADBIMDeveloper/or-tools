@@ -96,6 +96,8 @@ class ScatteredIntegerVector {
     return dense_vector_[col];
   }
 
+  const bool IsSparse() const { return is_sparse_; }
+
  private:
   // If is_sparse is true we maintain the non_zeros positions and bool vector
   // of dense_vector_. Otherwise we don't. Note that we automatically switch
@@ -132,7 +134,6 @@ class LinearProgrammingConstraint : public PropagatorInterface,
   typedef glop::RowIndex ConstraintIndex;
 
   explicit LinearProgrammingConstraint(Model* model);
-  ~LinearProgrammingConstraint() override;
 
   // Add a new linear constraint to this LP.
   void AddLinearConstraint(const LinearConstraint& ct);
@@ -219,6 +220,9 @@ class LinearProgrammingConstraint : public PropagatorInterface,
   int64_t total_num_simplex_iterations() const {
     return total_num_simplex_iterations_;
   }
+
+  // Returns some statistics about this LP.
+  std::string Statistics() const;
 
  private:
   // Helper methods for branching. Returns true if branching on the given
@@ -315,7 +319,7 @@ class LinearProgrammingConstraint : public PropagatorInterface,
   // Shortcut for an integer linear expression type.
   using LinearExpression = std::vector<std::pair<glop::ColIndex, IntegerValue>>;
 
-  // Converts a dense represenation of a linear constraint to a sparse one
+  // Converts a dense representation of a linear constraint to a sparse one
   // expressed in terms of IntegerVariable.
   void ConvertToLinearConstraint(
       const absl::StrongVector<glop::ColIndex, IntegerValue>& dense_vector,
@@ -523,6 +527,7 @@ class LinearProgrammingConstraint : public PropagatorInterface,
   int64_t total_num_simplex_iterations_ = 0;
 
   // Some stats on the LP statuses encountered.
+  int64_t num_solves_ = 0;
   std::vector<int64_t> num_solves_by_status_;
 };
 

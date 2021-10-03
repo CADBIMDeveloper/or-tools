@@ -1,21 +1,10 @@
 # OR-Tools - Google Optimization Tools
 
-[![Build Status][github_status]][github_link]
-[![Build Status][travis_status]][travis_link]
-[![Build Status][appveyor_status]][appveyor_link]
-
-[github_status]: https://github.com/google/or-tools/workflows/C++%20CI/badge.svg?branch=master
-[github_link]: https://github.com/google/or-tools/actions
-[travis_status]: https://travis-ci.org/google/or-tools.svg?branch=master
-[travis_link]: https://travis-ci.org/google/or-tools
-[appveyor_status]: https://ci.appveyor.com/api/projects/status/9hyykkcm8sh3ua6x/branch/master?svg=true
-[appveyor_link]: https://ci.appveyor.com/project/lperron/or-tools-98u1n
-
-[![PyPI version](https://badge.fury.io/py/ortools.svg)](https://pypi.org/project/ortools/)
+[![PyPI version](https://img.shields.io/pypi/v/ortools.svg)](https://pypi.org/project/ortools/)
 [![PyPI download](https://img.shields.io/pypi/dm/ortools.svg)](https://pypi.org/project/ortools/#files)
 [![Binder](https://mybinder.org/badge.svg)](https://mybinder.org/v2/gh/google/or-tools/master)
 \
-[![NuGet version](https://badge.fury.io/nu/Google.OrTools.svg)](https://www.nuget.org/packages/Google.OrTools)
+[![NuGet version](https://img.shields.io/nuget/v/Google.OrTools.svg)](https://www.nuget.org/packages/Google.OrTools)
 [![NuGet download](https://img.shields.io/nuget/dt/Google.OrTools.svg)](https://www.nuget.org/packages/Google.OrTools)
 \
 [![Maven Central](https://img.shields.io/maven-central/v/com.google.ortools/ortools-java)](https://mvnrepository.com/artifact/com.google.ortools/ortools-java)

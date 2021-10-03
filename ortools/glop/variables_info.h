@@ -66,12 +66,42 @@ class VariablesInfo {
   bool LoadBoundsAndReturnTrueIfUnchanged(const DenseRow& new_lower_bounds,
                                           const DenseRow& new_upper_bounds);
 
+  // Same for an LP not in equation form.
+  bool LoadBoundsAndReturnTrueIfUnchanged(
+      const DenseRow& variable_lower_bounds,
+      const DenseRow& variable_upper_bounds,
+      const DenseColumn& constraint_lower_bounds,
+      const DenseColumn& constraint_upper_bounds);
+
   // Initializes the status according to the given BasisState. Incompatible
-  // statuses will be corrected, and we transfrom the state correctly if new
+  // statuses will be corrected, and we transform the state correctly if new
   // columns / rows were added. Note however that one will need to update the
   // BasisState with deletions to preserve the status of unchanged columns.
   void InitializeFromBasisState(ColIndex first_slack, ColIndex num_new_cols,
                                 const BasisState& state);
+
+  // Changes to the FREE status any column with a BASIC status not listed in
+  // the basis. Returns their number. Also makes sure all the columns listed in
+  // basis are marked as basic. Note that if a variable is fixed, we set its
+  // status to FIXED_VALUE not FREE.
+  int ChangeUnusedBasicVariablesToFree(const RowToColMapping& basis);
+
+  // Loops over all the free variables, and if such a variable has bounds and
+  // its starting value is closer to its closest bound than the given distance,
+  // change the status to move this variable to that bound. Returns the number
+  // of changes. The variable for which starting_values is not provided are
+  // considered at zero.
+  //
+  // This is mainly useful if non-zero starting values are provided. It allows
+  // to move all the variables close to their bounds at once instead of having
+  // to move them one by one with simplex pivots later. Of course, by doing that
+  // we usually introduce a small primal infeasibility that might need
+  // correction.
+  //
+  // If one uses a large distance, then all such variables will start at their
+  // bound if they have one.
+  int SnapFreeVariablesToBound(Fractional distance,
+                               const DenseRow& starting_values);
 
   // Sets all variables status to their lowest magnitude bounds. Note that there
   // will be no basic variable after this is called.
@@ -124,7 +154,7 @@ class VariablesInfo {
   //   I.e. they cost in the dual infeasibility minimization problem is
   //   multiplied by 1000.
   //
-  // It then update the status to get an inital dual feasible solution, and
+  // It then update the status to get an initial dual feasible solution, and
   // then one just have to apply the phase II algo on this problem to try to
   // find a feasible solution to the original problem.
   //

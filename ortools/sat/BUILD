@@ -89,7 +89,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":cp_model_cc_proto",
-        ":cp_model_loader",
+        ":cp_model_mapping",
         ":cp_model_utils",
         ":integer",
         ":linear_programming_constraint",
@@ -124,11 +124,23 @@ cc_library(
 )
 
 cc_library(
+    name = "parameters_validation",
+    srcs = ["parameters_validation.cc"],
+    hdrs = ["parameters_validation.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":sat_parameters_cc_proto",
+        "//ortools/base",
+    ],
+)
+
+cc_library(
     name = "cp_model_search",
     srcs = ["cp_model_search.cc"],
     hdrs = ["cp_model_search.h"],
     deps = [
         ":cp_model_cc_proto",
+        ":cp_model_mapping",
         ":cp_model_utils",
         ":integer",
         ":integer_search",
@@ -176,10 +188,12 @@ cc_library(
         ":integer",
         ":integer_expr",
         ":integer_search",
+        ":lb_tree_search",
         ":linear_programming_constraint",
         ":linear_relaxation",
         ":model",
         ":optimization",
+        ":parameters_validation",
         ":precedences",
         ":probing",
         ":rins",
@@ -214,6 +228,29 @@ cc_library(
 )
 
 cc_library(
+    name = "cp_model_mapping",
+    hdrs = ["cp_model_mapping.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":cp_model_cc_proto",
+        ":cp_model_utils",
+        ":integer",
+        ":intervals",
+        ":linear_constraint",
+        ":model",
+        ":sat_base",
+        "//ortools/base",
+        "//ortools/base:int_type",
+        "//ortools/base:strong_vector",
+        "//ortools/util:logging",
+        "//ortools/util:sorted_interval_list",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+    ],
+)
+
+cc_library(
     name = "cp_model_loader",
     srcs = ["cp_model_loader.cc"],
     hdrs = ["cp_model_loader.h"],
@@ -223,6 +260,7 @@ cc_library(
         ":circuit",
         ":cp_constraints",
         ":cp_model_cc_proto",
+        ":cp_model_mapping",
         ":cp_model_symmetries",
         ":cp_model_utils",
         ":cumulative",
@@ -232,6 +270,7 @@ cc_library(
         ":integer",
         ":integer_expr",
         ":intervals",
+        ":linear_relaxation",
         ":model",
         ":pb_constraint",
         ":precedences",
@@ -303,10 +342,12 @@ cc_library(
     srcs = ["cp_model_presolve.cc"],
     hdrs = ["cp_model_presolve.h"],
     deps = [
+        ":circuit",
         ":cp_model_cc_proto",
         ":cp_model_checker",
         ":cp_model_expand",
         ":cp_model_loader",
+        ":cp_model_mapping",
         ":cp_model_objective",
         ":cp_model_symmetries",
         ":cp_model_utils",
@@ -634,6 +675,8 @@ cc_library(
     srcs = ["integer_search.cc"],
     hdrs = ["integer_search.h"],
     deps = [
+        ":cp_model_mapping",
+        ":disjunctive",
         ":integer",
         ":linear_programming_constraint",
         ":probing",
@@ -644,6 +687,22 @@ cc_library(
         ":sat_inprocessing",
         ":sat_solver",
         ":util",
+    ],
+)
+
+cc_library(
+    name = "lb_tree_search",
+    srcs = ["lb_tree_search.cc"],
+    hdrs = ["lb_tree_search.h"],
+    deps = [
+        ":cp_model_mapping",
+        ":integer",
+        ":integer_search",
+        ":sat_base",
+        ":sat_solver",
+        ":synchronization",
+        ":util",
+        "@com_google_absl//absl/container:flat_hash_set",
     ],
 )
 
@@ -904,11 +963,13 @@ cc_library(
     srcs = ["linear_relaxation.cc"],
     hdrs = ["linear_relaxation.h"],
     deps = [
-        ":cp_model_loader",
+        ":circuit",
+        ":cp_model_mapping",
         ":integer",
         ":linear_programming_constraint",
         ":model",
         ":scheduling_constraints",
+        ":scheduling_cuts",
         "//ortools/base",
         "//ortools/base:iterator_adaptors",
         "@com_google_absl//absl/container:flat_hash_set",
@@ -981,6 +1042,7 @@ cc_library(
     srcs = ["cuts.cc"],
     hdrs = ["cuts.h"],
     deps = [
+        ":diffn_util",
         ":implied_bounds",
         ":integer",
         ":intervals",
@@ -990,6 +1052,27 @@ cc_library(
         "//ortools/algorithms:knapsack_solver_for_cuts",
         "//ortools/base",
         "//ortools/base:int_type",
+        "//ortools/util:time_limit",
+    ],
+)
+
+cc_library(
+    name = "scheduling_cuts",
+    srcs = ["scheduling_cuts.cc"],
+    hdrs = ["scheduling_cuts.h"],
+    deps = [
+        ":cuts",
+        ":diffn_util",
+        ":integer",
+        ":intervals",
+        ":linear_constraint",
+        ":linear_constraint_manager",
+        ":model",
+        ":sat_base",
+        ":util",
+        "//ortools/base",
+        "//ortools/base:int_type",
+        "//ortools/base:stl_util",
         "//ortools/util:time_limit",
     ],
 )
@@ -1038,6 +1121,7 @@ cc_library(
     deps = [
         ":boolean_problem",
         ":boolean_problem_cc_proto",
+        ":cp_model_mapping",
         ":encoding",
         ":integer",
         ":integer_expr",
@@ -1072,6 +1156,7 @@ cc_library(
         "//ortools/base:random",
         "//ortools/base:stl_util",
         "//ortools/util:random_engine",
+        "//ortools/util:time_limit",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/random",
         "@com_google_absl//absl/random:bit_gen_ref",
@@ -1134,11 +1219,24 @@ cc_library(
 )
 
 cc_library(
+    name = "diffn_util",
+    srcs = ["diffn_util.cc"],
+    hdrs = ["diffn_util.h"],
+    deps = [
+        ":integer",
+        ":intervals",
+        "//ortools/graph:connected_components",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+cc_library(
     name = "diffn",
     srcs = ["diffn.cc"],
     hdrs = ["diffn.h"],
     deps = [
         ":cumulative",
+        ":diffn_util",
         ":disjunctive",
         ":integer",
         ":intervals",
@@ -1193,7 +1291,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":cp_model_cc_proto",
-        ":cp_model_loader",
+        ":cp_model_mapping",
         ":cp_model_utils",
         ":linear_programming_constraint",
         ":model",
@@ -1205,6 +1303,7 @@ cc_library(
         "//ortools/util:adaptative_parameter_value",
         "//ortools/util:random_engine",
         "//ortools/util:time_limit",
+        "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/synchronization",
     ],
 )
@@ -1216,7 +1315,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":cp_model_cc_proto",
-        ":cp_model_loader",
+        ":cp_model_mapping",
         ":integer",
         ":linear_constraint",
         ":synchronization",
@@ -1236,7 +1335,7 @@ cc_library(
     hdrs = ["rins.h"],
     visibility = ["//visibility:public"],
     deps = [
-        ":cp_model_loader",
+        ":cp_model_mapping",
         ":integer",
         ":linear_programming_constraint",
         ":model",

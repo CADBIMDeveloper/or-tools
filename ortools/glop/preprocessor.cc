@@ -17,6 +17,7 @@
 #include <limits>
 
 #include "absl/strings/str_format.h"
+#include "ortools/base/iterator_adaptors.h"
 #include "ortools/base/strong_vector.h"
 #include "ortools/glop/revised_simplex.h"
 #include "ortools/glop/status.h"
@@ -120,11 +121,9 @@ bool MainLpPreprocessor::Run(LinearProgram* lp) {
     RUN_PREPROCESSOR(SingletonColumnSignPreprocessor);
   }
 
-  // The scaling is controled by use_scaling, not use_preprocessing.
+  // The scaling is controlled by use_scaling, not use_preprocessing.
   RUN_PREPROCESSOR(ScalingPreprocessor);
 
-  // This one must always run. It is needed by the revised simplex code.
-  RUN_PREPROCESSOR(AddSlackVariablesPreprocessor);
   return !preprocessors_.empty();
 }
 
@@ -179,6 +178,13 @@ void MainLpPreprocessor::RunAndPushIfRelevant(
 }
 
 void MainLpPreprocessor::RecoverSolution(ProblemSolution* solution) const {
+  SCOPED_INSTRUCTION_COUNT(time_limit_);
+  for (const auto& p : gtl::reversed_view(preprocessors_)) {
+    p->RecoverSolution(solution);
+  }
+}
+
+void MainLpPreprocessor::DestructiveRecoverSolution(ProblemSolution* solution) {
   SCOPED_INSTRUCTION_COUNT(time_limit_);
   while (!preprocessors_.empty()) {
     preprocessors_.back()->RecoverSolution(solution);
@@ -430,7 +436,7 @@ namespace {
 
 // Subtracts 'multiple' times the column col of the given linear program from
 // the constraint bounds. That is, for a non-zero entry of coefficient c,
-// c * multiple is substracted from both the constraint upper and lower bound.
+// c * multiple is subtracted from both the constraint upper and lower bound.
 void SubtractColumnMultipleFromConstraintBound(ColIndex col,
                                                Fractional multiple,
                                                LinearProgram* lp) {
@@ -1445,7 +1451,7 @@ bool ImpliedFreePreprocessor::Run(LinearProgram* lp) {
   for (ColWithDegree col_with_degree : col_by_degree) {
     const ColIndex col = col_with_degree.col;
 
-    // If the variable is alreay free or fixed, we do nothing.
+    // If the variable is already free or fixed, we do nothing.
     const Fractional lower_bound = lp->variable_lower_bounds()[col];
     const Fractional upper_bound = lp->variable_upper_bounds()[col];
     if (!IsFinite(lower_bound) && !IsFinite(upper_bound)) {
@@ -2101,7 +2107,7 @@ void UnconstrainedVariablePreprocessor::RecoverSolution(
 
       // This is for VariableStatus::FREE rows.
       //
-      // TODO(user): In presense of free row, we must move them to 0.
+      // TODO(user): In presence of free row, we must move them to 0.
       // Note that currently VariableStatus::FREE rows should be removed before
       // this is called.
       DCHECK(IsFinite(rhs_[row]));
@@ -2483,10 +2489,10 @@ void SingletonUndo::ZeroCostSingletonColumnUndo(
     }
   }
   if (variable_upper_bound_ != kInfinity) {
-    const Fractional actibity_at_ub =
+    const Fractional activity_at_ub =
         activity + e_.coeff * variable_upper_bound_;
-    if (is_smaller_with_tolerance(constraint_lower_bound_, actibity_at_ub) &&
-        is_smaller_with_tolerance(actibity_at_ub, constraint_upper_bound_)) {
+    if (is_smaller_with_tolerance(constraint_lower_bound_, activity_at_ub) &&
+        is_smaller_with_tolerance(activity_at_ub, constraint_upper_bound_)) {
       solution->primal_values[e_.col] = variable_upper_bound_;
       solution->variable_statuses[e_.col] = VariableStatus::AT_UPPER_BOUND;
       return;
@@ -2552,7 +2558,7 @@ void SingletonPreprocessor::DeleteSingletonColumnInEquality(
   // Update the objective function using the equality constraint. We have
   //     v_col*coeff + expression = rhs,
   // so the contribution of this variable to the cost function (v_col * cost)
-  // can be rewrited as:
+  // can be rewritten as:
   //     (rhs * cost - expression * cost) / coeff.
   const Fractional rhs = lp->constraint_upper_bounds()[e.row];
   const Fractional cost = lp->objective_coefficients()[e.col];

@@ -215,6 +215,19 @@ int64_t Domain::Max() const {
   return intervals_.back().end;
 }
 
+int64_t Domain::SmallestValue() const {
+  DCHECK(!IsEmpty());
+  int64_t result = Min();
+  for (const ClosedInterval interval : intervals_) {
+    if (interval.start <= 0 && interval.end >= 0) return 0;
+    for (const int64_t b : {interval.start, interval.end}) {
+      if (b > 0 && b <= std::abs(result)) result = b;
+      if (b < 0 && -b < std::abs(result)) result = b;
+    }
+  }
+  return result;
+}
+
 int64_t Domain::FixedValue() const {
   DCHECK(IsFixed());
   return intervals_.front().start;
@@ -463,6 +476,22 @@ Domain Domain::InverseMultiplicationBy(const int64_t coeff) const {
   DCHECK(IntervalsAreSortedAndNonAdjacent(result.intervals_));
   if (coeff < 0) result.NegateInPlace();
   return result;
+}
+
+Domain Domain::PositiveModuloBySuperset(const Domain& modulo) const {
+  if (IsEmpty()) return Domain();
+  CHECK_GT(modulo.Min(), 0);
+  const int64_t max_mod = modulo.Max() - 1;
+  const int64_t max = std::min(Max(), max_mod);
+  const int64_t min = Min() < 0 ? std::max(Min(), -max_mod) : 0;
+  return Domain(min, max);
+}
+
+Domain Domain::PositiveDivisionBySuperset(const Domain& divisor) const {
+  if (IsEmpty()) return Domain();
+  CHECK_GT(divisor.Min(), 0);
+  return Domain(std::min(Min() / divisor.Max(), Min() / divisor.Min()),
+                std::max(Max() / divisor.Min(), Max() / divisor.Max()));
 }
 
 // It is a bit difficult to see, but this code is doing the same thing as

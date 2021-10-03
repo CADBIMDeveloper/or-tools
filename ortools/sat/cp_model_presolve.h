@@ -94,25 +94,30 @@ class CpModelPresolver {
   // is through ABSL_MUST_USE_RESULT function that should also abort right away
   // the current code. This way we shouldn't keep doing computation on an
   // inconsistent state.
-  // TODO(user,user): Make these public and unit test.
+  // TODO(user): Make these public and unit test.
+  bool ConvertIntMax(ConstraintProto* ct);
+  bool PresolveAllDiff(ConstraintProto* ct);
   bool PresolveAutomaton(ConstraintProto* ct);
-  bool PresolveCircuit(ConstraintProto* ct);
-  bool PresolveRoutes(ConstraintProto* ct);
+  bool PresolveElement(ConstraintProto* ct);
+  bool PresolveIntAbs(ConstraintProto* ct);
+  bool PresolveIntDiv(ConstraintProto* ct);
+  bool PresolveIntMax(ConstraintProto* ct);
+  bool PresolveIntMin(ConstraintProto* ct);
+  bool PresolveIntMod(ConstraintProto* ct);
+  bool PresolveIntProd(ConstraintProto* ct);
+  bool PresolveInterval(int c, ConstraintProto* ct);
+  bool PresolveInverse(ConstraintProto* ct);
+  bool PresolveLinMax(ConstraintProto* ct);
+  bool PresolveLinMin(ConstraintProto* ct);
+  bool PresolveTable(ConstraintProto* ct);
+
   bool PresolveCumulative(ConstraintProto* ct);
   bool PresolveNoOverlap(ConstraintProto* ct);
+  bool PresolveNoOverlap2D(int c, ConstraintProto* ct);
   bool PresolveReservoir(ConstraintProto* ct);
-  bool PresolveAllDiff(ConstraintProto* ct);
-  bool PresolveTable(ConstraintProto* ct);
-  bool PresolveElement(ConstraintProto* ct);
-  bool PresolveInterval(int c, ConstraintProto* ct);
-  bool PresolveIntDiv(ConstraintProto* ct);
-  bool PresolveIntProd(ConstraintProto* ct);
-  bool PresolveIntMin(ConstraintProto* ct);
-  bool PresolveIntMax(ConstraintProto* ct);
-  bool PresolveLinMin(ConstraintProto* ct);
-  bool PresolveLinMax(ConstraintProto* ct);
-  bool PresolveIntAbs(ConstraintProto* ct);
-  bool PresolveBoolXor(ConstraintProto* ct);
+
+  bool PresolveCircuit(ConstraintProto* ct);
+  bool PresolveRoutes(ConstraintProto* ct);
 
   bool PresolveAtMostOrExactlyOne(ConstraintProto* ct);
   bool PresolveAtMostOne(ConstraintProto* ct);
@@ -120,6 +125,7 @@ class CpModelPresolver {
 
   bool PresolveBoolAnd(ConstraintProto* ct);
   bool PresolveBoolOr(ConstraintProto* ct);
+  bool PresolveBoolXor(ConstraintProto* ct);
   bool PresolveEnforcementLiteral(ConstraintProto* ct);
 
   // Regroups terms and substitute affine relations.
@@ -139,11 +145,8 @@ class CpModelPresolver {
   bool PresolveLinearOnBooleans(ConstraintProto* ct);
   void PresolveLinearEqualityModuloTwo(ConstraintProto* ct);
 
-  // To simplify dealing with the two kind of intervals.
-  int64_t StartMin(const IntervalConstraintProto& interval) const;
-  int64_t EndMax(const IntervalConstraintProto& interval) const;
-  int64_t SizeMin(const IntervalConstraintProto& interval) const;
-  int64_t SizeMax(const IntervalConstraintProto& interval) const;
+  // Scheduling helpers.
+  void AddLinearConstraintFromInterval(const ConstraintProto& ct);
 
   // SetPPC is short for set packing, partitioning and covering constraints.
   // These are sum of booleans <=, = and >= 1 respectively.
@@ -263,16 +266,19 @@ void CopyEverythingExceptVariablesAndConstraintsFieldsIntoContext(
 bool PresolveCpModel(PresolveContext* context,
                      std::vector<int>* postsolve_mapping);
 
-// Returns the index of exact duplicate constraints in the given proto. That
-// is, all returned constraints will have an identical constraint before it in
-// the model_proto.constraints() list. Empty constraints are ignored.
+// Returns the index of duplicate constraints in the given proto in the first
+// element of each pair. The second element of each pair is the "representative"
+// that is the first constraint in the proto in a set of duplicate constraints.
+//
+// Empty constraints are ignored. We also do a bit more:
+// - We ignore names when comparing constraint.
+// - For linear constraints, we ignore the domain. This is because we can
+//   just merge them if the constraints are the same.
 //
 // Visible here for testing. This is meant to be called at the end of the
 // presolve where constraints have been canonicalized.
-//
-// TODO(user): Ignore names? canonicalize constraint further by sorting
-// enforcement literal list for instance...
-std::vector<int> FindDuplicateConstraints(const CpModelProto& model_proto);
+std::vector<std::pair<int, int>> FindDuplicateConstraints(
+    const CpModelProto& model_proto);
 
 }  // namespace sat
 }  // namespace operations_research

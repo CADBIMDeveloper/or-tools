@@ -50,7 +50,7 @@
 // possibly {{x, 0.0}} as well.
 //
 // If the callback argument to MathOpt::Solve() is not null, it will be invoked
-// on the events specificed by the callback_registration argument (and when the
+// on the events specified by the callback_registration argument (and when the
 // callback is null, callback_registration must not request any events or will
 // CHECK fail). Some solvers do not support callbacks or certain events, in this
 // case the callback is ignored. TODO(b/180617976): change this behavior.
@@ -70,9 +70,9 @@
 #include "absl/time/time.h"
 #include "absl/types/optional.h"
 #include "ortools/math_opt/callback.pb.h"
+#include "ortools/math_opt/core/indexed_model.h"
 #include "ortools/math_opt/cpp/map_filter.h"
 #include "ortools/math_opt/cpp/variable_and_expressions.h"
-#include "ortools/math_opt/indexed_model.h"
 
 namespace operations_research {
 namespace math_opt {

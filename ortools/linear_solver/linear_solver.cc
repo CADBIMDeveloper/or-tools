@@ -19,6 +19,7 @@
 #include <unistd.h>
 #endif
 
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +33,8 @@
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_replace.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
+#include "absl/time/time.h"
 #include "ortools/base/accurate_sum.h"
 #include "ortools/base/commandlineflags.h"
 #include "ortools/base/integral_types.h"
@@ -39,6 +42,7 @@
 #include "ortools/base/map_util.h"
 #include "ortools/base/status_macros.h"
 #include "ortools/base/stl_util.h"
+#include "ortools/base/threadpool.h"
 #include "ortools/linear_solver/linear_solver.pb.h"
 #include "ortools/linear_solver/model_exporter.h"
 #include "ortools/linear_solver/model_validator.h"
@@ -838,10 +842,35 @@ void MPSolver::FillSolutionResponseProto(MPSolutionResponse* response) const {
   }
 }
 
+namespace {
+bool InCategory(int status, int category) {
+  if (category == MPSOLVER_OPTIMAL) return status == MPSOLVER_OPTIMAL;
+  while (status > category) status >>= 4;
+  return status == category;
+}
+
+void AppendStatusStr(const std::string& msg, MPSolutionResponse* response) {
+  response->set_status_str(
+      absl::StrCat(response->status_str(),
+                   (response->status_str().empty() ? "" : "\n"), msg));
+}
+}  // namespace
+
 // static
 void MPSolver::SolveWithProto(const MPModelRequest& model_request,
-                              MPSolutionResponse* response) {
+                              MPSolutionResponse* response,
+                              std::atomic<bool>* interrupt) {
   CHECK(response != nullptr);
+
+  if (interrupt != nullptr &&
+      !SolverTypeSupportsInterruption(model_request.solver_type())) {
+    response->set_status(MPSOLVER_INCOMPATIBLE_OPTIONS);
+    response->set_status_str(
+        "Called MPSolver::SolveWithProto with an underlying solver that "
+        "doesn't support interruption.");
+    return;
+  }
+
   MPSolver solver(model_request.model().name(),
                   static_cast<MPSolver::OptimizationProblemType>(
                       model_request.solver_type()));
@@ -849,7 +878,10 @@ void MPSolver::SolveWithProto(const MPModelRequest& model_request,
     solver.EnableOutput();
   }
 
-  auto optional_response = solver.interface_->DirectlySolveProto(model_request);
+  // If interruption support is not required, we don't need access to the
+  // underlying solver and can solve it directly if the interface supports it.
+  auto optional_response =
+      solver.interface_->DirectlySolveProto(model_request, interrupt);
   if (optional_response) {
     *response = std::move(optional_response).value();
     return;
@@ -898,12 +930,113 @@ void MPSolver::SolveWithProto(const MPModelRequest& model_request,
       }
     }
   }
-  solver.Solve();
-  solver.FillSolutionResponseProto(response);
+
+  if (interrupt == nullptr) {
+    // If we don't need interruption support, we can save some overhead by
+    // running the solve in the current thread.
+    solver.Solve();
+    solver.FillSolutionResponseProto(response);
+  } else {
+    const absl::Time start_time = absl::Now();
+    absl::Time interrupt_time;
+    bool interrupted_by_user = false;
+    {
+      absl::Notification solve_finished;
+      auto polling_func = [&interrupt, &solve_finished, &solver,
+                           &interrupted_by_user, &interrupt_time,
+                           &model_request]() {
+        constexpr absl::Duration kPollDelay = absl::Microseconds(100);
+        constexpr absl::Duration kMaxInterruptionDelay = absl::Seconds(10);
+
+        while (!interrupt->load()) {
+          if (solve_finished.HasBeenNotified()) return;
+          absl::SleepFor(kPollDelay);
+        }
+
+        // If we get here, we received an interruption notification before the
+        // solve finished "naturally".
+        solver.InterruptSolve();
+        interrupt_time = absl::Now();
+        interrupted_by_user = true;
+
+        // SUBTLE: our call to InterruptSolve() can be ignored by the
+        // underlying solver for several reasons:
+        // 1) The solver thread doesn't poll its 'interrupted' bit often
+        //    enough and takes too long to realize that it should return, or
+        //    its mere return + FillSolutionResponse() takes too long.
+        // 2) The user interrupted the solve so early that Solve() hadn't
+        //    really started yet when we called InterruptSolve().
+        // In case 1), we should just wait a little longer. In case 2), we
+        // should call InterruptSolve() again, maybe several times. To both
+        // accommodate cases where the solver takes really a long time to
+        // react to the interruption, while returning as quickly as possible,
+        // we poll the solve_finished notification with increasing durations
+        // and call InterruptSolve again, each time.
+        for (absl::Duration poll_delay = kPollDelay;
+             absl::Now() <= interrupt_time + kMaxInterruptionDelay;
+             poll_delay *= 2) {
+          if (solve_finished.WaitForNotificationWithTimeout(poll_delay)) {
+            return;
+          } else {
+            solver.InterruptSolve();
+          }
+        }
+
+        LOG(DFATAL)
+            << "MPSolver::InterruptSolve() seems to be ignored by the "
+               "underlying solver, despite repeated calls over at least "
+            << absl::FormatDuration(kMaxInterruptionDelay)
+            << ". Solver type used: "
+            << MPModelRequest_SolverType_Name(model_request.solver_type());
+
+        // Note that in opt builds, the polling thread terminates here with an
+        // error message, but we let Solve() finish, ignoring the user
+        // interruption request.
+      };
+
+      // The choice to do polling rather than solving in the second thread is
+      // not arbitrary, as we want to maintain any custom thread options set by
+      // the user. They shouldn't matter for polling, but for solving we might
+      // e.g. use a larger stack.
+      ThreadPool thread_pool("SolverThread", /*num_threads=*/1);
+      thread_pool.StartWorkers();
+      thread_pool.Schedule(polling_func);
+
+      // Make sure the interruption notification didn't arrive while waiting to
+      // be scheduled.
+      if (!interrupt->load()) {
+        solver.Solve();
+        solver.FillSolutionResponseProto(response);
+      } else {  // *interrupt == true
+        response->set_status(MPSOLVER_CANCELLED_BY_USER);
+        response->set_status_str(
+            "Solve not started, because the user set the atomic<bool> in "
+            "MPSolver::SolveWithProto() to true before solving could "
+            "start.");
+      }
+      solve_finished.Notify();
+
+      // We block until the thread finishes when thread_pool goes out of scope.
+    }
+
+    if (interrupted_by_user) {
+      // Despite the interruption, the solver might still have found a useful
+      // result. If so, don't overwrite the status.
+      if (InCategory(response->status(), MPSOLVER_NOT_SOLVED)) {
+        response->set_status(MPSOLVER_CANCELLED_BY_USER);
+      }
+      AppendStatusStr(
+          absl::StrFormat(
+              "User interrupted MPSolver::SolveWithProto() by setting the "
+              "atomic<bool> to true at %s (%s after solving started.)",
+              absl::FormatTime(interrupt_time),
+              absl::FormatDuration(interrupt_time - start_time)),
+          response);
+    }
+  }
+
   if (!warning_message.empty()) {
-    response->set_status_str(absl::StrCat(
-        response->status_str(), (response->status_str().empty() ? "" : "\n"),
-        warning_message));
+    AppendStatusStr(warning_message, response);
   }
 }
 
@@ -1085,15 +1218,18 @@ absl::Status MPSolver::LoadSolutionFromProto(const MPSolutionResponse& response,
 }
 
 void MPSolver::Clear() {
+  {
+    absl::MutexLock lock(&global_count_mutex_);
+    global_num_variables_ += variables_.size();
+    global_num_constraints_ += constraints_.size();
+  }
   MutableObjective()->Clear();
   gtl::STLDeleteElements(&variables_);
   gtl::STLDeleteElements(&constraints_);
-  variables_.clear();
   if (variable_name_to_index_) {
     variable_name_to_index_->clear();
   }
   variable_is_extracted_.clear();
-  constraints_.clear();
   if (constraint_name_to_index_) {
     constraint_name_to_index_->clear();
   }
@@ -1607,6 +1743,25 @@ bool MPSolver::SupportsCallbacks() const {
   return interface_->SupportsCallbacks();
 }
 
+// Global counters.
+absl::Mutex MPSolver::global_count_mutex_(absl::kConstInit);
+int64_t MPSolver::global_num_variables_ = 0;
+int64_t MPSolver::global_num_constraints_ = 0;
+
+// static
+int64_t MPSolver::global_num_variables() {
+  // Why not ReaderMutexLock? See go/totw/197#when-are-shared-locks-useful.
+  absl::MutexLock lock(&global_count_mutex_);
+  return global_num_variables_;
+}
+
+// static
+int64_t MPSolver::global_num_constraints() {
+  // Why not ReaderMutexLock? See go/totw/197#when-are-shared-locks-useful.
+  absl::MutexLock lock(&global_count_mutex_);
+  return global_num_constraints_;
+}
+
 bool MPSolverResponseStatusIsRpcError(MPSolverResponseStatus status) {
   switch (status) {
     // Cases that don't yield an RPC error when they happen on the server.
@@ -1621,12 +1776,14 @@ bool MPSolverResponseStatusIsRpcError(MPSolverResponseStatus status) {
     // Cases that should never happen with the linear solver server. We prefer
     // to consider those as "not RPC errors".
     case MPSOLVER_MODEL_IS_VALID:
+    case MPSOLVER_CANCELLED_BY_USER:
       return false;
     // Cases that yield an RPC error when they happen on the server.
     case MPSOLVER_MODEL_INVALID:
     case MPSOLVER_MODEL_INVALID_SOLUTION_HINT:
     case MPSOLVER_MODEL_INVALID_SOLVER_PARAMETERS:
     case MPSOLVER_SOLVER_TYPE_UNAVAILABLE:
+    case MPSOLVER_INCOMPATIBLE_OPTIONS:
       return true;
   }
   LOG(DFATAL)

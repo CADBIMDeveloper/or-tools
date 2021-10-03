@@ -466,7 +466,7 @@ absl::Status MPSReaderImpl::ProcessLine(const std::string& line,
   if (IsCommentOrBlank()) {
     return absl::OkStatus();  // Skip blank lines and comments.
   }
-  if (!free_form_ && line_.find('\t') != std::string::npos) {
+  if (!free_form_ && absl::StrContains(line_, '\t')) {
     return InvalidArgumentError("File contains tabs.");
   }
   std::string section;
@@ -489,7 +489,7 @@ absl::Status MPSReaderImpl::ProcessLine(const std::string& line,
       // fixed form, the name has at most 8 characters, and starts at a specific
       // position in the NAME line. For MIPLIB2010 problems (eg, air04, glass4),
       // the name in fixed form ends up being preceded with a whitespace.
-      // TODO(user,user): Return an error for fixed form if the problem name
+      // TODO(user): Return an error for fixed form if the problem name
       // does not fit.
       if (free_form_) {
         if (fields_.size() >= 2) {
