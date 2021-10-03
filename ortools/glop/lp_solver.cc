@@ -217,7 +217,7 @@ ProblemStatus LPSolver::SolveWithTimeLimit(const LinearProgram& lp,
     RunRevisedSimplexIfNeeded(&solution, time_limit);
   }
 
-  if (postsolve_is_needed) preprocessor.RecoverSolution(&solution);
+  if (postsolve_is_needed) preprocessor.DestructiveRecoverSolution(&solution);
   const ProblemStatus status = LoadAndVerifySolution(lp, solution);
 
   // LOG some statistics that can be parsed by our benchmark script.
@@ -581,8 +581,9 @@ void LPSolver::RunRevisedSimplexIfNeeded(ProblemSolution* solution,
     num_revised_simplex_iterations_ = revised_simplex_->GetNumberOfIterations();
     solution->status = revised_simplex_->GetProblemStatus();
 
-    const ColIndex num_cols = revised_simplex_->GetProblemNumCols();
-    DCHECK_EQ(solution->primal_values.size(), num_cols);
+    // Make sure we do not copy the slacks added by revised_simplex_.
+    const ColIndex num_cols = solution->primal_values.size();
+    DCHECK_LE(num_cols, revised_simplex_->GetProblemNumCols());
     for (ColIndex col(0); col < num_cols; ++col) {
       solution->primal_values[col] = revised_simplex_->GetVariableValue(col);
       solution->variable_statuses[col] =

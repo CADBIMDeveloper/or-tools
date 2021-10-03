@@ -19,13 +19,7 @@ namespace Google.OrTools.Sat
 {
     public class CpSolver
     {
-        public CpSolverStatus Solve(CpModel model)
-        {
-            SolveWithSolutionCallback(model, null);
-            return response_.Status;
-        }
-
-        public CpSolverStatus SolveWithSolutionCallback(CpModel model, SolutionCallback cb)
+        public CpSolverStatus Solve(CpModel model, SolutionCallback cb = null)
         {
             // Setup search.
             CreateSolveWrapper();
@@ -54,11 +48,17 @@ namespace Google.OrTools.Sat
             return response_.Status;
         }
 
+        [ObsoleteAttribute("This method is obsolete. Call Solve instead.", false)]
+        public CpSolverStatus SolveWithSolutionCallback(CpModel model, SolutionCallback cb)
+        {
+            return Solve(model, cb);
+        }
+
         public CpSolverStatus SearchAllSolutions(CpModel model, SolutionCallback cb)
         {
             string old_parameters = string_parameters_;
             string_parameters_ += " enumerate_all_solutions:true";
-            SolveWithSolutionCallback(model, cb);
+            Solve(model, cb);
             string_parameters_ = old_parameters;
             return response_.Status;
         }
@@ -154,7 +154,7 @@ namespace Google.OrTools.Sat
                 else if (expr is SumArray)
                 {
                     SumArray a = (SumArray)expr;
-                    constant += coeff * a.Constant;
+                    constant += coeff * a.Offset;
                     foreach (LinearExpr sub in a.Expressions)
                     {
                         exprs.Add(sub);
@@ -219,7 +219,6 @@ namespace Google.OrTools.Sat
             return response_.SufficientAssumptionsForInfeasibility;
         }
 
-        private CpModelProto model_;
         private CpSolverResponse response_;
         private LogCallback log_callback_;
         private string string_parameters_;

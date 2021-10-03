@@ -1,3 +1,6 @@
+# Need a Centos 7 to avoid this:
+# https://github.com/google/or-tools/issues/2520#issuecomment-825119882
+# note: PEP 599 manylinux2014 is also based on Centos 7 which will reach End of Life (EOL) on June 30th, 2024
 FROM centos:7 AS env
 
 #############
@@ -18,11 +21,11 @@ RUN yum -y update \
 SHELL ["/bin/bash", "--login", "-c"]
 # RUN gcc --version
 
-# Install CMake 3.20.1
-RUN wget "https://cmake.org/files/v3.20/cmake-3.20.1-linux-x86_64.sh" \
-&& chmod a+x cmake-3.20.1-linux-x86_64.sh \
-&& ./cmake-3.20.1-linux-x86_64.sh --prefix=/usr/local/ --skip-license \
-&& rm cmake-3.20.1-linux-x86_64.sh
+# Install CMake 3.21.1
+RUN wget -q "https://cmake.org/files/v3.21/cmake-3.21.1-linux-x86_64.sh" \
+&& chmod a+x cmake-3.21.1-linux-x86_64.sh \
+&& ./cmake-3.21.1-linux-x86_64.sh --prefix=/usr/local/ --skip-license \
+&& rm cmake-3.21.1-linux-x86_64.sh
 
 # Install Swig 4.0.2
 RUN curl --location-trusted \
@@ -48,7 +51,7 @@ ENV JAVA_HOME=/usr/lib/jvm/java
 # see https://docs.microsoft.com/en-us/dotnet/core/install/linux-centos#centos-7-
 RUN rpm -Uvh https://packages.microsoft.com/config/centos/7/packages-microsoft-prod.rpm \
 && yum -y update \
-&& yum -y install dotnet-sdk-3.1 \
+&& yum -y install dotnet-sdk-3.1 dotnet-sdk-5.0 \
 && yum clean all \
 && rm -rf /var/cache/yum
 # Trigger first run experience by running arbitrary cmd

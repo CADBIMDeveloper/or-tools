@@ -50,10 +50,10 @@ runtime on which platform the code is currently running.
 
 ### Local Package
 
-The pipeline for `linux-x86-64` should be as follow:  
-note: The pipeline will be similar for `darwin-x86-64` and `win32-x86-64` architecture,
-don't hesitate to look at the CI log! ![Local Pipeline](doc/local_pipeline.svg)
-![Legend](doc/legend.svg)
+The pipeline for `linux-x86-64` should be as follow: \
+note: The pipeline will be similar for `darwin-x86-64` and `win32-x86-64`
+architecture, don't hesitate to look at the CI log!
+![Local Pipeline](doc/local_pipeline.svg) ![Legend](doc/legend.svg)
 
 #### Building local native Package
 
@@ -93,7 +93,7 @@ So now, let's create the local `com.google.ortools:ortools-java.jar` maven
 package which will depend on our previous native package.
 
 Here some dev-note concerning this `POM.xml`.
-* Add runtime dependency on each native package(s) availabe:
+* Add runtime dependency on each native package(s) available:
   ```xml
   <dependency>
     <groupId>com.google.ortools</groupId>

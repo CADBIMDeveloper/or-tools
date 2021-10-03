@@ -115,9 +115,9 @@ bool ConstraintIsNEq(const LinearConstraintProto& proto,
 
 }  // namespace
 
-void CpModelMapping::CreateVariables(const CpModelProto& model_proto,
-                                     bool view_all_booleans_as_integers,
-                                     Model* m) {
+void LoadVariables(const CpModelProto& model_proto,
+                   bool view_all_booleans_as_integers, Model* m) {
+  auto* mapping = m->GetOrCreate<CpModelMapping>();
   const int num_proto_variables = model_proto.variables_size();
 
   // All [0, 1] variables always have a corresponding Boolean, even if it is
@@ -130,14 +130,14 @@ void CpModelMapping::CreateVariables(const CpModelProto& model_proto,
     std::vector<BooleanVariable> false_variables;
     std::vector<BooleanVariable> true_variables;
 
-    booleans_.resize(num_proto_variables, kNoBooleanVariable);
-    reverse_boolean_map_.resize(num_proto_variables, -1);
+    mapping->booleans_.resize(num_proto_variables, kNoBooleanVariable);
+    mapping->reverse_boolean_map_.resize(num_proto_variables, -1);
     for (int i = 0; i < num_proto_variables; ++i) {
       const auto& domain = model_proto.variables(i).domain();
       if (domain.size() != 2) continue;
       if (domain[0] >= 0 && domain[1] <= 1) {
-        booleans_[i] = new_var;
-        reverse_boolean_map_[new_var] = i;
+        mapping->booleans_[i] = new_var;
+        mapping->reverse_boolean_map_[new_var] = i;
         if (domain[1] == 0) {
           false_variables.push_back(new_var);
         } else if (domain[0] == 1) {
@@ -188,7 +188,7 @@ void CpModelMapping::CreateVariables(const CpModelProto& model_proto,
     // Make sure any unused variable, that is not already a Boolean is
     // considered "used".
     for (int i = 0; i < num_proto_variables; ++i) {
-      if (booleans_[i] == kNoBooleanVariable) {
+      if (mapping->booleans_[i] == kNoBooleanVariable) {
         used_variables.insert(i);
       }
     }
@@ -198,18 +198,19 @@ void CpModelMapping::CreateVariables(const CpModelProto& model_proto,
                                          used_variables.end());
     gtl::STLSortAndRemoveDuplicates(&var_to_instantiate_as_integer);
   }
-  integers_.resize(num_proto_variables, kNoIntegerVariable);
+  mapping->integers_.resize(num_proto_variables, kNoIntegerVariable);
 
   auto* integer_trail = m->GetOrCreate<IntegerTrail>();
   integer_trail->ReserveSpaceForNumVariables(
       var_to_instantiate_as_integer.size());
-  reverse_integer_map_.resize(2 * var_to_instantiate_as_integer.size(), -1);
+  mapping->reverse_integer_map_.resize(2 * var_to_instantiate_as_integer.size(),
+                                       -1);
   for (const int i : var_to_instantiate_as_integer) {
     const auto& var_proto = model_proto.variables(i);
-    integers_[i] =
+    mapping->integers_[i] =
         integer_trail->AddIntegerVariable(ReadDomainFromProto(var_proto));
-    DCHECK_LT(integers_[i], reverse_integer_map_.size());
-    reverse_integer_map_[integers_[i]] = i;
+    DCHECK_LT(mapping->integers_[i], mapping->reverse_integer_map_.size());
+    mapping->reverse_integer_map_[mapping->integers_[i]] = i;
   }
 
   auto* encoder = m->GetOrCreate<IntegerEncoder>();
@@ -217,16 +218,18 @@ void CpModelMapping::CreateVariables(const CpModelProto& model_proto,
 
   // Link any variable that has both views.
   for (int i = 0; i < num_proto_variables; ++i) {
-    if (integers_[i] == kNoIntegerVariable) continue;
-    if (booleans_[i] == kNoBooleanVariable) continue;
+    if (mapping->integers_[i] == kNoIntegerVariable) continue;
+    if (mapping->booleans_[i] == kNoBooleanVariable) continue;
 
     // Associate with corresponding integer variable.
-    encoder->AssociateToIntegerEqualValue(sat::Literal(booleans_[i], true),
-                                          integers_[i], IntegerValue(1));
+    encoder->AssociateToIntegerEqualValue(
+        sat::Literal(mapping->booleans_[i], true), mapping->integers_[i],
+        IntegerValue(1));
   }
 
   // Create the interval variables.
-  intervals_.resize(model_proto.constraints_size(), kNoIntervalVariable);
+  mapping->intervals_.resize(model_proto.constraints_size(),
+                             kNoIntervalVariable);
   for (int c = 0; c < model_proto.constraints_size(); ++c) {
     const ConstraintProto& ct = model_proto.constraints(c);
     if (ct.constraint_case() != ConstraintProto::ConstraintCase::kInterval) {
@@ -234,41 +237,43 @@ void CpModelMapping::CreateVariables(const CpModelProto& model_proto,
     }
     if (HasEnforcementLiteral(ct)) {
       const sat::Literal enforcement_literal =
-          Literal(ct.enforcement_literal(0));
+          mapping->Literal(ct.enforcement_literal(0));
       // TODO(user): Fix the constant variable situation. An optional interval
       // with constant start/end or size cannot share the same constant
       // variable if it is used in non-optional situation.
       if (ct.interval().has_start_view()) {
-        intervals_[c] = intervals_repository->CreateInterval(
-            LoadAffineView(ct.interval().start_view()),
-            LoadAffineView(ct.interval().end_view()),
-            LoadAffineView(ct.interval().size_view()),
+        mapping->intervals_[c] = intervals_repository->CreateInterval(
+            mapping->LoadAffineView(ct.interval().start_view()),
+            mapping->LoadAffineView(ct.interval().end_view()),
+            mapping->LoadAffineView(ct.interval().size_view()),
             enforcement_literal.Index(),
             /*add_linear_relation=*/false);
       } else {
-        intervals_[c] = m->Add(NewOptionalInterval(
-            Integer(ct.interval().start()), Integer(ct.interval().end()),
-            Integer(ct.interval().size()), enforcement_literal));
+        mapping->intervals_[c] = m->Add(NewOptionalInterval(
+            mapping->Integer(ct.interval().start()),
+            mapping->Integer(ct.interval().end()),
+            mapping->Integer(ct.interval().size()), enforcement_literal));
       }
     } else {
       if (ct.interval().has_start_view()) {
-        intervals_[c] = intervals_repository->CreateInterval(
-            LoadAffineView(ct.interval().start_view()),
-            LoadAffineView(ct.interval().end_view()),
-            LoadAffineView(ct.interval().size_view()), kNoLiteralIndex,
+        mapping->intervals_[c] = intervals_repository->CreateInterval(
+            mapping->LoadAffineView(ct.interval().start_view()),
+            mapping->LoadAffineView(ct.interval().end_view()),
+            mapping->LoadAffineView(ct.interval().size_view()), kNoLiteralIndex,
             /*add_linear_relation=*/false);
       } else {
-        intervals_[c] = m->Add(NewInterval(Integer(ct.interval().start()),
-                                           Integer(ct.interval().end()),
-                                           Integer(ct.interval().size())));
+        mapping->intervals_[c] =
+            m->Add(NewInterval(mapping->Integer(ct.interval().start()),
+                               mapping->Integer(ct.interval().end()),
+                               mapping->Integer(ct.interval().size())));
       }
     }
-    already_loaded_ct_.insert(&ct);
+    mapping->already_loaded_ct_.insert(&ct);
   }
 }
 
-void CpModelMapping::LoadBooleanSymmetries(const CpModelProto& model_proto,
-                                           Model* m) {
+void LoadBooleanSymmetries(const CpModelProto& model_proto, Model* m) {
+  auto* mapping = m->GetOrCreate<CpModelMapping>();
   const SymmetryProto symmetry = model_proto.symmetry();
   if (symmetry.permutations().empty()) return;
 
@@ -280,7 +285,7 @@ void CpModelMapping::LoadBooleanSymmetries(const CpModelProto& model_proto,
   for (const SparsePermutationProto& perm : symmetry.permutations()) {
     bool all_bool = true;
     for (const int var : perm.support()) {
-      if (!IsBoolean(var)) {
+      if (!mapping->IsBoolean(var)) {
         all_bool = false;
         break;
       }
@@ -297,7 +302,8 @@ void CpModelMapping::LoadBooleanSymmetries(const CpModelProto& model_proto,
       const int saved_support_index = support_index;
       for (int j = 0; j < size; ++j) {
         const int var = perm.support(support_index++);
-        literal_permutation->AddToCurrentCycle(Literal(var).Index().value());
+        literal_permutation->AddToCurrentCycle(
+            mapping->Literal(var).Index().value());
       }
       literal_permutation->CloseCurrentCycle();
 
@@ -307,7 +313,7 @@ void CpModelMapping::LoadBooleanSymmetries(const CpModelProto& model_proto,
       for (int j = 0; j < size; ++j) {
         const int var = perm.support(support_index++);
         literal_permutation->AddToCurrentCycle(
-            Literal(var).NegatedIndex().value());
+            mapping->Literal(var).NegatedIndex().value());
       }
       literal_permutation->CloseCurrentCycle();
     }
@@ -325,8 +331,8 @@ void CpModelMapping::LoadBooleanSymmetries(const CpModelProto& model_proto,
 //
 // TODO(user): Regroup/presolve two encoding like b => x > 2 and the same
 // Boolean b => x > 5. These shouldn't happen if we merge linear constraints.
-void CpModelMapping::ExtractEncoding(const CpModelProto& model_proto,
-                                     Model* m) {
+void ExtractEncoding(const CpModelProto& model_proto, Model* m) {
+  auto* mapping = m->GetOrCreate<CpModelMapping>();
   auto* encoder = m->GetOrCreate<IntegerEncoder>();
   auto* integer_trail = m->GetOrCreate<IntegerTrail>();
   auto* sat_solver = m->GetOrCreate<SatSolver>();
@@ -386,7 +392,10 @@ void CpModelMapping::ExtractEncoding(const CpModelProto& model_proto,
     if (ct.linear().vars_size() != 1) continue;
 
     // ct is a linear constraint with one term and one enforcement literal.
-    const sat::Literal enforcement_literal = Literal(ct.enforcement_literal(0));
+    const sat::Literal enforcement_literal =
+        mapping->Literal(ct.enforcement_literal(0));
+    if (sat_solver->Assignment().LiteralIsFalse(enforcement_literal)) continue;
+
     const int ref = ct.linear().vars(0);
     const int var = PositiveRef(ref);
 
@@ -396,23 +405,41 @@ void CpModelMapping::ExtractEncoding(const CpModelProto& model_proto,
             .InverseMultiplicationBy(ct.linear().coeffs(0) *
                                      (RefIsPositive(ref) ? 1 : -1));
 
+    if (domain_if_enforced.IsEmpty()) {
+      if (!sat_solver->AddUnitClause(enforcement_literal.Negated())) return;
+      continue;
+    }
+
     // Detect enforcement_literal => (var >= value or var <= value).
     if (domain_if_enforced.NumIntervals() == 1) {
       if (domain_if_enforced.Max() >= domain.Max() &&
           domain_if_enforced.Min() > domain.Min()) {
-        inequalities.push_back(
-            {&ct, enforcement_literal,
-             IntegerLiteral::GreaterOrEqual(
-                 Integer(var), IntegerValue(domain_if_enforced.Min()))});
-        implied_bounds->Add(enforcement_literal, inequalities.back().i_lit);
+        inequalities.push_back({&ct, enforcement_literal,
+                                IntegerLiteral::GreaterOrEqual(
+                                    mapping->Integer(var),
+                                    IntegerValue(domain_if_enforced.Min()))});
       } else if (domain_if_enforced.Min() <= domain.Min() &&
                  domain_if_enforced.Max() < domain.Max()) {
-        inequalities.push_back(
-            {&ct, enforcement_literal,
-             IntegerLiteral::LowerOrEqual(
-                 Integer(var), IntegerValue(domain_if_enforced.Max()))});
-        implied_bounds->Add(enforcement_literal, inequalities.back().i_lit);
+        inequalities.push_back({&ct, enforcement_literal,
+                                IntegerLiteral::LowerOrEqual(
+                                    mapping->Integer(var),
+                                    IntegerValue(domain_if_enforced.Max()))});
       }
+    }
+
+    // Detect implied bounds. The test is less strict than the above
+    // test.
+    if (domain_if_enforced.Min() > domain.Min()) {
+      implied_bounds->Add(
+          enforcement_literal,
+          IntegerLiteral::GreaterOrEqual(
+              mapping->Integer(var), IntegerValue(domain_if_enforced.Min())));
+    }
+    if (domain_if_enforced.Max() < domain.Max()) {
+      implied_bounds->Add(
+          enforcement_literal,
+          IntegerLiteral::LowerOrEqual(mapping->Integer(var),
+                                       IntegerValue(domain_if_enforced.Max())));
     }
 
     // Detect enforcement_literal => (var == value or var != value).
@@ -426,7 +453,7 @@ void CpModelMapping::ExtractEncoding(const CpModelProto& model_proto,
         var_to_equalities[var].push_back(
             {&ct, enforcement_literal, inter.Min(), true});
         if (domain.Contains(inter.Min())) {
-          variables_to_encoded_values_[var].insert(inter.Min());
+          mapping->variables_to_encoded_values_[var].insert(inter.Min());
         }
       }
     }
@@ -437,7 +464,7 @@ void CpModelMapping::ExtractEncoding(const CpModelProto& model_proto,
         var_to_equalities[var].push_back(
             {&ct, enforcement_literal, inter.Min(), false});
         if (domain.Contains(inter.Min())) {
-          variables_to_encoded_values_[var].insert(inter.Min());
+          mapping->variables_to_encoded_values_[var].insert(inter.Min());
         }
       }
     }
@@ -469,23 +496,23 @@ void CpModelMapping::ExtractEncoding(const CpModelProto& model_proto,
       ++num_inequalities;
       encoder->AssociateToIntegerLiteral(inequalities[i].literal,
                                          inequalities[i].i_lit);
-      already_loaded_ct_.insert(inequalities[i].ct);
-      already_loaded_ct_.insert(inequalities[i + 1].ct);
+      mapping->already_loaded_ct_.insert(inequalities[i].ct);
+      mapping->already_loaded_ct_.insert(inequalities[i + 1].ct);
     }
   }
 
   // Encode the half-inequalities.
   int num_half_inequalities = 0;
   for (const auto inequality : inequalities) {
-    if (ConstraintIsAlreadyLoaded(inequality.ct)) continue;
+    if (mapping->ConstraintIsAlreadyLoaded(inequality.ct)) continue;
     m->Add(
         Implication(inequality.literal,
                     encoder->GetOrCreateAssociatedLiteral(inequality.i_lit)));
     if (sat_solver->IsModelUnsat()) return;
 
     ++num_half_inequalities;
-    already_loaded_ct_.insert(inequality.ct);
-    is_half_encoding_ct_.insert(inequality.ct);
+    mapping->already_loaded_ct_.insert(inequality.ct);
+    mapping->is_half_encoding_ct_.insert(inequality.ct);
   }
 
   if (!inequalities.empty()) {
@@ -517,10 +544,11 @@ void CpModelMapping::ExtractEncoding(const CpModelProto& model_proto,
       }
 
       ++num_equalities;
-      encoder->AssociateToIntegerEqualValue(encoding[j].literal, integers_[i],
+      encoder->AssociateToIntegerEqualValue(encoding[j].literal,
+                                            mapping->integers_[i],
                                             IntegerValue(encoding[j].value));
-      already_loaded_ct_.insert(encoding[j].ct);
-      already_loaded_ct_.insert(encoding[j + 1].ct);
+      mapping->already_loaded_ct_.insert(encoding[j].ct);
+      mapping->already_loaded_ct_.insert(encoding[j + 1].ct);
       values.insert(encoding[j].value);
     }
 
@@ -536,9 +564,9 @@ void CpModelMapping::ExtractEncoding(const CpModelProto& model_proto,
     // however, that in the presolve, we should only use the "representative" in
     // linear constraints, so we should be fine.
     for (const auto equality : encoding) {
-      if (ConstraintIsAlreadyLoaded(equality.ct)) continue;
+      if (mapping->ConstraintIsAlreadyLoaded(equality.ct)) continue;
       const class Literal eq = encoder->GetOrCreateLiteralAssociatedToEquality(
-          integers_[i], IntegerValue(equality.value));
+          mapping->integers_[i], IntegerValue(equality.value));
       if (equality.is_equality) {
         m->Add(Implication(equality.literal, eq));
       } else {
@@ -546,13 +574,13 @@ void CpModelMapping::ExtractEncoding(const CpModelProto& model_proto,
       }
 
       ++num_half_equalities;
-      already_loaded_ct_.insert(equality.ct);
-      is_half_encoding_ct_.insert(equality.ct);
+      mapping->already_loaded_ct_.insert(equality.ct);
+      mapping->is_half_encoding_ct_.insert(equality.ct);
     }
 
     // Update stats.
     if (VLOG_IS_ON(1)) {
-      if (encoder->VariableIsFullyEncoded(integers_[i])) {
+      if (encoder->VariableIsFullyEncoded(mapping->integers_[i])) {
         ++num_fully_encoded;
       } else {
         ++num_partially_encoded;
@@ -572,8 +600,9 @@ void CpModelMapping::ExtractEncoding(const CpModelProto& model_proto,
   }
 }
 
-void CpModelMapping::PropagateEncodingFromEquivalenceRelations(
-    const CpModelProto& model_proto, Model* m) {
+void PropagateEncodingFromEquivalenceRelations(const CpModelProto& model_proto,
+                                               Model* m) {
+  auto* mapping = m->GetOrCreate<CpModelMapping>();
   auto* encoder = m->GetOrCreate<IntegerEncoder>();
   auto* sat_solver = m->GetOrCreate<SatSolver>();
 
@@ -589,8 +618,8 @@ void CpModelMapping::PropagateEncodingFromEquivalenceRelations(
     const IntegerValue rhs(ct.linear().domain(0));
 
     // Make sure the coefficient are positive.
-    IntegerVariable var1 = Integer(ct.linear().vars(0));
-    IntegerVariable var2 = Integer(ct.linear().vars(1));
+    IntegerVariable var1 = mapping->Integer(ct.linear().vars(0));
+    IntegerVariable var2 = mapping->Integer(ct.linear().vars(1));
     IntegerValue coeff1(ct.linear().coeffs(0));
     IntegerValue coeff2(ct.linear().coeffs(1));
     if (coeff1 < 0) {
@@ -655,8 +684,8 @@ void CpModelMapping::PropagateEncodingFromEquivalenceRelations(
   }
 }
 
-void CpModelMapping::DetectOptionalVariables(const CpModelProto& model_proto,
-                                             Model* m) {
+void DetectOptionalVariables(const CpModelProto& model_proto, Model* m) {
+  auto* mapping = m->GetOrCreate<CpModelMapping>();
   const SatParameters& parameters = *(m->GetOrCreate<SatParameters>());
   if (!parameters.use_optional_variables()) return;
   if (parameters.enumerate_all_solutions()) return;
@@ -674,7 +703,7 @@ void CpModelMapping::DetectOptionalVariables(const CpModelProto& model_proto,
   // of the constraints in which they appear.
   //
   // TODO(user): This deals with the simplest cases, but we could try to
-  // detect literals that implies all the constaints in which a variable
+  // detect literals that implies all the constraints in which a variable
   // appear to false. This can be done with a LCA computation in the tree of
   // Boolean implication (once the presolve remove cycles). Not sure if we can
   // properly exploit that afterwards though. Do some research!
@@ -724,7 +753,8 @@ void CpModelMapping::DetectOptionalVariables(const CpModelProto& model_proto,
 
     ++num_optionals;
     integer_trail->MarkIntegerVariableAsOptional(
-        Integer(var), Literal(enforcement_intersection[var].front()));
+        mapping->Integer(var),
+        mapping->Literal(enforcement_intersection[var].front()));
   }
   VLOG(2) << "Auto-detected " << num_optionals << " optional variables.";
 }
@@ -775,7 +805,7 @@ class FullEncodingFixedPointComputer {
   // Note that we always consider a fixed variable to be fully encoded here.
   const bool IsFullyEncoded(int v) {
     const IntegerVariable variable = mapping_->Integer(v);
-    if (v == kNoIntegerVariable) return false;
+    if (variable == kNoIntegerVariable) return false;
     return integer_trail_->IsFixed(variable) ||
            integer_encoder_->VariableIsFullyEncoded(variable);
   }
@@ -1008,6 +1038,26 @@ void MaybeFullyEncodeMoreVariables(const CpModelProto& model_proto, Model* m) {
   fixpoint.ComputeFixedPoint();
 }
 
+void AddFullEncodingFromSearchBranching(const CpModelProto& model_proto,
+                                        Model* m) {
+  if (model_proto.search_strategy().empty()) return;
+
+  auto* mapping = m->GetOrCreate<CpModelMapping>();
+  auto* integer_trail = m->GetOrCreate<IntegerTrail>();
+  for (const DecisionStrategyProto& strategy : model_proto.search_strategy()) {
+    if (strategy.domain_reduction_strategy() ==
+        DecisionStrategyProto::SELECT_MEDIAN_VALUE) {
+      for (const int ref : strategy.variables()) {
+        if (!mapping->IsInteger(ref)) return;
+        const IntegerVariable variable = mapping->Integer(PositiveRef(ref));
+        if (!integer_trail->IsFixed(variable)) {
+          m->Add(FullyEncodeVariable(variable));
+        }
+      }
+    }
+  }
+}
+
 // ============================================================================
 // Constraint loading functions.
 // ============================================================================
@@ -1171,9 +1221,12 @@ void LoadLinearConstraint(const ConstraintProto& ct, Model* m) {
     max_sum += std::max(term_a, term_b);
   }
 
+  const SatParameters& params = *m->GetOrCreate<SatParameters>();
+  const IntegerValue domain_size_limit(
+      params.max_domain_size_when_encoding_eq_neq_constraints());
   if (ct.linear().vars_size() == 2 && !integer_trail->IsFixed(vars[0]) &&
-      !integer_trail->IsFixed(vars[1]) && max_domain_size < 16) {
-    const SatParameters& params = *m->GetOrCreate<SatParameters>();
+      !integer_trail->IsFixed(vars[1]) &&
+      max_domain_size <= domain_size_limit) {
     auto* encoder = m->GetOrCreate<IntegerEncoder>();
     if (params.boolean_encoding_level() > 0 && ConstraintIsEq(ct.linear()) &&
         ct.linear().domain(0) != min_sum && ct.linear().domain(0) != max_sum &&
@@ -1339,26 +1392,19 @@ void LoadIntMinConstraint(const ConstraintProto& ct, Model* m) {
   m->Add(IsEqualToMinOf(min, vars));
 }
 
-LinearExpression GetExprFromProto(const LinearExpressionProto& expr_proto,
-                                  const CpModelMapping& mapping) {
-  LinearExpression expr;
-  expr.vars = mapping.Integers(expr_proto.vars());
-  for (int j = 0; j < expr_proto.coeffs_size(); ++j) {
-    expr.coeffs.push_back(IntegerValue(expr_proto.coeffs(j)));
-  }
-  expr.offset = IntegerValue(expr_proto.offset());
-  return CanonicalizeExpr(expr);
-}
-
 void LoadLinMaxConstraint(const ConstraintProto& ct, Model* m) {
+  if (ct.lin_max().exprs().empty()) {
+    m->GetOrCreate<SatSolver>()->NotifyThatModelIsUnsat();
+    return;
+  }
+
   auto* mapping = m->GetOrCreate<CpModelMapping>();
-  const LinearExpression max =
-      GetExprFromProto(ct.lin_max().target(), *mapping);
+  const LinearExpression max = mapping->GetExprFromProto(ct.lin_max().target());
   std::vector<LinearExpression> negated_exprs;
   negated_exprs.reserve(ct.lin_max().exprs_size());
   for (int i = 0; i < ct.lin_max().exprs_size(); ++i) {
     negated_exprs.push_back(
-        NegationOf(GetExprFromProto(ct.lin_max().exprs(i), *mapping)));
+        NegationOf(mapping->GetExprFromProto(ct.lin_max().exprs(i))));
   }
   // TODO(user): Consider replacing the min propagator by max.
   m->Add(IsEqualToMinOf(NegationOf(max), negated_exprs));

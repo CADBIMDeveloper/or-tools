@@ -73,6 +73,23 @@ namespace Google.OrTools.Sat
             return Prod(var, coeff);
         }
 
+        public static LinearExpr Affine(IntVar var, long coeff, long offset)
+        {
+            if (offset == 0)
+            {
+                return Prod(var, coeff);
+            }
+            else
+            {
+                return new SumArray(Prod(var, coeff), offset);
+            }
+        }
+
+        public static LinearExpr Constant(long value)
+        {
+            return new ConstantExpr(value);
+        }
+
         public int Index
         {
             get {
@@ -264,7 +281,7 @@ namespace Google.OrTools.Sat
                 else if (expr is SumArray)
                 {
                     SumArray a = (SumArray)expr;
-                    constant += coeff * a.Constant;
+                    constant += coeff * a.Offset;
                     foreach (LinearExpr sub in a.Expressions)
                     {
                         if (sub is IntVar)
@@ -300,6 +317,11 @@ namespace Google.OrTools.Sat
                             coeffs.Add(coeff);
                         }
                     }
+                }
+                else if (expr is ConstantExpr)
+                {
+                    ConstantExpr cte = (ConstantExpr)expr;
+                    constant += coeff * cte.Value;
                 }
                 else if (expr is IntVar)
                 {
@@ -368,26 +390,26 @@ namespace Google.OrTools.Sat
             expressions_ = new List<LinearExpr>();
             AddExpr(a);
             AddExpr(b);
-            constant_ = 0L;
+            offset_ = 0L;
         }
 
         public SumArray(LinearExpr a, long b)
         {
             expressions_ = new List<LinearExpr>();
             AddExpr(a);
-            constant_ = b;
+            offset_ = b;
         }
 
         public SumArray(IEnumerable<LinearExpr> exprs)
         {
             expressions_ = new List<LinearExpr>(exprs);
-            constant_ = 0L;
+            offset_ = 0L;
         }
 
         public SumArray(IEnumerable<IntVar> vars)
         {
             expressions_ = new List<LinearExpr>(vars);
-            constant_ = 0L;
+            offset_ = 0L;
         }
 
         public SumArray(IntVar[] vars, long[] coeffs)
@@ -397,7 +419,7 @@ namespace Google.OrTools.Sat
             {
                 AddExpr(Prod(vars[i], coeffs[i]));
             }
-            constant_ = 0L;
+            offset_ = 0L;
         }
         public SumArray(IEnumerable<IntVar> vars, IEnumerable<long> coeffs)
         {
@@ -422,7 +444,7 @@ namespace Google.OrTools.Sat
             {
                 expressions_.Add(Prod(flat_vars[i], flat_coeffs[i]));
             }
-            constant_ = 0L;
+            offset_ = 0L;
         }
 
         public SumArray(IEnumerable<IntVar> vars, IEnumerable<int> coeffs)
@@ -448,7 +470,7 @@ namespace Google.OrTools.Sat
             {
                 expressions_.Add(Prod(flat_vars[i], flat_coeffs[i]));
             }
-            constant_ = 0L;
+            offset_ = 0L;
         }
 
         public void AddExpr(LinearExpr expr)
@@ -466,10 +488,10 @@ namespace Google.OrTools.Sat
             }
         }
 
-        public long Constant
+        public long Offset
         {
             get {
-                return constant_;
+                return offset_;
             }
         }
 
@@ -496,7 +518,24 @@ namespace Google.OrTools.Sat
         }
 
         private List<LinearExpr> expressions_;
-        private long constant_;
+        private long offset_;
+    }
+
+    public class ConstantExpr : LinearExpr
+    {
+        public ConstantExpr(long value)
+        {
+            value_ = value;
+        }
+
+        public long Value
+        {
+            get {
+                return value_;
+            }
+        }
+
+        private long value_;
     }
 
     public class IntVar : LinearExpr, ILiteral
@@ -510,13 +549,6 @@ namespace Google.OrTools.Sat
             var_.Domain.Add(domain.FlattenedIntervals());
             model.Variables.Add(var_);
             negation_ = null;
-        }
-
-        public int Index
-        {
-            get {
-                return index_;
-            }
         }
 
         public override int GetIndex()
@@ -581,7 +613,6 @@ namespace Google.OrTools.Sat
 
         private CpModelProto model_;
         private int index_;
-        private List<long> bounds_;
         private IntegerVariableProto var_;
         private NotBooleanVariable negation_;
     }

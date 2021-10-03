@@ -479,7 +479,7 @@ std::vector<double> DetectImpliedIntegers(MPModelProto* mp_model,
 
 namespace {
 
-// We use a class to reuse the temporay memory.
+// We use a class to reuse the temporary memory.
 struct ConstraintScaler {
   // Scales an individual constraint.
   ConstraintProto* AddConstraint(const MPModelProto& mp_model,
@@ -554,6 +554,14 @@ ConstraintProto* ConstraintScaler::AddConstraint(
 
   double scaling_factor = GetBestScalingOfDoublesToInt64(
       coefficients, lower_bounds, upper_bounds, scaling_target);
+  if (scaling_factor == 0.0) {
+    // TODO(user): Report error properly instead of ignoring constraint. Note
+    // however that this likely indicate a coefficient of inf in the constraint,
+    // so we should probably abort before reaching here.
+    LOG(DFATAL) << "Scaling factor of zero while scaling constraint: "
+                << mp_constraint.ShortDebugString();
+    return nullptr;
+  }
 
   // Returns the smallest factor of the form 2^i that gives us a relative sum
   // error of wanted_precision and still make sure we will have no integer
@@ -614,7 +622,11 @@ ConstraintProto* ConstraintScaler::AddConstraint(
     lb -= std::max(std::abs(lb), 1.0) * wanted_precision;
   }
   const Fractional scaled_lb = std::ceil(lb * scaling_factor);
-  if (lb == -kInfinity || scaled_lb <= std::numeric_limits<int64_t>::min()) {
+  if (lb == kInfinity || scaled_lb >= std::numeric_limits<int64_t>::max()) {
+    // Corner case: infeasible model.
+    arg->add_domain(std::numeric_limits<int64_t>::max());
+  } else if (lb == -kInfinity ||
+             scaled_lb <= std::numeric_limits<int64_t>::min()) {
     arg->add_domain(std::numeric_limits<int64_t>::min());
   } else {
     arg->add_domain(CeilRatio(IntegerValue(static_cast<int64_t>(scaled_lb)),
@@ -626,7 +638,11 @@ ConstraintProto* ConstraintScaler::AddConstraint(
     ub += std::max(std::abs(ub), 1.0) * wanted_precision;
   }
   const Fractional scaled_ub = std::floor(ub * scaling_factor);
-  if (ub == kInfinity || scaled_ub >= std::numeric_limits<int64_t>::max()) {
+  if (ub == -kInfinity || scaled_ub <= std::numeric_limits<int64_t>::min()) {
+    // Corner case: infeasible model.
+    arg->add_domain(std::numeric_limits<int64_t>::min());
+  } else if (ub == kInfinity ||
+             scaled_ub >= std::numeric_limits<int64_t>::max()) {
     arg->add_domain(std::numeric_limits<int64_t>::max());
   } else {
     arg->add_domain(FloorRatio(IntegerValue(static_cast<int64_t>(scaled_ub)),
@@ -852,6 +868,11 @@ bool ConvertMPModelProtoToCpModelProto(const SatParameters& params,
   if (!coefficients.empty() || mp_model.objective_offset() != 0.0) {
     double scaling_factor = GetBestScalingOfDoublesToInt64(
         coefficients, lower_bounds, upper_bounds, kScalingTarget);
+    if (scaling_factor == 0.0) {
+      LOG(ERROR) << "Scaling factor of zero while scaling objective! This "
+                    "likely indicate an infinite coefficient in the objective.";
+      return false;
+    }
 
     // Returns the smallest factor of the form 2^i that gives us an absolute
     // error of kWantedPrecision and still make sure we will have no integer

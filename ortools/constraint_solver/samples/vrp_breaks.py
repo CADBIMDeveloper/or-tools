@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # [START program]
-"""Vehicle Routing Problem with Time Windows (CVRPTW).
+"""Vehicle Routing Problem (VRP) with breaks.
 
-   This is a sample using the routing library python wrapper to solve a CVRPTW
+   This is a sample using the routing library python wrapper to solve a VRP
    problem.
    A description of the problem can be found here:
    http://en.wikipedia.org/wiki/Vehicle_routing_problem.
@@ -53,8 +53,8 @@ def create_data_model():
         [38, 43, 77, 28, 33, 52, 63, 37, 54, 40, 57, 13, 19, 21, 38, 0, 39],
         [33, 60, 37, 67, 62, 35, 24, 42, 25, 23, 17, 42, 36, 26, 9, 39, 0],
     ]
-    data['service_time'] = [15] * len(
-        data['time_matrix'])  # 15 min of service time
+    # 15 min of service time
+    data['service_time'] = [15] * len(data['time_matrix'])
     data['service_time'][data['depot']] = 0
     assert len(data['time_matrix']) == len(data['service_time'])
     return data
@@ -64,7 +64,7 @@ def create_data_model():
 # [START solution_printer]
 def print_solution(manager, routing, solution):
     """Prints solution on console."""
-    print('Objective: {}'.format(solution.ObjectiveValue()))
+    print(f'Objective: {solution.ObjectiveValue()}')
 
     print('Breaks:')
     intervals = solution.IntervalVarContainer()
@@ -105,14 +105,15 @@ def main():
 
     # Create the routing index manager.
     # [START index_manager]
-    manager = pywrapcp.RoutingIndexManager(len(data['time_matrix']),
-                                           data['num_vehicles'], data['depot'])
+    manager = pywrapcp.RoutingIndexManager(
+            len(data['time_matrix']),
+            data['num_vehicles'],
+            data['depot'])
     # [END index_manager]
 
     # Create Routing Model.
     # [START routing_model]
     routing = pywrapcp.RoutingModel(manager)
-
     # [END routing_model]
 
     # Create and register a transit callback.
@@ -153,7 +154,7 @@ def main():
         node_visit_transit[index] = data['service_time'][node]
 
     break_intervals = {}
-    for v in range(data['num_vehicles']):
+    for v in range(manager.GetNumberOfVehicles()):
         break_intervals[v] = [
             routing.solver().FixedDurationIntervalVar(
                 50,  # start min

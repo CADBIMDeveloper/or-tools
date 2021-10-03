@@ -32,6 +32,7 @@
 #include "ortools/glop/parameters.pb.h"
 #include "ortools/lp_data/lp_data.h"
 #include "ortools/lp_data/lp_print_utils.h"
+#include "ortools/lp_data/lp_types.h"
 #include "ortools/lp_data/lp_utils.h"
 #include "ortools/lp_data/matrix_utils.h"
 #include "ortools/lp_data/permutation.h"
@@ -68,6 +69,7 @@ class Cleanup {
     DCHECK_GT(num_cols_, col); \
   }
 
+// TODO(user): Remove this function.
 #define DCHECK_ROW_BOUNDS(row) \
   {                            \
     DCHECK_LE(0, row);         \
@@ -78,9 +80,6 @@ constexpr const uint64_t kDeterministicSeed = 42;
 
 RevisedSimplex::RevisedSimplex()
     : problem_status_(ProblemStatus::INIT),
-      num_rows_(0),
-      num_cols_(0),
-      first_slack_col_(0),
       objective_(),
       basis_(),
       variable_name_(),
@@ -103,31 +102,29 @@ RevisedSimplex::RevisedSimplex()
       entering_variable_(variables_info_, random_, &reduced_costs_),
       primal_prices_(random_, variables_info_, &primal_edge_norms_,
                      &reduced_costs_),
-      num_iterations_(0),
-      num_feasibility_iterations_(0),
-      num_optimization_iterations_(0),
-      total_time_(0.0),
-      feasibility_time_(0.0),
-      optimization_time_(0.0),
-      last_deterministic_time_update_(0.0),
       iteration_stats_(),
       ratio_test_stats_(),
       function_stats_("SimplexFunctionStats"),
       parameters_(),
-      test_lu_(),
-      feasibility_phase_(true) {
+      test_lu_() {
   SetParameters(parameters_);
 }
 
 void RevisedSimplex::ClearStateForNextSolve() {
   SCOPED_TIME_STAT(&function_stats_);
   solution_state_.statuses.clear();
+  variable_starting_values_.clear();
 }
 
 void RevisedSimplex::LoadStateForNextSolve(const BasisState& state) {
   SCOPED_TIME_STAT(&function_stats_);
   solution_state_ = state;
   solution_state_has_been_set_externally_ = true;
+}
+
+void RevisedSimplex::SetStartingVariableValuesForNextSolve(
+    const DenseRow& values) {
+  variable_starting_values_ = values;
 }
 
 void RevisedSimplex::NotifyThatMatrixIsUnchangedForNextSolve() {
@@ -138,10 +135,6 @@ Status RevisedSimplex::Solve(const LinearProgram& lp, TimeLimit* time_limit) {
   SCOPED_TIME_STAT(&function_stats_);
   DCHECK(lp.IsCleanedUp());
   GLOP_RETURN_ERROR_IF_NULL(time_limit);
-  if (!lp.IsInEquationForm()) {
-    return Status(Status::ERROR_INVALID_PROBLEM,
-                  "The problem is not in the equations form.");
-  }
   Cleanup update_deterministic_time_on_return(
       [this, time_limit]() { AdvanceDeterministicTime(time_limit); });
 
@@ -154,12 +147,14 @@ Status RevisedSimplex::Solve(const LinearProgram& lp, TimeLimit* time_limit) {
   update_row_.Invalidate();
   test_lu_.Clear();
   problem_status_ = ProblemStatus::INIT;
-  feasibility_phase_ = true;
+  phase_ = Phase::FEASIBILITY;
   num_iterations_ = 0;
   num_feasibility_iterations_ = 0;
   num_optimization_iterations_ = 0;
+  num_push_iterations_ = 0;
   feasibility_time_ = 0.0;
   optimization_time_ = 0.0;
+  push_time_ = 0.0;
   total_time_ = 0.0;
 
   // In case we abort because of an error, we cannot assume that the current
@@ -186,6 +181,8 @@ Status RevisedSimplex::Solve(const LinearProgram& lp, TimeLimit* time_limit) {
     LOG(INFO) << "The matrix has " << compact_matrix_.num_rows() << " rows, "
               << compact_matrix_.num_cols() << " columns, "
               << compact_matrix_.num_entries() << " entries.";
+    LOG(INFO) << "Initial number of super-basic variables: "
+              << ComputeNumberOfSuperBasicVariables();
   }
 
   // TODO(user): Avoid doing the first phase checks when we know from the
@@ -199,7 +196,8 @@ Status RevisedSimplex::Solve(const LinearProgram& lp, TimeLimit* time_limit) {
 
     if (parameters_.use_dedicated_dual_feasibility_algorithm()) {
       variables_info_.MakeBoxedVariableRelevant(false);
-      GLOP_RETURN_IF_ERROR(DualMinimize(feasibility_phase_, time_limit));
+      GLOP_RETURN_IF_ERROR(
+          DualMinimize(phase_ == Phase::FEASIBILITY, time_limit));
       DisplayIterationInfo();
 
       if (problem_status_ != ProblemStatus::DUAL_INFEASIBLE) {
@@ -227,9 +225,8 @@ Status RevisedSimplex::Solve(const LinearProgram& lp, TimeLimit* time_limit) {
       // refactorize/recompute the reduced costs if not already done.
       // TODO(user): Not ideal in an incremental setting.
       reduced_costs_.MakeReducedCostsPrecise();
-      bool unused;
-      RefactorizeBasisIfNeeded(&unused);
-      reduced_costs_.GetReducedCosts();
+      bool refactorize = reduced_costs_.NeedsBasisRefactorization();
+      GLOP_RETURN_IF_ERROR(RefactorizeBasisIfNeeded(&refactorize));
 
       const Fractional initial_infeasibility =
           reduced_costs_.ComputeMaximumDualInfeasibilityOnNonBoxedVariables();
@@ -246,7 +243,8 @@ Status RevisedSimplex::Solve(const LinearProgram& lp, TimeLimit* time_limit) {
         variables_info_.TransformToDualPhaseIProblem(
             reduced_costs_.GetDualFeasibilityTolerance(),
             reduced_costs_.GetReducedCosts());
-        variable_values_.ResetAllNonBasicVariableValues();
+        DenseRow zero;  // We want the FREE variable at zero here.
+        variable_values_.ResetAllNonBasicVariableValues(zero);
         variable_values_.RecomputeBasicVariableValues();
 
         // Optimize.
@@ -259,7 +257,8 @@ Status RevisedSimplex::Solve(const LinearProgram& lp, TimeLimit* time_limit) {
         variables_info_.EndDualPhaseI(
             reduced_costs_.GetDualFeasibilityTolerance(),
             reduced_costs_.GetFullReducedCosts());
-        variable_values_.ResetAllNonBasicVariableValues();
+        variable_values_.ResetAllNonBasicVariableValues(
+            variable_starting_values_);
         variable_values_.RecomputeBasicVariableValues();
 
         // TODO(user): Note that if there was cost shifts, we just keep them
@@ -281,7 +280,7 @@ Status RevisedSimplex::Solve(const LinearProgram& lp, TimeLimit* time_limit) {
       }
     }
   } else {
-    GLOP_RETURN_IF_ERROR(Minimize(time_limit));
+    GLOP_RETURN_IF_ERROR(PrimalMinimize(time_limit));
     DisplayIterationInfo();
 
     // After the primal phase I, we need to restore the objective.
@@ -291,13 +290,9 @@ Status RevisedSimplex::Solve(const LinearProgram& lp, TimeLimit* time_limit) {
     }
   }
 
-  // Reduced costs must be explicitly recomputed because DisplayErrors() is
-  // const.
-  // TODO(user): This API is not really nice.
-  reduced_costs_.GetReducedCosts();
   DisplayErrors();
 
-  feasibility_phase_ = false;
+  phase_ = Phase::OPTIMIZATION;
   feasibility_time_ = time_limit->GetElapsedTime() - start_time;
   primal_edge_norms_.SetPricingRule(parameters_.optimization_rule());
   num_feasibility_iterations_ = num_iterations_;
@@ -331,14 +326,15 @@ Status RevisedSimplex::Solve(const LinearProgram& lp, TimeLimit* time_limit) {
        ++num_optims) {
     if (problem_status_ == ProblemStatus::PRIMAL_FEASIBLE) {
       // Run the primal simplex.
-      GLOP_RETURN_IF_ERROR(Minimize(time_limit));
+      GLOP_RETURN_IF_ERROR(PrimalMinimize(time_limit));
     } else {
       // Run the dual simplex.
-      GLOP_RETURN_IF_ERROR(DualMinimize(feasibility_phase_, time_limit));
+      GLOP_RETURN_IF_ERROR(
+          DualMinimize(phase_ == Phase::FEASIBILITY, time_limit));
     }
 
-    // Minimize() or DualMinimize() always double check the result with maximum
-    // precision by refactoring the basis before exiting (except if an
+    // PrimalMinimize() or DualMinimize() always double check the result with
+    // maximum precision by refactoring the basis before exiting (except if an
     // iteration or time limit was reached).
     DCHECK(problem_status_ == ProblemStatus::PRIMAL_FEASIBLE ||
            problem_status_ == ProblemStatus::DUAL_FEASIBLE ||
@@ -354,16 +350,12 @@ Status RevisedSimplex::Solve(const LinearProgram& lp, TimeLimit* time_limit) {
     //
     // Note(user): Currently, we never do both at the same time, so we could
     // be a bit faster here, but then this is quick anyway.
-    variable_values_.ResetAllNonBasicVariableValues();
+    variable_values_.ResetAllNonBasicVariableValues(variable_starting_values_);
     GLOP_RETURN_IF_ERROR(basis_factorization_.Refactorize());
     PermuteBasis();
     variable_values_.RecomputeBasicVariableValues();
     reduced_costs_.ClearAndRemoveCostShifts();
 
-    // Reduced costs must be explicitly recomputed because DisplayErrors() is
-    // const.
-    // TODO(user): This API is not really nice.
-    reduced_costs_.GetReducedCosts();
     DisplayIterationInfo();
     DisplayErrors();
 
@@ -484,6 +476,38 @@ Status RevisedSimplex::Solve(const LinearProgram& lp, TimeLimit* time_limit) {
     }
   }
 
+  total_time_ = time_limit->GetElapsedTime() - start_time;
+  optimization_time_ = total_time_ - feasibility_time_;
+  num_optimization_iterations_ = num_iterations_ - num_feasibility_iterations_;
+
+  // If the user didn't provide starting variable values, then there is no need
+  // to check for super-basic variables.
+  if (!variable_starting_values_.empty()) {
+    const int num_super_basic = ComputeNumberOfSuperBasicVariables();
+    if (num_super_basic > 0) {
+      if (log_info) {
+        LOG(INFO) << "Num super-basic variables left after optimize phase: "
+                  << num_super_basic;
+      }
+      if (parameters_.push_to_vertex()) {
+        if (problem_status_ == ProblemStatus::OPTIMAL) {
+          if (log_info) LOG(INFO) << "------ Third phase: push.";
+          phase_ = Phase::PUSH;
+          GLOP_RETURN_IF_ERROR(PrimalPush(time_limit));
+          // TODO(user): We should re-check for feasibility at this point and
+          // apply clean-up as needed.
+        } else if (log_info) {
+          LOG(INFO) << "Skipping push phase because optimize didn't succeed.";
+        }
+      }
+    }
+  }
+
+  total_time_ = time_limit->GetElapsedTime() - start_time;
+  push_time_ = total_time_ - feasibility_time_ - optimization_time_;
+  num_push_iterations_ = num_iterations_ - num_feasibility_iterations_ -
+                         num_optimization_iterations_;
+
   // Store the result for the solution getters.
   solution_objective_value_ = ComputeInitialProblemObjectiveValue();
   solution_dual_values_ = reduced_costs_.GetDualValues();
@@ -506,10 +530,7 @@ Status RevisedSimplex::Solve(const LinearProgram& lp, TimeLimit* time_limit) {
     }
   }
 
-  total_time_ = time_limit->GetElapsedTime() - start_time;
-  optimization_time_ = total_time_ - feasibility_time_;
-  num_optimization_iterations_ = num_iterations_ - num_feasibility_iterations_;
-
+  variable_starting_values_.clear();
   DisplayAllStats();
   return Status::OK();
 }
@@ -806,28 +827,30 @@ void RevisedSimplex::UseSingletonColumnInInitialBasis(RowToColMapping* basis) {
 }
 
 bool RevisedSimplex::InitializeMatrixAndTestIfUnchanged(
-    const LinearProgram& lp, bool* only_change_is_new_rows,
-    bool* only_change_is_new_cols, ColIndex* num_new_cols) {
+    const LinearProgram& lp, bool lp_is_in_equation_form,
+    bool* only_change_is_new_rows, bool* only_change_is_new_cols,
+    ColIndex* num_new_cols) {
   SCOPED_TIME_STAT(&function_stats_);
   DCHECK(only_change_is_new_rows != nullptr);
   DCHECK(only_change_is_new_cols != nullptr);
   DCHECK(num_new_cols != nullptr);
-  DCHECK_NE(kInvalidCol, lp.GetFirstSlackVariable());
   DCHECK_EQ(num_cols_, compact_matrix_.num_cols());
   DCHECK_EQ(num_rows_, compact_matrix_.num_rows());
 
-  DCHECK_EQ(lp.num_variables(),
-            lp.GetFirstSlackVariable() + RowToColIndex(lp.num_constraints()));
-  DCHECK(IsRightMostSquareMatrixIdentity(lp.GetSparseMatrix()));
+  // This works whether the lp is in equation form (with slack) or not.
   const bool old_part_of_matrix_is_unchanged =
       AreFirstColumnsAndRowsExactlyEquals(
           num_rows_, first_slack_col_, lp.GetSparseMatrix(), compact_matrix_);
+
+  // This is the only adaptation we need for the test below.
+  const ColIndex lp_first_slack =
+      lp_is_in_equation_form ? lp.GetFirstSlackVariable() : lp.num_variables();
 
   // Test if the matrix is unchanged, and if yes, just returns true. Note that
   // this doesn't check the columns corresponding to the slack variables,
   // because they were checked by lp.IsInEquationForm() when Solve() was called.
   if (old_part_of_matrix_is_unchanged && lp.num_constraints() == num_rows_ &&
-      lp.num_variables() == num_cols_) {
+      lp_first_slack == first_slack_col_) {
     return true;
   }
 
@@ -835,38 +858,45 @@ bool RevisedSimplex::InitializeMatrixAndTestIfUnchanged(
   // new rows (i.e new constraints).
   *only_change_is_new_rows = old_part_of_matrix_is_unchanged &&
                              lp.num_constraints() > num_rows_ &&
-                             lp.GetFirstSlackVariable() == first_slack_col_;
+                             lp_first_slack == first_slack_col_;
 
   // Check if the new matrix can be derived from the old one just by adding
   // new columns (i.e new variables).
   *only_change_is_new_cols = old_part_of_matrix_is_unchanged &&
                              lp.num_constraints() == num_rows_ &&
-                             lp.GetFirstSlackVariable() > first_slack_col_;
-  *num_new_cols =
-      *only_change_is_new_cols ? lp.num_variables() - num_cols_ : ColIndex(0);
+                             lp_first_slack > first_slack_col_;
+  *num_new_cols = *only_change_is_new_cols ? lp_first_slack - first_slack_col_
+                                           : ColIndex(0);
 
   // Initialize first_slack_.
-  first_slack_col_ = lp.GetFirstSlackVariable();
+  first_slack_col_ = lp_first_slack;
 
   // Initialize the new dimensions.
   num_rows_ = lp.num_constraints();
-  num_cols_ = lp.num_variables();
+  num_cols_ = lp_first_slack + RowToColIndex(lp.num_constraints());
 
   // Populate compact_matrix_ and transposed_matrix_ if needed. Note that we
   // already added all the slack variables at this point, so matrix_ will not
   // change anymore.
-  // TODO(user): This can be sped up by removing the MatrixView.
-  compact_matrix_.PopulateFromMatrixView(MatrixView(lp.GetSparseMatrix()));
+  if (lp_is_in_equation_form) {
+    // TODO(user): This can be sped up by removing the MatrixView, but then
+    // this path will likely go away.
+    compact_matrix_.PopulateFromMatrixView(MatrixView(lp.GetSparseMatrix()));
+  } else {
+    compact_matrix_.PopulateFromSparseMatrixAndAddSlacks(lp.GetSparseMatrix());
+  }
   if (parameters_.use_transposed_matrix()) {
     transposed_matrix_.PopulateFromTranspose(compact_matrix_);
   }
   return false;
 }
 
+// Preconditions: This should only be called if there are only new variable
+// in the lp.
 bool RevisedSimplex::OldBoundsAreUnchangedAndNewVariablesHaveOneBoundAtZero(
-    const LinearProgram& lp, ColIndex num_new_cols) {
+    const LinearProgram& lp, bool lp_is_in_equation_form,
+    ColIndex num_new_cols) {
   SCOPED_TIME_STAT(&function_stats_);
-  DCHECK_EQ(lp.num_variables(), num_cols_);
   DCHECK_LE(num_new_cols, first_slack_col_);
   const ColIndex first_new_col(first_slack_col_ - num_new_cols);
 
@@ -879,6 +909,7 @@ bool RevisedSimplex::OldBoundsAreUnchangedAndNewVariablesHaveOneBoundAtZero(
       return false;
     }
   }
+
   // Check that each new variable has a bound of zero.
   for (ColIndex col(first_new_col); col < first_slack_col_; ++col) {
     if (lp.variable_lower_bounds()[col] != 0.0 &&
@@ -886,11 +917,25 @@ bool RevisedSimplex::OldBoundsAreUnchangedAndNewVariablesHaveOneBoundAtZero(
       return false;
     }
   }
+
   // Check that the slack bounds are unchanged.
-  for (ColIndex col(first_slack_col_); col < num_cols_; ++col) {
-    if (lower_bounds[col - num_new_cols] != lp.variable_lower_bounds()[col] ||
-        upper_bounds[col - num_new_cols] != lp.variable_upper_bounds()[col]) {
-      return false;
+  if (lp_is_in_equation_form) {
+    for (ColIndex col(first_slack_col_); col < num_cols_; ++col) {
+      if (lower_bounds[col - num_new_cols] != lp.variable_lower_bounds()[col] ||
+          upper_bounds[col - num_new_cols] != lp.variable_upper_bounds()[col]) {
+        return false;
+      }
+    }
+  } else {
+    DCHECK_EQ(num_rows_, lp.num_constraints());
+    for (RowIndex row(0); row < num_rows_; ++row) {
+      const ColIndex col = first_slack_col_ + RowToColIndex(row);
+      if (lower_bounds[col - num_new_cols] !=
+              -lp.constraint_upper_bounds()[row] ||
+          upper_bounds[col - num_new_cols] !=
+              -lp.constraint_lower_bounds()[row]) {
+        return false;
+      }
     }
   }
   return true;
@@ -902,31 +947,40 @@ bool RevisedSimplex::InitializeObjectiveAndTestIfUnchanged(
 
   bool objective_is_unchanged = true;
   objective_.resize(num_cols_, 0.0);
-  DCHECK_EQ(num_cols_, lp.num_variables());
+
+  // This function work whether the lp is in equation form (with slack) or
+  // without, since the objective of the slacks are always zero.
+  DCHECK_GE(num_cols_, lp.num_variables());
+  for (ColIndex col(lp.num_variables()); col < num_cols_; ++col) {
+    if (objective_[col] != 0.0) {
+      objective_is_unchanged = false;
+      objective_[col] = 0.0;
+    }
+  }
+
   if (lp.IsMaximizationProblem()) {
     // Note that we use the minimization version of the objective internally.
     for (ColIndex col(0); col < lp.num_variables(); ++col) {
       const Fractional coeff = -lp.objective_coefficients()[col];
       if (objective_[col] != coeff) {
         objective_is_unchanged = false;
+        objective_[col] = coeff;
       }
-      objective_[col] = coeff;
     }
     objective_offset_ = -lp.objective_offset();
     objective_scaling_factor_ = -lp.objective_scaling_factor();
   } else {
     for (ColIndex col(0); col < lp.num_variables(); ++col) {
-      if (objective_[col] != lp.objective_coefficients()[col]) {
+      const Fractional coeff = lp.objective_coefficients()[col];
+      if (objective_[col] != coeff) {
         objective_is_unchanged = false;
-        break;
+        objective_[col] = coeff;
       }
-    }
-    if (!objective_is_unchanged) {
-      objective_ = lp.objective_coefficients();
     }
     objective_offset_ = lp.objective_offset();
     objective_scaling_factor_ = lp.objective_scaling_factor();
   }
+
   return objective_is_unchanged;
 }
 
@@ -975,16 +1029,7 @@ Status RevisedSimplex::CreateInitialBasis() {
   // dual-feasible later by MakeBoxedVariableDualFeasible(), so it doesn't
   // really matter at which of their two finite bounds they start.
   variables_info_.InitializeToDefaultStatus();
-  variable_values_.ResetAllNonBasicVariableValues();
-
-  if (VLOG_IS_ON(1)) {
-    int num_free_variables = 0;
-    for (const VariableStatus status : variables_info_.GetStatusRow()) {
-      if (status == VariableStatus::FREE) ++num_free_variables;
-    }
-    VLOG(1) << "Number of free variables in the problem: "
-            << num_free_variables;
-  }
+  variable_values_.ResetAllNonBasicVariableValues(variable_starting_values_);
 
   // Start by using an all-slack basis.
   RowToColMapping basis(num_rows_, kInvalidCol);
@@ -1156,12 +1201,13 @@ Status RevisedSimplex::InitializeFirstBasis(const RowToColMapping& basis) {
   }
   DCHECK(BasisIsConsistent());
 
-  // TODO(user): Maybe return an error status if this is too high. Note however
-  // that if we want to do that, we need to reset variables_info_ to a
-  // consistent state.
-  variable_values_.ResetAllNonBasicVariableValues();
+  variable_values_.ResetAllNonBasicVariableValues(variable_starting_values_);
   variable_values_.RecomputeBasicVariableValues();
+
   if (VLOG_IS_ON(1)) {
+    // TODO(user): Maybe return an error status if this is too high. Note
+    // however that if we want to do that, we need to reset variables_info_ to a
+    // consistent state.
     const Fractional tolerance = parameters_.primal_feasibility_tolerance();
     if (variable_values_.ComputeMaximumPrimalResidual() > tolerance) {
       VLOG(1) << absl::StrCat(
@@ -1176,6 +1222,14 @@ Status RevisedSimplex::Initialize(const LinearProgram& lp) {
   parameters_ = initial_parameters_;
   PropagateParameters();
 
+  // We accept both kind of input.
+  //
+  // TODO(user): Ideally there should be no need to ever put the slack in the
+  // LinearProgram. That take extra memory (one big SparseColumn per slack) and
+  // just add visible overhead in incremental solve when one wants to add/remove
+  // constraints. But for historical reason, we handle both for now.
+  const bool lp_is_in_equation_form = lp.IsInEquationForm();
+
   // Calling InitializeMatrixAndTestIfUnchanged() first is important because
   // this is where num_rows_ and num_cols_ are computed.
   //
@@ -1188,13 +1242,15 @@ Status RevisedSimplex::Initialize(const LinearProgram& lp) {
   bool only_new_bounds = false;
   if (solution_state_.IsEmpty() || !notify_that_matrix_is_unchanged_) {
     matrix_is_unchanged = InitializeMatrixAndTestIfUnchanged(
-        lp, &only_change_is_new_rows, &only_change_is_new_cols, &num_new_cols);
+        lp, lp_is_in_equation_form, &only_change_is_new_rows,
+        &only_change_is_new_cols, &num_new_cols);
     only_new_bounds = only_change_is_new_cols && num_new_cols > 0 &&
                       OldBoundsAreUnchangedAndNewVariablesHaveOneBoundAtZero(
-                          lp, num_new_cols);
+                          lp, lp_is_in_equation_form, num_new_cols);
   } else if (DEBUG_MODE) {
     CHECK(InitializeMatrixAndTestIfUnchanged(
-        lp, &only_change_is_new_rows, &only_change_is_new_cols, &num_new_cols));
+        lp, lp_is_in_equation_form, &only_change_is_new_rows,
+        &only_change_is_new_cols, &num_new_cols));
   }
   notify_that_matrix_is_unchanged_ = false;
 
@@ -1202,8 +1258,12 @@ Status RevisedSimplex::Initialize(const LinearProgram& lp) {
   const bool objective_is_unchanged = InitializeObjectiveAndTestIfUnchanged(lp);
 
   const bool bounds_are_unchanged =
-      variables_info_.LoadBoundsAndReturnTrueIfUnchanged(
-          lp.variable_lower_bounds(), lp.variable_upper_bounds());
+      lp_is_in_equation_form
+          ? variables_info_.LoadBoundsAndReturnTrueIfUnchanged(
+                lp.variable_lower_bounds(), lp.variable_upper_bounds())
+          : variables_info_.LoadBoundsAndReturnTrueIfUnchanged(
+                lp.variable_lower_bounds(), lp.variable_upper_bounds(),
+                lp.constraint_lower_bounds(), lp.constraint_upper_bounds());
 
   // If parameters_.allow_simplex_algorithm_change() is true and we already have
   // a primal (resp. dual) feasible solution, then we use the primal (resp.
@@ -1254,7 +1314,8 @@ Status RevisedSimplex::Initialize(const LinearProgram& lp) {
       } else if (only_change_is_new_cols && only_new_bounds) {
         variables_info_.InitializeFromBasisState(first_slack_col_, num_new_cols,
                                                  solution_state_);
-        variable_values_.ResetAllNonBasicVariableValues();
+        variable_values_.ResetAllNonBasicVariableValues(
+            variable_starting_values_);
 
         const ColIndex first_new_col(first_slack_col_ - num_new_cols);
         for (ColIndex& col_ref : basis_) {
@@ -1280,7 +1341,8 @@ Status RevisedSimplex::Initialize(const LinearProgram& lp) {
           if (!bounds_are_unchanged) {
             variables_info_.InitializeFromBasisState(
                 first_slack_col_, ColIndex(0), solution_state_);
-            variable_values_.ResetAllNonBasicVariableValues();
+            variable_values_.ResetAllNonBasicVariableValues(
+                variable_starting_values_);
             variable_values_.RecomputeBasicVariableValues();
           }
           solve_from_scratch = false;
@@ -1310,32 +1372,70 @@ Status RevisedSimplex::Initialize(const LinearProgram& lp) {
   // reuse the variable statuses.
   const bool log_info = parameters_.log_search_progress() || VLOG_IS_ON(1);
   if (solve_from_scratch && !solution_state_.IsEmpty()) {
-    // If an external basis has been provided or if the matrix changed, we need
-    // to perform more work, e.g., factorize the proposed basis and validate it.
-    variables_info_.InitializeFromBasisState(first_slack_col_, ColIndex(0),
-                                             solution_state_);
-    basis_.assign(num_rows_, kInvalidCol);
-    RowIndex row(0);
-    for (ColIndex col : variables_info_.GetIsBasicBitRow()) {
-      basis_[row] = col;
-      ++row;
-    }
-
     basis_factorization_.Clear();
     reduced_costs_.ClearAndRemoveCostShifts();
     primal_edge_norms_.Clear();
     dual_edge_norms_.Clear();
     dual_pricing_vector_.clear();
 
-    // TODO(user): If the basis is incomplete, we could complete it with
-    // better slack variables than is done by InitializeFirstBasis() by
-    // using a partial LU decomposition (see markowitz.h).
-    if (InitializeFirstBasis(basis_).ok()) {
-      solve_from_scratch = false;
-    } else {
+    // If an external basis has been provided or if the matrix changed, we need
+    // to perform more work, e.g., factorize the proposed basis and validate it.
+    variables_info_.InitializeFromBasisState(first_slack_col_, ColIndex(0),
+                                             solution_state_);
+
+    // Use the set of basic columns as a "hint" to construct the first basis.
+    std::vector<ColIndex> candidates;
+    for (const ColIndex col : variables_info_.GetIsBasicBitRow()) {
+      candidates.push_back(col);
+    }
+    if (log_info) {
+      LOG(INFO) << "The warm-start state contains " << candidates.size()
+                << " candidates for the basis (num_rows = " << num_rows_
+                << ").";
+    }
+
+    // Optimization: Try to factorize it right away if we have the correct
+    // number of element. Ideally the other path below would no require a
+    // "double" factorization effort, so this would not be needed.
+    if (candidates.size() == num_rows_) {
+      basis_.clear();
+      for (const ColIndex col : candidates) {
+        basis_.push_back(col);
+      }
+
+      // TODO(user): Depending on the error here, there is no point doing extra
+      // work below. This is the case when we fail because of a bad initial
+      // condition number for instance.
+      if (InitializeFirstBasis(basis_).ok()) {
+        solve_from_scratch = false;
+      }
+    }
+
+    if (solve_from_scratch) {
+      basis_ = basis_factorization_.ComputeInitialBasis(candidates);
+      const int num_super_basic =
+          variables_info_.ChangeUnusedBasicVariablesToFree(basis_);
+      const int num_snapped = variables_info_.SnapFreeVariablesToBound(
+          parameters_.crossover_bound_snapping_distance(),
+          variable_starting_values_);
       if (log_info) {
-        LOG(INFO) << "RevisedSimplex is not using the warm start "
-                     "basis because it is not factorizable.";
+        LOG(INFO) << "The initial basis did not use " << num_super_basic
+                  << " BASIC columns from the initial state and used "
+                  << (num_rows_ - (candidates.size() - num_super_basic))
+                  << " slack variables that were not marked BASIC.";
+        if (num_snapped > 0) {
+          LOG(INFO) << num_snapped
+                    << " of the FREE variables where moved to their bound.";
+        }
+      }
+
+      if (InitializeFirstBasis(basis_).ok()) {
+        solve_from_scratch = false;
+      } else {
+        if (log_info) {
+          LOG(INFO) << "RevisedSimplex is not using the warm start "
+                       "basis because it is not factorizable.";
+        }
       }
     }
   }
@@ -1427,10 +1527,22 @@ ColIndex RevisedSimplex::ComputeNumberOfEmptyColumns() {
   for (ColIndex col(0); col < num_cols_; ++col) {
     if (compact_matrix_.column(col).IsEmpty()) {
       ++num_empty_cols;
-      VLOG(1) << "Column " << col << " is empty.";
+      VLOG(2) << "Column " << col << " is empty.";
     }
   }
   return num_empty_cols;
+}
+
+int RevisedSimplex::ComputeNumberOfSuperBasicVariables() const {
+  const VariableStatusRow& variable_statuses = variables_info_.GetStatusRow();
+  int num_super_basic = 0;
+  for (ColIndex col(0); col < num_cols_; ++col) {
+    if (variable_statuses[col] == VariableStatus::FREE &&
+        variable_values_.Get(col) != 0.0) {
+      ++num_super_basic;
+    }
+  }
+  return num_super_basic;
 }
 
 void RevisedSimplex::CorrectErrorsOnVariableValues() {
@@ -2260,6 +2372,29 @@ Status RevisedSimplex::UpdateAndPivot(ColIndex entering_col,
                                       RowIndex leaving_row,
                                       Fractional target_bound) {
   SCOPED_TIME_STAT(&function_stats_);
+
+  // Tricky and a bit hacky.
+  //
+  // The basis update code assumes that we already computed the left inverse of
+  // the leaving row, otherwise it will just refactorize the basis. This left
+  // inverse is needed by update_row_.ComputeUpdateRow(), so in most case it
+  // will already be computed. However, in some situation we don't need the
+  // full update row, so just the left inverse can be computed.
+  //
+  // TODO(user): Ideally this shouldn't be needed if we are going to refactorize
+  // the basis anyway. So we should know that before hand which is currently
+  // hard to do.
+  Fractional pivot_from_update_row;
+  if (update_row_.IsComputed()) {
+    pivot_from_update_row = update_row_.GetCoefficient(entering_col);
+  } else {
+    // We only need the left inverse and the update row position at the
+    // entering_col to check precision.
+    update_row_.ComputeUnitRowLeftInverse(leaving_row);
+    pivot_from_update_row = compact_matrix_.ColumnScalarProduct(
+        entering_col, update_row_.GetUnitRowLeftInverse().values);
+  }
+
   const DenseRow& lower_bounds = variables_info_.GetVariableLowerBounds();
   const DenseRow& upper_bounds = variables_info_.GetVariableUpperBounds();
   const ColIndex leaving_col = basis_[leaving_row];
@@ -2275,9 +2410,8 @@ Status RevisedSimplex::UpdateAndPivot(ColIndex entering_col,
   }
   UpdateBasis(entering_col, leaving_row, leaving_variable_status);
 
+  // Test precision by comparing two ways to get the "pivot".
   const Fractional pivot_from_direction = direction_[leaving_row];
-  const Fractional pivot_from_update_row =
-      update_row_.GetCoefficient(entering_col);
   const Fractional diff =
       std::abs(pivot_from_update_row - pivot_from_direction);
   if (diff > parameters_.refactorization_threshold() *
@@ -2295,28 +2429,9 @@ Status RevisedSimplex::UpdateAndPivot(ColIndex entering_col,
   return Status::OK();
 }
 
-bool RevisedSimplex::NeedsBasisRefactorization(bool refactorize) {
-  if (basis_factorization_.IsRefactorized()) return false;
-  if (reduced_costs_.NeedsBasisRefactorization()) return true;
-  const GlopParameters::PricingRule pricing_rule =
-      feasibility_phase_ ? parameters_.feasibility_rule()
-                         : parameters_.optimization_rule();
-  if (parameters_.use_dual_simplex()) {
-    // TODO(user): Currently the dual is always using STEEPEST_EDGE.
-    DCHECK_EQ(pricing_rule, GlopParameters::STEEPEST_EDGE);
-    if (dual_edge_norms_.NeedsBasisRefactorization()) return true;
-  } else {
-    if (pricing_rule == GlopParameters::STEEPEST_EDGE &&
-        primal_edge_norms_.NeedsBasisRefactorization()) {
-      return true;
-    }
-  }
-  return refactorize;
-}
-
 Status RevisedSimplex::RefactorizeBasisIfNeeded(bool* refactorize) {
   SCOPED_TIME_STAT(&function_stats_);
-  if (NeedsBasisRefactorization(*refactorize)) {
+  if (*refactorize && !basis_factorization_.IsRefactorized()) {
     GLOP_RETURN_IF_ERROR(basis_factorization_.Refactorize());
     update_row_.Invalidate();
     PermuteBasis();
@@ -2370,8 +2485,11 @@ Status RevisedSimplex::Polish(TimeLimit* time_limit) {
       fake_rc = -1.0;
     }
 
-    // Compute the direction and by how much we can move along it.
+    // Refactorize if needed.
+    if (reduced_costs_.NeedsBasisRefactorization()) refactorize = true;
     GLOP_RETURN_IF_ERROR(RefactorizeBasisIfNeeded(&refactorize));
+
+    // Compute the direction and by how much we can move along it.
     ComputeDirection(entering_col);
     Fractional step_length;
     RowIndex leaving_row;
@@ -2434,8 +2552,23 @@ Status RevisedSimplex::Polish(TimeLimit* time_limit) {
     // Perform the pivot.
     const ColIndex leaving_col = basis_[leaving_row];
     update_row_.ComputeUpdateRow(leaving_row);
+
+    // Note that this will only do work if the norms are computed.
+    //
+    // TODO(user): We should probably move all the "update" in a function so
+    // that all "iterations" function can just reuse the same code. Everything
+    // that is currently not "cleared" should be updated. If one does not want
+    // that, then it is easy to call Clear() on the quantities that do not needs
+    // to be kept in sync with the current basis.
     primal_edge_norms_.UpdateBeforeBasisPivot(
         entering_col, leaving_col, leaving_row, direction_, &update_row_);
+    dual_edge_norms_.UpdateBeforeBasisPivot(
+        entering_col, leaving_row, direction_,
+        update_row_.GetUnitRowLeftInverse());
+
+    // TODO(user): Rather than maintaining this, it is probably better to
+    // recompute it in one go after Polish() is done. We don't use the reduced
+    // costs here as we just assume that the set of candidates does not change.
     reduced_costs_.UpdateBeforeBasisPivot(entering_col, leaving_row, direction_,
                                           &update_row_);
 
@@ -2470,7 +2603,7 @@ Status RevisedSimplex::Polish(TimeLimit* time_limit) {
 // enter the basis, and a variable from x_B is selected to leave the basis.
 // To avoid explicit inversion of B, the algorithm solves two sub-systems:
 // y.B = c_B and B.d = a (a being the entering column).
-Status RevisedSimplex::Minimize(TimeLimit* time_limit) {
+Status RevisedSimplex::PrimalMinimize(TimeLimit* time_limit) {
   GLOP_RETURN_ERROR_IF_NULL(time_limit);
   Cleanup update_deterministic_time_on_return(
       [this, time_limit]() { AdvanceDeterministicTime(time_limit); });
@@ -2482,7 +2615,7 @@ Status RevisedSimplex::Minimize(TimeLimit* time_limit) {
   // lets always reset them for the first iteration below.
   primal_prices_.ForceRecomputation();
 
-  if (feasibility_phase_) {
+  if (phase_ == Phase::FEASIBILITY) {
     // Initialize the primal phase-I objective.
     // Note that this temporarily erases the problem objective.
     objective_.AssignToZero(num_cols_);
@@ -2496,12 +2629,17 @@ Status RevisedSimplex::Minimize(TimeLimit* time_limit) {
     // fix.
     IF_STATS_ENABLED(
         ScopedTimeDistributionUpdater timer(&iteration_stats_.total));
+
+    // Trigger a refactorization if one of the class we use request it.
+    if (reduced_costs_.NeedsBasisRefactorization()) refactorize = true;
+    if (primal_edge_norms_.NeedsBasisRefactorization()) refactorize = true;
     GLOP_RETURN_IF_ERROR(RefactorizeBasisIfNeeded(&refactorize));
+
     if (basis_factorization_.IsRefactorized()) {
       CorrectErrorsOnVariableValues();
       DisplayIterationInfo();
 
-      if (feasibility_phase_) {
+      if (phase_ == Phase::FEASIBILITY) {
         // Since the variable values may have been recomputed, we need to
         // recompute the primal infeasible variables and update their costs.
         if (variable_values_.UpdatePrimalPhaseICosts(
@@ -2513,7 +2651,7 @@ Status RevisedSimplex::Minimize(TimeLimit* time_limit) {
 
       // Computing the objective at each iteration takes time, so we just
       // check the limit when the basis is refactorized.
-      if (!feasibility_phase_ &&
+      if (phase_ == Phase::OPTIMIZATION &&
           ComputeObjectiveValue() < primal_objective_limit_) {
         VLOG(1) << "Stopping the primal simplex because"
                 << " the objective limit " << primal_objective_limit_
@@ -2522,7 +2660,7 @@ Status RevisedSimplex::Minimize(TimeLimit* time_limit) {
         objective_limit_reached_ = true;
         return Status::OK();
       }
-    } else if (feasibility_phase_) {
+    } else if (phase_ == Phase::FEASIBILITY) {
       // Note that direction_.non_zeros contains the positions of the basic
       // variables whose values were updated during the last iteration.
       if (variable_values_.UpdatePrimalPhaseICosts(direction_.non_zeros,
@@ -2531,12 +2669,11 @@ Status RevisedSimplex::Minimize(TimeLimit* time_limit) {
       }
     }
 
-    Fractional reduced_cost = 0.0;
     const ColIndex entering_col = primal_prices_.GetBestEnteringColumn();
     if (entering_col == kInvalidCol) {
       if (reduced_costs_.AreReducedCostsPrecise() &&
           basis_factorization_.IsRefactorized()) {
-        if (feasibility_phase_) {
+        if (phase_ == Phase::FEASIBILITY) {
           const Fractional primal_infeasibility =
               variable_values_.ComputeMaximumPrimalInfeasibility();
           if (primal_infeasibility <
@@ -2551,28 +2688,36 @@ Status RevisedSimplex::Minimize(TimeLimit* time_limit) {
           problem_status_ = ProblemStatus::OPTIMAL;
         }
         break;
-      } else {
-        VLOG(1) << "Optimal reached, double checking...";
-        reduced_costs_.MakeReducedCostsPrecise();
-        refactorize = true;
-        continue;
       }
-    } else {
-      reduced_cost = reduced_costs_.GetReducedCosts()[entering_col];
-      DCHECK(reduced_costs_.IsValidPrimalEnteringCandidate(entering_col));
 
-      // Solve the system B.d = a with a the entering column.
-      ComputeDirection(entering_col);
-      primal_edge_norms_.TestEnteringEdgeNormPrecision(entering_col,
-                                                       direction_);
-      if (!reduced_costs_.TestEnteringReducedCostPrecision(
-              entering_col, direction_, &reduced_cost)) {
-        primal_prices_.RecomputePriceAt(entering_col);
-        VLOG(1) << "Skipping col #" << entering_col << " whose reduced cost is "
-                << reduced_cost;
-        continue;
-      }
-      primal_prices_.RecomputePriceAt(entering_col);
+      VLOG(1) << "Optimal reached, double checking...";
+      reduced_costs_.MakeReducedCostsPrecise();
+      refactorize = true;
+      continue;
+    }
+
+    DCHECK(reduced_costs_.IsValidPrimalEnteringCandidate(entering_col));
+
+    // Solve the system B.d = a with a the entering column.
+    ComputeDirection(entering_col);
+
+    // This might trigger a recomputation on the next iteration, but we
+    // finish this one even if the price is imprecise.
+    primal_edge_norms_.TestEnteringEdgeNormPrecision(entering_col, direction_);
+    const Fractional reduced_cost =
+        reduced_costs_.TestEnteringReducedCostPrecision(entering_col,
+                                                        direction_);
+
+    // The test might have changed the reduced cost of the entering_col.
+    // If it is no longer a valid entering candidate, we loop.
+    primal_prices_.RecomputePriceAt(entering_col);
+    if (!reduced_costs_.IsValidPrimalEnteringCandidate(entering_col)) {
+      reduced_costs_.MakeReducedCostsPrecise();
+      VLOG(1) << "Skipping col #" << entering_col
+              << " whose reduced cost is no longer valid under precise reduced "
+                 "cost: "
+              << reduced_cost;
+      continue;
     }
 
     // This test takes place after the check for optimality/feasibility because
@@ -2588,7 +2733,7 @@ Status RevisedSimplex::Minimize(TimeLimit* time_limit) {
     Fractional step_length;
     RowIndex leaving_row;
     Fractional target_bound;
-    if (feasibility_phase_) {
+    if (phase_ == Phase::FEASIBILITY) {
       PrimalPhaseIChooseLeavingVariableRow(entering_col, reduced_cost,
                                            &refactorize, &leaving_row,
                                            &step_length, &target_bound);
@@ -2606,7 +2751,7 @@ Status RevisedSimplex::Minimize(TimeLimit* time_limit) {
         reduced_costs_.MakeReducedCostsPrecise();
         continue;
       }
-      if (feasibility_phase_) {
+      if (phase_ == Phase::FEASIBILITY) {
         // This shouldn't happen by construction.
         VLOG(1) << "Unbounded feasibility problem !?";
         problem_status_ = ProblemStatus::ABNORMAL;
@@ -2627,7 +2772,7 @@ Status RevisedSimplex::Minimize(TimeLimit* time_limit) {
     }
 
     Fractional step = (reduced_cost > 0.0) ? -step_length : step_length;
-    if (feasibility_phase_ && leaving_row != kInvalidRow) {
+    if (phase_ == Phase::FEASIBILITY && leaving_row != kInvalidRow) {
       // For phase-I we currently always set the leaving variable to its exact
       // bound even if by doing so we may take a small step in the wrong
       // direction and may increase the overall infeasibility.
@@ -2705,7 +2850,7 @@ Status RevisedSimplex::Minimize(TimeLimit* time_limit) {
       IF_STATS_ENABLED(timer.AlsoUpdate(&iteration_stats_.bound_flip));
     }
 
-    if (feasibility_phase_ && leaving_row != kInvalidRow) {
+    if (phase_ == Phase::FEASIBILITY && leaving_row != kInvalidRow) {
       // Set the leaving variable to its exact bound.
       variable_values_.SetNonBasicVariableValueFromStatus(leaving_col);
 
@@ -2768,7 +2913,10 @@ Status RevisedSimplex::DualMinimize(bool feasibility_phase,
     IF_STATS_ENABLED(
         ScopedTimeDistributionUpdater timer(&iteration_stats_.total));
 
+    // Trigger a refactorization if one of the class we use request it.
     const bool old_refactorize_value = refactorize;
+    if (reduced_costs_.NeedsBasisRefactorization()) refactorize = true;
+    if (dual_edge_norms_.NeedsBasisRefactorization()) refactorize = true;
     GLOP_RETURN_IF_ERROR(RefactorizeBasisIfNeeded(&refactorize));
 
     // If the basis is refactorized, we recompute all the values in order to
@@ -2778,23 +2926,16 @@ Status RevisedSimplex::DualMinimize(bool feasibility_phase,
       // because that may break the overall direction taken by the last steps
       // and may lead to less improvement on degenerate problems.
       //
+      // For now, we just recompute them if refactorize was set during the
+      // loop and not because of normal refactorization.
+      //
       // During phase-I, we do want the reduced costs to be as precise as
       // possible. TODO(user): Investigate why and fix the TODO in
       // PermuteBasis().
       //
       // Reduced costs are needed by MakeBoxedVariableDualFeasible(), so if we
       // do recompute them, it is better to do that first.
-      if (!feasibility_phase && !reduced_costs_.AreReducedCostsRecomputed() &&
-          !old_refactorize_value) {
-        const Fractional dual_residual_error =
-            reduced_costs_.ComputeMaximumDualResidual();
-        if (dual_residual_error >
-            reduced_costs_.GetDualFeasibilityTolerance()) {
-          VLOG(1) << "Recomputing reduced costs. Dual residual = "
-                  << dual_residual_error;
-          reduced_costs_.MakeReducedCostsPrecise();
-        }
-      } else {
+      if (feasibility_phase || old_refactorize_value) {
         reduced_costs_.MakeReducedCostsPrecise();
       }
 
@@ -2816,11 +2957,12 @@ Status RevisedSimplex::DualMinimize(bool feasibility_phase,
         // Computing the objective at each iteration takes time, so we just
         // check the limit when the basis is refactorized.
         //
-        // Hack: We need the feasibility_phase_ here and not the local variable
-        // because this must not be checked for the dual phase I algo that use
-        // the same code as the dual phase II (i.e. the local feasibility_phase
-        // will be false).
-        if (!feasibility_phase_ && dual_objective_limit_ != kInfinity &&
+        // Hack: We need phase_ here and not the local feasibility_phase
+        // variable because this must not be checked for the dual phase I algo
+        // that use the same code as the dual phase II (i.e. the local
+        // feasibility_phase will be false).
+        if (phase_ == Phase::OPTIMIZATION &&
+            dual_objective_limit_ != kInfinity &&
             ComputeObjectiveValue() > dual_objective_limit_) {
           VLOG(1) << "Stopping the dual simplex because"
                   << " the objective limit " << dual_objective_limit_
@@ -2831,7 +2973,6 @@ Status RevisedSimplex::DualMinimize(bool feasibility_phase,
         }
       }
 
-      reduced_costs_.GetReducedCosts();
       DisplayIterationInfo();
     } else {
       // Updates from the previous iteration that can be skipped if we
@@ -3036,8 +3177,186 @@ Status RevisedSimplex::DualMinimize(bool feasibility_phase,
   return Status::OK();
 }
 
+Status RevisedSimplex::PrimalPush(TimeLimit* time_limit) {
+  GLOP_RETURN_ERROR_IF_NULL(time_limit);
+  Cleanup update_deterministic_time_on_return(
+      [this, time_limit]() { AdvanceDeterministicTime(time_limit); });
+
+  DisplayIterationInfo();
+  bool refactorize = false;
+
+  // We clear all the quantities that we don't update so they will be recomputed
+  // later if needed.
+  primal_edge_norms_.Clear();
+  dual_edge_norms_.Clear();
+  update_row_.Invalidate();
+  reduced_costs_.ClearAndRemoveCostShifts();
+
+  std::vector<ColIndex> super_basic_cols;
+  for (const ColIndex col : variables_info_.GetNotBasicBitRow()) {
+    if (variables_info_.GetStatusRow()[col] == VariableStatus::FREE &&
+        variable_values_.Get(col) != 0) {
+      super_basic_cols.push_back(col);
+    }
+  }
+
+  while (!super_basic_cols.empty()) {
+    AdvanceDeterministicTime(time_limit);
+    if (time_limit->LimitReached()) break;
+
+    IF_STATS_ENABLED(
+        ScopedTimeDistributionUpdater timer(&iteration_stats_.total));
+    GLOP_RETURN_IF_ERROR(RefactorizeBasisIfNeeded(&refactorize));
+    if (basis_factorization_.IsRefactorized()) {
+      CorrectErrorsOnVariableValues();
+      DisplayIterationInfo();
+    }
+
+    // TODO(user): Select at random like in Polish().
+    ColIndex entering_col = super_basic_cols.back();
+
+    DCHECK(variables_info_.GetCanDecreaseBitRow()[entering_col]);
+    DCHECK(variables_info_.GetCanIncreaseBitRow()[entering_col]);
+
+    // Decide which direction to send the entering column.
+    // UNCONSTRAINED variables go towards zero. Other variables go towards their
+    // closest bound. We assume that we're at an optimal solution, so all FREE
+    // variables have approximately zero reduced cost, which means that the
+    // objective value won't change from moving this column into the basis.
+    // TODO(user): As an improvement for variables with two bounds, try both
+    // and pick one that doesn't require a basis change (if possible), otherwise
+    // pick the closer bound.
+    Fractional fake_rc;
+    const Fractional entering_value = variable_values_.Get(entering_col);
+    if (variables_info_.GetTypeRow()[entering_col] ==
+        VariableType::UNCONSTRAINED) {
+      if (entering_value > 0) {
+        fake_rc = 1.0;
+      } else {
+        fake_rc = -1.0;
+      }
+    } else {
+      const Fractional diff_ub =
+          variables_info_.GetVariableUpperBounds()[entering_col] -
+          entering_value;
+      const Fractional diff_lb =
+          entering_value -
+          variables_info_.GetVariableLowerBounds()[entering_col];
+      if (diff_lb <= diff_ub) {
+        fake_rc = 1.0;
+      } else {
+        fake_rc = -1.0;
+      }
+    }
+
+    // Solve the system B.d = a with a the entering column.
+    ComputeDirection(entering_col);
+
+    Fractional step_length;
+    RowIndex leaving_row;
+    Fractional target_bound;
+
+    GLOP_RETURN_IF_ERROR(ChooseLeavingVariableRow(entering_col, fake_rc,
+                                                  &refactorize, &leaving_row,
+                                                  &step_length, &target_bound));
+
+    if (refactorize) continue;
+
+    // At this point, we know the iteration will finish or stop with an error.
+    super_basic_cols.pop_back();
+
+    if (step_length == kInfinity || step_length == -kInfinity) {
+      if (variables_info_.GetTypeRow()[entering_col] ==
+          VariableType::UNCONSTRAINED) {
+        step_length = std::fabs(entering_value);
+      } else {
+        VLOG(1) << "Infinite step for bounded variable ?!";
+        problem_status_ = ProblemStatus::ABNORMAL;
+        break;
+      }
+    }
+
+    const Fractional step = (fake_rc > 0.0) ? -step_length : step_length;
+
+    // Store the leaving_col before basis_ change.
+    const ColIndex leaving_col =
+        (leaving_row == kInvalidRow) ? kInvalidCol : basis_[leaving_row];
+
+    // An iteration is called 'degenerate' if the leaving variable is already
+    // primal-infeasible and we make it even more infeasible or if we do a zero
+    // step.
+    // TODO(user): Test setting the step size to zero for degenerate steps.
+    // We don't need to force a positive step because each super-basic variable
+    // is pivoted in exactly once.
+    bool is_degenerate = false;
+    if (leaving_row != kInvalidRow) {
+      Fractional dir = -direction_[leaving_row] * step;
+      is_degenerate =
+          (dir == 0.0) ||
+          (dir > 0.0 && variable_values_.Get(leaving_col) >= target_bound) ||
+          (dir < 0.0 && variable_values_.Get(leaving_col) <= target_bound);
+
+      // If the iteration is not degenerate, the leaving variable should go to
+      // its exact target bound (it is how the step is computed).
+      if (!is_degenerate) {
+        DCHECK_EQ(step, ComputeStepToMoveBasicVariableToBound(leaving_row,
+                                                              target_bound));
+      }
+    }
+
+    variable_values_.UpdateOnPivoting(direction_, entering_col, step);
+    if (leaving_row != kInvalidRow) {
+      if (!is_degenerate) {
+        // On a non-degenerate iteration, the leaving variable should be at its
+        // exact bound. This corrects an eventual small numerical error since
+        // 'value + direction * step' where step is
+        // '(target_bound - value) / direction'
+        // may be slighlty different from target_bound.
+        variable_values_.Set(leaving_col, target_bound);
+      }
+      GLOP_RETURN_IF_ERROR(
+          UpdateAndPivot(entering_col, leaving_row, target_bound));
+      IF_STATS_ENABLED({
+        if (is_degenerate) {
+          timer.AlsoUpdate(&iteration_stats_.degenerate);
+        } else {
+          timer.AlsoUpdate(&iteration_stats_.normal);
+        }
+      });
+    } else {
+      // Snap the super-basic variable to its bound. Note that
+      // variable_values_.UpdateOnPivoting() should already be close to that but
+      // here we make sure it is exact and remove any small numerical errors.
+      if (variables_info_.GetTypeRow()[entering_col] ==
+          VariableType::UNCONSTRAINED) {
+        variable_values_.Set(entering_col, 0.0);
+      } else if (step > 0.0) {
+        SetNonBasicVariableStatusAndDeriveValue(entering_col,
+                                                VariableStatus::AT_UPPER_BOUND);
+      } else if (step < 0.0) {
+        SetNonBasicVariableStatusAndDeriveValue(entering_col,
+                                                VariableStatus::AT_LOWER_BOUND);
+      }
+      IF_STATS_ENABLED(timer.AlsoUpdate(&iteration_stats_.bound_flip));
+    }
+
+    ++num_iterations_;
+  }
+
+  if (!super_basic_cols.empty() > 0 &&
+      (parameters_.log_search_progress() || VLOG_IS_ON(1))) {
+    LOG(INFO) << "Push terminated early with " << super_basic_cols.size()
+              << " super-basic variables remaining.";
+  }
+
+  // TODO(user): What status should be returned if the time limit is hit?
+  // If the optimization phase finished, then OPTIMAL is technically correct
+  // but also misleading.
+
+  return Status::OK();
+}
+
 ColIndex RevisedSimplex::SlackColIndex(RowIndex row) const {
-  // TODO(user): Remove this function.
   DCHECK_ROW_BOUNDS(row);
   return first_slack_col_ + RowToColIndex(row);
 }
@@ -3097,42 +3416,57 @@ void RevisedSimplex::PropagateParameters() {
   update_row_.SetParameters(parameters_);
 }
 
-void RevisedSimplex::DisplayIterationInfo() const {
-  if (parameters_.log_search_progress() || VLOG_IS_ON(1)) {
-    Fractional objective;
-    std::string name;
-    if (!feasibility_phase_) {
-      // Note that in the dual phase II, ComputeObjectiveValue() is also
-      // computing the dual objective even if it uses the variable values. This
-      // is because if we modify the bounds to make the problem primal-feasible,
-      // we are at the optimal and hence the two objectives are the same.
-      objective = ComputeInitialProblemObjectiveValue();
-      name = "objective";
-    } else if (parameters_.use_dual_simplex()) {
-      if (parameters_.use_dedicated_dual_feasibility_algorithm()) {
-        objective = reduced_costs_.ComputeSumOfDualInfeasibilities();
-      } else {
-        // The internal objective of the transformed problem is the negation
-        // of the sum of the dual infeasibility of the original problem.
-        objective = -PreciseScalarProduct(
-            objective_, Transpose(variable_values_.GetDenseRow()));
-      }
-      name = "sum_dual_infeasibilities";
-    } else {
-      objective = variable_values_.ComputeSumOfPrimalInfeasibilities();
-      name = "sum_primal_infeasibilities";
-    }
+void RevisedSimplex::DisplayIterationInfo() {
+  const bool log = parameters_.log_search_progress() || VLOG_IS_ON(1);
+  if (!log) return;
 
-    const int iter = feasibility_phase_
-                         ? num_iterations_
-                         : num_iterations_ - num_feasibility_iterations_;
-    LOG(INFO) << (feasibility_phase_ ? "Feasibility" : "Optimization")
-              << " phase, iteration # " << iter << ", " << name << " = "
-              << absl::StrFormat("%.15E", objective);
+  switch (phase_) {
+    case Phase::FEASIBILITY: {
+      const int64_t iter = num_iterations_;
+      std::string name;
+      Fractional objective;
+      if (parameters_.use_dual_simplex()) {
+        if (parameters_.use_dedicated_dual_feasibility_algorithm()) {
+          objective = reduced_costs_.ComputeSumOfDualInfeasibilities();
+        } else {
+          // The internal objective of the transformed problem is the negation
+          // of the sum of the dual infeasibility of the original problem.
+          objective = -PreciseScalarProduct(
+              objective_, Transpose(variable_values_.GetDenseRow()));
+        }
+        name = "sum_dual_infeasibilities";
+      } else {
+        objective = variable_values_.ComputeSumOfPrimalInfeasibilities();
+        name = "sum_primal_infeasibilities";
+      }
+
+      LOG(INFO) << "Feasibility phase, iteration # " << iter << ", " << name
+                << " = " << absl::StrFormat("%.15E", objective);
+      break;
+    }
+    case Phase::OPTIMIZATION: {
+      const int64_t iter = num_iterations_ - num_feasibility_iterations_;
+      // Note that in the dual phase II, ComputeObjectiveValue() is also
+      // computing the dual objective even if it uses the variable values.
+      // This is because if we modify the bounds to make the problem
+      // primal-feasible, we are at the optimal and hence the two objectives
+      // are the same.
+      const Fractional objective = ComputeInitialProblemObjectiveValue();
+      LOG(INFO) << "Optimization phase, iteration # " << iter
+                << ", objective = " << absl::StrFormat("%.15E", objective);
+      break;
+    }
+    case Phase::PUSH: {
+      const int64_t iter = num_iterations_ - num_feasibility_iterations_ -
+                           num_optimization_iterations_;
+      LOG(INFO) << "Push phase, iteration # " << iter
+                << ", remaining_variables_to_push = "
+                << ComputeNumberOfSuperBasicVariables();
+    }
   }
 }
 
-void RevisedSimplex::DisplayErrors() const {
+void RevisedSimplex::DisplayErrors() {
   if (parameters_.log_search_progress() || VLOG_IS_ON(1)) {
     LOG(INFO) << "Primal infeasibility (bounds) = "
               << variable_values_.ComputeMaximumPrimalInfeasibility();

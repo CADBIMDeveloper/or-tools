@@ -14,8 +14,10 @@
 #include "ortools/sat/cp_model_utils.h"
 
 #include <cstdint>
+#include <functional>
 
 #include "ortools/base/stl_util.h"
+#include "ortools/sat/cp_model.pb.h"
 
 namespace operations_research {
 namespace sat {
@@ -97,6 +99,9 @@ IndexReferences GetReferencesUsedByConstraint(const ConstraintProto& ct) {
     case ConstraintProto::ConstraintCase::kAllDiff:
       AddIndices(ct.all_diff().vars(), &output.variables);
       break;
+    case ConstraintProto::ConstraintCase::kDummyConstraint:
+      AddIndices(ct.dummy_constraint().vars(), &output.variables);
+      break;
     case ConstraintProto::ConstraintCase::kElement:
       output.variables.push_back(ct.element().index());
       output.variables.push_back(ct.element().target());
@@ -146,6 +151,9 @@ IndexReferences GetReferencesUsedByConstraint(const ConstraintProto& ct) {
     case ConstraintProto::ConstraintCase::kCumulative:
       output.variables.push_back(ct.cumulative().capacity());
       AddIndices(ct.cumulative().demands(), &output.variables);
+      for (const LinearExpressionProto& lin : ct.cumulative().energies()) {
+        AddIndices(lin.vars(), &output.variables);
+      }
       break;
     case ConstraintProto::ConstraintCase::CONSTRAINT_NOT_SET:
       break;
@@ -201,6 +209,8 @@ void ApplyToAllLiteralIndices(const std::function<void(int*)>& f,
     case ConstraintProto::ConstraintCase::kLinear:
       break;
     case ConstraintProto::ConstraintCase::kAllDiff:
+      break;
+    case ConstraintProto::ConstraintCase::kDummyConstraint:
       break;
     case ConstraintProto::ConstraintCase::kElement:
       break;
@@ -283,6 +293,9 @@ void ApplyToAllVariableIndices(const std::function<void(int*)>& f,
     case ConstraintProto::ConstraintCase::kAllDiff:
       APPLY_TO_REPEATED_FIELD(all_diff, vars);
       break;
+    case ConstraintProto::ConstraintCase::kDummyConstraint:
+      APPLY_TO_REPEATED_FIELD(dummy_constraint, vars);
+      break;
     case ConstraintProto::ConstraintCase::kElement:
       APPLY_TO_SINGULAR_FIELD(element, index);
       APPLY_TO_SINGULAR_FIELD(element, target);
@@ -329,6 +342,12 @@ void ApplyToAllVariableIndices(const std::function<void(int*)>& f,
     case ConstraintProto::ConstraintCase::kCumulative:
       APPLY_TO_SINGULAR_FIELD(cumulative, capacity);
       APPLY_TO_REPEATED_FIELD(cumulative, demands);
+      for (int i = 0; i < ct->cumulative().energies_size(); ++i) {
+        for (int& r :
+             *ct->mutable_cumulative()->mutable_energies(i)->mutable_vars()) {
+          f(&r);
+        }
+      }
       break;
     case ConstraintProto::ConstraintCase::CONSTRAINT_NOT_SET:
       break;
@@ -365,6 +384,8 @@ void ApplyToAllIntervalIndices(const std::function<void(int*)>& f,
     case ConstraintProto::ConstraintCase::kLinear:
       break;
     case ConstraintProto::ConstraintCase::kAllDiff:
+      break;
+    case ConstraintProto::ConstraintCase::kDummyConstraint:
       break;
     case ConstraintProto::ConstraintCase::kElement:
       break;
@@ -431,6 +452,8 @@ std::string ConstraintCaseName(
       return "kLinear";
     case ConstraintProto::ConstraintCase::kAllDiff:
       return "kAllDiff";
+    case ConstraintProto::ConstraintCase::kDummyConstraint:
+      return "kDummyConstraint";
     case ConstraintProto::ConstraintCase::kElement:
       return "kElement";
     case ConstraintProto::ConstraintCase::kCircuit:
@@ -503,6 +526,8 @@ std::vector<int> UsedIntervals(const ConstraintProto& ct) {
     case ConstraintProto::ConstraintCase::kLinear:
       break;
     case ConstraintProto::ConstraintCase::kAllDiff:
+      break;
+    case ConstraintProto::ConstraintCase::kDummyConstraint:
       break;
     case ConstraintProto::ConstraintCase::kElement:
       break;

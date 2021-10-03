@@ -14,12 +14,13 @@
 #ifndef OR_TOOLS_SAT_CP_MODEL_SEARCH_H_
 #define OR_TOOLS_SAT_CP_MODEL_SEARCH_H_
 
+#include <cstdint>
 #include <functional>
 #include <vector>
 
 #include "ortools/base/integral_types.h"
 #include "ortools/sat/cp_model.pb.h"
-#include "ortools/sat/cp_model_loader.h"
+#include "ortools/sat/cp_model_mapping.h"
 #include "ortools/sat/integer.h"
 #include "ortools/sat/integer_search.h"
 #include "ortools/sat/model.h"
@@ -60,11 +61,13 @@ class CpModelView {
   // Helpers to generate a decision.
   BooleanOrIntegerLiteral GreaterOrEqual(int var, int64_t value) const;
   BooleanOrIntegerLiteral LowerOrEqual(int var, int64_t value) const;
+  BooleanOrIntegerLiteral MedianValue(int var) const;
 
  private:
   const CpModelMapping& mapping_;
   const VariablesAssignment& boolean_assignment_;
   const IntegerTrail& integer_trail_;
+  const IntegerEncoder& integer_encoder_;
 };
 
 // Constructs the search strategy specified in the given CpModelProto. A

@@ -22,6 +22,7 @@ option java_package = "com.google.ortools.sat";
 option java_multiple_files = true;
 option java_outer_classname = "CpModelProtobuf";
 
+
 // An integer variable.
 //
 // It will be referred to by an int32 corresponding to its index in a
@@ -154,20 +155,33 @@ message NoOverlapConstraintProto {
 }
 
 // The boxes defined by [start_x, end_x) * [start_y, end_y) cannot overlap.
+// Furthermore, one box is optional if at least one of the x or y interval is
+// optional.
 message NoOverlap2DConstraintProto {
   repeated int32 x_intervals = 1;
   repeated int32 y_intervals = 2;  // Same size as x_intervals.
   bool boxes_with_null_area_can_overlap = 3;
+  // TODO(user): Add optional areas as repeated LinearExpressionProto.
 }
 
 // The sum of the demands of the intervals at each interval point cannot exceed
 // a capacity. Note that intervals are interpreted as [start, end) and as
 // such intervals like [2,3) and [3,4) do not overlap for the point of view of
 // this constraint. Moreover, intervals of size zero are ignored.
+//
+// TODO(user,user): Switch to linear expression for demands and capacity.
 message CumulativeConstraintProto {
   int32 capacity = 1;
   repeated int32 intervals = 2;
   repeated int32 demands = 3;  // Same size as intervals.
+
+  // EXPERIMENTAL: This optional field adds a redundant and more precise
+  // representation of the energy of a task (instead of the traditional demand *
+  // duration. This is only used by the linear relaxation, and it is only useful
+  // if both demand and durations are variable, and if the additional linear
+  // equation if more precise than the linear relaxation (McCormick equation) of
+  // the product demand * duration.
+  repeated LinearExpressionProto energies = 4;
 }
 
 // Maintain a reservoir level within bounds. The water level starts at 0, and at
@@ -218,6 +232,11 @@ message CircuitConstraintProto {
 // - Self-arcs are allowed except for node 0.
 // - There is no cycle in this graph, except through node 0.
 //
+// Note: Currently this constraint expect all the nodes in [0, num_nodes) to
+// have at least one incident arc. The model will be considered invalid if it
+// is not the case. You can add self-arc fixed to one to ignore some nodes if
+// needed.
+//
 // TODO(user): It is probably possible to generalize this constraint to a
 // no-cycle in a general graph, or a no-cycle with sum incoming <= 1 and sum
 // outgoing <= 1 (more efficient implementation). On the other hand, having this
@@ -227,7 +246,7 @@ message RoutesConstraintProto {
   repeated int32 heads = 2;
   repeated int32 literals = 3;
 
-  // Experimental. The demands for each node, and the maximum capacity for each
+  // EXPERIMENTAL. The demands for each node, and the maximum capacity for each
   // route. Note that this is currently only used for the LP relaxation and one
   // need to add the corresponding constraint to enforce this outside of the LP.
   //
@@ -280,7 +299,12 @@ message AutomatonConstraintProto {
   repeated int32 vars = 7;
 }
 
-// Next id: 30
+// A list of variables, without any semantics.
+message ListOfVariablesProto {
+  repeated int32 vars = 1;
+}
+
+// Next id: 31
 message ConstraintProto {
   // For debug/logging only. Can be empty.
   string name = 1;
@@ -344,11 +368,13 @@ message ConstraintProto {
     BoolArgumentProto bool_xor = 5;
 
     // The int_div constraint forces the target to equal vars[0] / vars[1].
-    // In particular, vars[1] can never take the value 0.
+    // In particular, vars[1] can never take the value 0. Also, as for now, we
+    // do not support vars[1] spanning across 0.
     IntegerArgumentProto int_div = 7;
 
     // The int_mod constraint forces the target to equal vars[0] % vars[1].
-    // The domain of vars[1] must be strictly positive.
+    // The domain of vars[1] must be strictly positive. The sign of the target
+    // is the same as the sign of vars[0].
     IntegerArgumentProto int_mod = 8;
 
     // The int_max constraint forces the target to equal the maximum of all
@@ -374,6 +400,10 @@ message ConstraintProto {
     // The int_prod constraint forces the target to equal the product of all
     // variables. By convention, because we can just remove term equal to one,
     // the empty product forces the target to be one.
+    //
+    // Note that the solver checks for potential integer overflow. So it is
+    // recommended to limit the domain of the variables such that the product
+    // fits in [INT_MIN + 1..INT_MAX - 1].
     //
     // TODO(user): Support more than two terms in the product.
     IntegerArgumentProto int_prod = 11;
@@ -438,6 +468,10 @@ message ConstraintProto {
     // of the demands of the intervals containing that point does not exceed
     // the capacity.
     CumulativeConstraintProto cumulative = 22;
+
+    // This constraint is not meant to be used and will be rejected by the
+    // solver. It is meant to mark variable when testing the presolve code.
+    ListOfVariablesProto dummy_constraint = 30;
   }
 }
 
@@ -538,7 +572,7 @@ message DenseMatrixProto {
   repeated int32 entries = 3;
 }
 
-// Experimental. For now, this is meant to be used by the solver and not filled
+// EXPERIMENTAL. For now, this is meant to be used by the solver and not filled
 // by clients.
 //
 // Hold symmetry information about the set of feasible solutions. If we permute
@@ -720,6 +754,10 @@ message CpSolverResponse {
   // If you really want a minimal subset, a possible way to get one is by
   // changing your model to minimize the number of assumptions at false, but
   // this is likely an harder problem to solve.
+  //
+  // Important: Currently, this is minimized only in single-thread and if the
+  // problem is not an optimization problem, otherwise, it will always include
+  // all the assumptions.
   //
   // TODO(user): Allows for returning multiple core at once.
   repeated int32 sufficient_assumptions_for_infeasibility = 23;

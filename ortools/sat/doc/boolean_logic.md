@@ -3,6 +3,7 @@
 
 # Boolean logic recipes for the CP-SAT solver.
 
+https://developers.google.com/optimization/
 
 
 <!--ts-->
@@ -434,7 +435,8 @@ def BooleanProductSampleSat():
   # Create a solver and solve.
   solver = cp_model.CpSolver()
   solution_printer = cp_model.VarArraySolutionPrinter([x, y, p])
-  solver.SearchForAllSolutions(model, solution_printer)
+  solver.parameters.enumerate_all_solutions = True
+  solver.Solve(model, solution_printer)
 
 
 BooleanProductSampleSat()

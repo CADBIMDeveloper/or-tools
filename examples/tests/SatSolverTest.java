@@ -19,18 +19,23 @@ import com.google.ortools.sat.CpSolverStatus;
 import com.google.ortools.sat.IntVar;
 import com.google.ortools.sat.LinearExpr;
 import com.google.ortools.util.Domain;
-import java.util.function.Consumer;
+import java.lang.Thread;
 import java.util.Random;
+import java.util.function.Consumer;
 import java.util.logging.Logger;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 /** Tests the CP-SAT java interface. */
 public class SatSolverTest {
   private static final Logger logger = Logger.getLogger(SatSolverTest.class.getName());
+  @BeforeEach
+  public void setUp() {
+    Loader.loadNativeLibraries();
+  }
 
   @Test
   public void testDomainGetter() {
-    Loader.loadNativeLibraries();
     System.out.println("testDomainGetter");
     CpModel model = new CpModel();
 
@@ -46,7 +51,6 @@ public class SatSolverTest {
 
   @Test
   public void testCrashInPresolve() {
-    Loader.loadNativeLibraries();
     System.out.println("testCrashInPresolve");
     CpModel model = new CpModel();
 
@@ -82,7 +86,6 @@ public class SatSolverTest {
   private IntVar[] entitiesOne;
   @Test
   public void testCrashInSolveWithAllowedAssignment() {
-    Loader.loadNativeLibraries();
     System.out.println("testCrashInSolveWithAllowedAssignment");
     final CpModel model = new CpModel();
     final int numEntityOne = 50000;
@@ -112,7 +115,6 @@ public class SatSolverTest {
 
   @Test
   public void testCrashEquality() {
-    Loader.loadNativeLibraries();
     System.out.println("testCrashInSolveWithAllowedAssignment");
     final CpModel model = new CpModel();
 
@@ -176,11 +178,22 @@ public class SatSolverTest {
     model.addDifferent(x, y);
 
     // Creates a solver and solves the model.
-    CpSolver solver = new CpSolver();
+    final CpSolver solver = new CpSolver();
     StringBuilder logBuilder = new StringBuilder();
-    Consumer<String> appendToLog = (String message) -> logBuilder.append(message).append('\n');
+    Consumer<String> appendToLog = (String message) -> {
+      System.out.println(
+          "Current Thread Name:" + Thread.currentThread().getName()
+          + " Id:" + Thread.currentThread().getId()
+          + " msg:" + message
+          );
+      logBuilder.append(message).append('\n');
+    };
     solver.setLogCallback(appendToLog);
-    solver.getParameters().setLogToStdout(false).setLogSearchProgress(true);
+    solver.getParameters()
+      .setLogToStdout(false)
+      .setLogSearchProgress(true)
+      //.setNumSearchWorkers(1)
+      ;
     CpSolverStatus status = solver.solve(model);
 
     String log = logBuilder.toString();

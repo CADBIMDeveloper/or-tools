@@ -59,11 +59,10 @@ tools/docker/export
 # IDE stuff
 CMakeLists.txt.user
 *.userprefs
-*build*/*
 .idea/*
 .idea/
-build/
 cache/
+.cache/
 **/.vscode/*
 .DS_Store
 **/.vs/*
@@ -87,3 +86,10 @@ examples/contrib/obj
 examples/dotnet/bin
 examples/dotnet/obj
 
+# cmake code gen (assumes -Bbuild)
+.cmake/
+CMakeCache.txt
+CMakeFiles
+DartConfiguration.tcl
+*build*/*
+build/

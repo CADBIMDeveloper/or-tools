@@ -31,6 +31,7 @@
 #include "ortools/sat/model.h"
 #include "ortools/sat/sat_base.h"
 #include "ortools/sat/sat_parameters.pb.h"
+#include "ortools/sat/util.h"
 #include "ortools/util/bitset.h"
 #include "ortools/util/logging.h"
 #include "ortools/util/time_limit.h"
@@ -58,7 +59,7 @@ class SharedSolutionRepository {
     // this rank is actually the unscaled internal minimization objective.
     // Remove this assumptions by simply recomputing this value since it is not
     // too costly to do so.
-    int64_t rank;
+    int64_t rank = 0;
 
     std::vector<ValueType> variable_values;
 
@@ -164,16 +165,21 @@ class SharedIncompleteSolutionManager {
   mutable absl::Mutex mutex_;
 };
 
-// Manages the global best response kept by the solver.
-// All functions are thread-safe.
+// Manages the global best response kept by the solver. This class is
+// responsible for logging the progress of the solutions and bounds as they are
+// found.
+//
+// All functions are thread-safe except if specified otherwise.
 class SharedResponseManager {
  public:
-  // If log_updates is true, then all updates to the global "state" will be
-  // logged. This class is responsible for our solver log progress.
-  SharedResponseManager(bool enumerate_all_solutions, const CpModelProto* proto,
-                        const WallTimer* wall_timer,
-                        SharedTimeLimit* shared_time_limit,
-                        SolverLogger* logger);
+  explicit SharedResponseManager(Model* model);
+
+  // Loads the initial objective bounds and keep a reference to the objective to
+  // properly display the scaled bounds. This is optional if the model has no
+  // objective.
+  //
+  // This function is not thread safe.
+  void InitializeObjective(const CpModelProto& cp_model);
 
   // Reports OPTIMAL and stop the search if any gap limit are specified and
   // crossed. By default, we only stop when we have the true optimal, which is
@@ -185,11 +191,28 @@ class SharedResponseManager {
   //
   // Note that the solver statistics correspond to the last time a better
   // solution was found or SetStatsFromModel() was called.
-  CpSolverResponse GetResponse();
+  //
+  // If full response is true, we will do more postprocessing by calling all the
+  // AddFinalSolutionPostprocessor() postprocesors. Note that the response given
+  // to the AddSolutionCallback() will not call them.
+  CpSolverResponse GetResponse(bool full_response = true);
+
+  // These "postprocessing" steps will be applied in REVERSE order of
+  // registration to all solution passed to the callbacks.
+  void AddSolutionPostprocessor(
+      std::function<void(CpSolverResponse*)> postprocessor);
+
+  // These "postprocessing" steps will only be applied after the others to the
+  // solution returned by GetResponse().
+  void AddFinalSolutionPostprocessor(
+      std::function<void(CpSolverResponse*)> postprocessor);
 
   // Adds a callback that will be called on each new solution (for
   // statisfiablity problem) or each improving new solution (for an optimization
   // problem). Returns its id so it can be unregistered if needed.
+  //
+  // Note that adding a callback is not free since the solution will be
+  // postsolved before this is called.
   //
   // Note that currently the class is waiting for the callback to finish before
   // accepting any new updates. That could be changed if needed.
@@ -300,6 +323,15 @@ class SharedResponseManager {
   // Display improvement stats.
   void DisplayImprovementStatistics();
 
+  // This is here for the few codepath that needs to modify the returned
+  // response directly. Note that this do not work in parallel.
+  //
+  // TODO(user): This can probably be removed.
+  CpSolverResponse* MutableResponse() {
+    absl::MutexLock mutex_lock(&mutex_);
+    return &best_response_;
+  }
+
  private:
   void TestGapLimitsIfNeeded() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   void FillObjectiveValuesInBestResponse()
@@ -314,9 +346,9 @@ class SharedResponseManager {
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   const bool enumerate_all_solutions_;
-  const CpModelProto& model_proto_;
   const WallTimer& wall_timer_;
-  SharedTimeLimit* shared_time_limit_;
+  ModelSharedTimeLimit* shared_time_limit_;
+  CpObjectiveProto const* objective_or_null_ = nullptr;
 
   mutable absl::Mutex mutex_;
 
@@ -348,6 +380,11 @@ class SharedResponseManager {
   int next_callback_id_ ABSL_GUARDED_BY(mutex_) = 0;
   std::vector<std::pair<int, std::function<void(const CpSolverResponse&)>>>
       callbacks_ ABSL_GUARDED_BY(mutex_);
+
+  std::vector<std::function<void(CpSolverResponse*)>> postprocessors_
+      ABSL_GUARDED_BY(mutex_);
+  std::vector<std::function<void(CpSolverResponse*)>> final_postprocessors_
+      ABSL_GUARDED_BY(mutex_);
 
   // Dump prefix.
   std::string dump_prefix_;
@@ -499,7 +536,7 @@ void SharedSolutionRepository<ValueType>::Synchronize() {
   // We use a stable sort to keep the num_selected count for the already
   // existing solutions.
   //
-  // TODO(user): Intoduce a notion of orthogonality to diversify the pool?
+  // TODO(user): Introduce a notion of orthogonality to diversify the pool?
   gtl::STLStableSortAndRemoveDuplicates(&solutions_);
   if (solutions_.size() > num_solutions_to_keep_) {
     solutions_.resize(num_solutions_to_keep_);

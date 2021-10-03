@@ -347,14 +347,15 @@ $(JAVA_ORTOOLS_JAR): \
  $(GEN_DIR)/java/com/google/ortools/constraintsolver/RoutingParameters.java \
  $(GEN_DIR)/java/com/google/ortools/constraintsolver/RoutingEnums.java \
  $(GEN_DIR)/java/com/google/ortools/linearsolver/MPModelProto.java \
+ $(GEN_DIR)/java/com/google/ortools/sat/CpModelProto.java \
  $(GEN_DIR)/java/com/google/ortools/sat/SatParameters.java \
  $(GEN_DIR)/java/com/google/ortools/util/OptionalBoolean.java \
- $(GEN_DIR)/java/com/google/ortools/sat/CpModelProto.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/Loader.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/constraintsolver/IntIntToLongFunction.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/constraintsolver/JavaDecisionBuilder.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/constraintsolver/LongTernaryOperator.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/constraintsolver/LongTernaryPredicate.java \
+ $(SRC_DIR)/ortools/java/com/google/ortools/sat/Constant.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/sat/Constraint.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/sat/CpModel.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/sat/CpSolver.java \
@@ -366,6 +367,7 @@ $(JAVA_ORTOOLS_JAR): \
  $(SRC_DIR)/ortools/java/com/google/ortools/sat/Literal.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/sat/NotBooleanVariable.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/sat/ScalProd.java \
+ $(SRC_DIR)/ortools/java/com/google/ortools/sat/Sum.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/sat/SumOfVariables.java \
  | $(CLASS_DIR)/com/google/ortools
 	"$(JAVAC_BIN)" -encoding UTF-8 -d $(CLASS_DIR) \
@@ -436,10 +438,10 @@ java_runtime_pimpl: $(TEMP_JAVA_DIR)/$(JAVA_ORTOOLS_NATIVE_PROJECT)/timestamp
 $(TEMP_JAVA_DIR)/$(JAVA_ORTOOLS_NATIVE_PROJECT)/timestamp: \
  $(JAVA_ORTOOLS_NATIVE_LIBS) \
  $(TEMP_JAVA_DIR)/$(JAVA_ORTOOLS_NATIVE_PROJECT)/pom.xml
-	$(MKDIR_P) $(JAVA_NATIVE_PATH)$Sresources$S$(JAVA_NATIVE_IDENTIFIER)
-	$(COPY) $(subst /,$S,$(JAVA_ORTOOLS_NATIVE_LIBS)) $(JAVA_NATIVE_PATH)$Sresources$S$(JAVA_NATIVE_IDENTIFIER)
+	$(MKDIR_P) $(JAVA_NATIVE_PATH)$Sresources$S$(JAVA_ORTOOLS_NATIVE_PROJECT)
+	$(COPY) $(subst /,$S,$(JAVA_ORTOOLS_NATIVE_LIBS)) $(JAVA_NATIVE_PATH)$Sresources$S$(JAVA_ORTOOLS_NATIVE_PROJECT)
 ifeq ($(SYSTEM),unix)
-	$(COPY) $(OR_TOOLS_LIBS) $(JAVA_NATIVE_PATH)$Sresources$S$(JAVA_NATIVE_IDENTIFIER)
+	$(COPY) $(OR_TOOLS_LIBS) $(JAVA_NATIVE_PATH)$Sresources$S$(JAVA_ORTOOLS_NATIVE_PROJECT)
 endif
 	cd $(TEMP_JAVA_DIR)$S$(JAVA_ORTOOLS_NATIVE_PROJECT) && "$(MVN_BIN)" compile -B
 	cd $(TEMP_JAVA_DIR)$S$(JAVA_ORTOOLS_NATIVE_PROJECT) && "$(MVN_BIN)" package -B
@@ -481,9 +483,9 @@ $(TEMP_JAVA_DIR)/$(JAVA_ORTOOLS_PROJECT)/timestamp: \
  $(GEN_DIR)/java/com/google/ortools/constraintsolver/RoutingParameters.java \
  $(GEN_DIR)/java/com/google/ortools/constraintsolver/RoutingEnums.java \
  $(GEN_DIR)/java/com/google/ortools/linearsolver/MPModelProto.java \
+ $(GEN_DIR)/java/com/google/ortools/sat/CpModelProto.java \
  $(GEN_DIR)/java/com/google/ortools/sat/SatParameters.java \
  $(GEN_DIR)/java/com/google/ortools/util/OptionalBoolean.java \
- $(GEN_DIR)/java/com/google/ortools/sat/CpModelProto.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/Loader.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/constraintsolver/IntIntToLongFunction.java \
  $(SRC_DIR)/ortools/java/com/google/ortools/constraintsolver/JavaDecisionBuilder.java \
@@ -711,7 +713,8 @@ test_java_linear_solver_samples: \
  rjava_MipVarArray \
  rjava_MultipleKnapsackMip \
  rjava_SimpleLpProgram \
- rjava_SimpleMipProgram
+ rjava_SimpleMipProgram \
+ rjava_StiglerDiet
 
 .PHONY: test_java_sat_samples # Build and Run all Java SAT Samples (located in ortools/sat/samples)
 test_java_sat_samples: \
@@ -750,9 +753,14 @@ check_java_pimpl: \
 
 .PHONY: test_java_tests # Build and Run all Java Tests (located in examples/tests)
 test_java_tests: \
+ rjava_KnapsackSolverTest \
+ rjava_FlowTest \
  rjava_LinearSolverTest \
  rjava_ConstraintSolverTest \
  rjava_RoutingSolverTest \
+ rjava_LinearExprTest \
+ rjava_CpModelTest \
+ rjava_CpSolverTest \
  rjava_SatSolverTest \
 
 .PHONY: test_java_contrib # Build and Run all Java Contrib (located in examples/contrib)

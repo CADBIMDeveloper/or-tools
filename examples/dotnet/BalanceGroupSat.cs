@@ -129,7 +129,7 @@ public class BalanceGroupSat
 
         // Compute the maximum number of colors in a group.
         int maxColor = numItemsPerGroup / minItemsOfSameColorPerGroup;
-        // Redundant contraint: The problem does not solve in reasonable time
+        // Redundant constraint: The problem does not solve in reasonable time
         // without it.
         if (maxColor < numberColors)
         {
@@ -147,7 +147,7 @@ public class BalanceGroupSat
 
         var solutionPrinter = new SolutionPrinter(values, colors, allGroups, allItems, itemInGroup);
 
-        var status = solver.SolveWithSolutionCallback(model, solutionPrinter);
+        var status = solver.Solve(model, solutionPrinter);
     }
 
     public class SolutionPrinter : CpSolverSolutionCallback

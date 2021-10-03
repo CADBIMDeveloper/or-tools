@@ -44,14 +44,11 @@ Other methods and functions listed are primarily used for developing OR-Tools,
 rather than for solving specific optimization problems.
 """
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import collections
 import numbers
 import threading
 import time
+import warnings
 
 from ortools.sat import cp_model_pb2
 from ortools.sat import sat_parameters_pb2
@@ -60,15 +57,6 @@ from ortools.sat import pywrapsat
 from ortools.util import sorted_interval_list
 
 Domain = sorted_interval_list.Domain
-
-# Documentation cleaning.
-# Remove the documentation of some functions.
-# See https://pdoc3.github.io/pdoc/doc/pdoc/#overriding-docstrings-with-
-__pdoc__ = {}
-__pdoc__['DisplayBounds'] = False
-__pdoc__['EvaluateLinearExpr'] = False
-__pdoc__['EvaluateBooleanExpression'] = False
-__pdoc__['ShortName'] = False
 
 # The classes below allow linear expressions to be expressed naturally with the
 # usual arithmetic operators +-*/ and with constant numbers, which makes the
@@ -134,28 +122,59 @@ def ShortName(model, i):
         return '[%s]' % DisplayBounds(v.domain)
 
 
+def ShortExprName(model, e):
+    """Pretty-print LinearExpressionProto instances."""
+    if not e.vars:
+        return str(e.offset)
+    if len(e.vars) == 1:
+        var_name = ShortName(model, e.vars[0])
+        coeff = e.coeffs[0]
+        result = ''
+        if coeff == 1:
+            result = var_name
+        elif coeff == -1:
+            result = f'-{var_name}'
+        elif coeff != 0:
+            result = f'{coeff} * {var_name}'
+        if e.offset > 0:
+            result = f'{result} + {e.offset}'
+        elif e.offset < 0:
+            result = f'{result} - {-e.offset}'
+        return result
+    # TODO(user): Support more than affine expressions.
+    return str(e)
+
+
 class LinearExpr(object):
     """Holds an integer linear expression.
 
   A linear expression is built from integer constants and variables.
-  For example, x + 2 * (y - z + 1).
+  For example, `x + 2 * (y - z + 1)`.
 
-  Linear expressions are used in CP-SAT models in two ways:
+  Linear expressions are used in CP-SAT models in constraints and in the
+  objective:
 
-  * To define constraints. For example
+  * You can define linear constraints as in:
 
-      model.Add(x + 2 * y <= 5)
-      model.Add(sum(array_of_vars) == 5)
+  ```
+  model.Add(x + 2 * y <= 5)
+  model.Add(sum(array_of_vars) == 5)
+  ```
 
-  * To define the objective function. For example
+  * In CP-SAT, the objective is a linear expression:
 
-      model.Minimize(x + 2 * y + z)
+  ```
+  model.Minimize(x + 2 * y + z)
+  ```
 
-  For large arrays, you can create constraints and the objective
-  from lists of linear expressions or coefficients as follows:
+  * For large arrays, using the LinearExpr class is faster that using the python
+  `sum()` function. You can create constraints and the objective from lists of
+  linear expressions or coefficients as follows:
 
-      model.Minimize(cp_model.LinearExpr.Sum(expressions))
-      model.Add(cp_model.LinearExpr.ScalProd(expressions, coefficients) >= 0)
+  ```
+  model.Minimize(cp_model.LinearExpr.Sum(expressions))
+  model.Add(cp_model.LinearExpr.ScalProd(expressions, coefficients) >= 0)
+  ```
   """
 
     @classmethod
@@ -166,12 +185,25 @@ class LinearExpr(object):
     @classmethod
     def ScalProd(cls, expressions, coefficients):
         """Creates the expression sum(expressions[i] * coefficients[i])."""
-        return _ScalProd(expressions, coefficients)
+        if LinearExpr.IsEmptyOrAllNull(coefficients):
+            return 0
+        else:
+            return _ScalProd(expressions, coefficients)
 
     @classmethod
     def Term(cls, expression, coefficient):
         """Creates `expression * coefficient`."""
-        return expression * coefficient
+        if coefficient == 0:
+            return 0
+        else:
+            return expression * coefficient
+
+    @classmethod
+    def IsEmptyOrAllNull(cls, coefficients):
+        for c in coefficients:
+            if c != 0:
+                return False
+        return True
 
     def GetVarValueMap(self):
         """Scans the expression, and return a list of (var_coef_map, constant)."""
@@ -453,6 +485,8 @@ class _ScalProd(LinearExpr):
             output += ' + {}'.format(self.__constant)
         elif self.__constant < 0:
             output += ' - {}'.format(-self.__constant)
+        if output is None:
+            output = '0'
         return output
 
     def __repr__(self):
@@ -601,6 +635,10 @@ class BoundedLinearExpression(object):
                 return str(self.__expr) + ' <= ' + str(ub)
             else:
                 return 'True (unbounded expr ' + str(self.__expr) + ')'
+        elif (len(self.__bounds) == 4 and self.__bounds[0] == INT_MIN and
+              self.__bounds[1] + 2 == self.__bounds[2] and
+              self.__bounds[3] == INT_MAX):
+            return str(self.__expr) + ' != ' + str(self.__bounds[1] + 1)
         else:
             return str(self.__expr) + ' in [' + DisplayBounds(
                 self.__bounds) + ']'
@@ -612,28 +650,24 @@ class BoundedLinearExpression(object):
         return self.__bounds
 
     def __bool__(self):
-        # Check for x == y
-        if self.__bounds == [0, 0]:
-            coeffs_map, constant = self.__expr.GetVarValueMap()
-            if constant != 0:
-                return False
-            for coeff in coeffs_map.values():
-                if coeff != 0:
-                    return False
-            return True
-        elif self.__bounds == [INT_MIN, -1, 1, INT_MAX]:
-            # Check for x != y
-            coeffs_map, constant = self.__expr.GetVarValueMap()
-            if constant != 0:
-                return True
-            for coeff in coeffs_map.values():
-                if coeff != 0:
-                    return True
-            return False
+        coeffs_map, constant = self.__expr.GetVarValueMap()
+        all_coeffs = set(coeffs_map.values())
+        same_var = set([0])
+        eq_bounds = [0, 0]
+        different_vars = set([-1, 1])
+        ne_bounds = [INT_MIN, -1, 1, INT_MAX]
+        if (len(coeffs_map) == 1 and all_coeffs == same_var and
+                constant == 0 and
+            (self.__bounds == eq_bounds or self.__bounds == ne_bounds)):
+            return self.__bounds == eq_bounds
+        if (len(coeffs_map) == 2 and all_coeffs == different_vars and
+                constant == 0 and
+            (self.__bounds == eq_bounds or self.__bounds == ne_bounds)):
+            return self.__bounds == ne_bounds
 
         raise NotImplementedError(
-            'Evaluating a BoundedLinearExpr as a Boolean value is not supported.'
-        )
+            f'Evaluating a BoundedLinearExpression \'{self}\' as a Boolean value'
+            + ' is not supported.')
 
 
 class Constraint(object):
@@ -713,8 +747,8 @@ class IntervalVar(object):
   intervals into the schedule.
   """
 
-    def __init__(self, model, start_index, size_index, end_index,
-                 is_present_index, name):
+    def __init__(self, model, start_view, size_view, end_view, is_present_index,
+                 name):
         self.__model = model
         # As with the IntVar::__init__ method, we hack the __init__ method to
         # support two use cases:
@@ -724,16 +758,16 @@ class IntervalVar(object):
         #      name is a string
         #   case 2: called when querying an existing interval variable.
         #      start_index is an int, all parameters after are None.
-        if (size_index is None and end_index is None and
+        if (size_view is None and end_view is None and
                 is_present_index is None and name is None):
-            self.__index = start_index
-            self.__ct = model.constraints[start_index]
+            self.__index = start_view
+            self.__ct = model.constraints[start_view]
         else:
             self.__index = len(model.constraints)
             self.__ct = self.__model.constraints.add()
-            self.__ct.interval.start = start_index
-            self.__ct.interval.size = size_index
-            self.__ct.interval.end = end_index
+            self.__ct.interval.start_view.CopyFrom(start_view)
+            self.__ct.interval.size_view.CopyFrom(size_view)
+            self.__ct.interval.end_view.CopyFrom(end_view)
             if is_present_index is not None:
                 self.__ct.enforcement_literal.append(is_present_index)
             if name:
@@ -754,15 +788,17 @@ class IntervalVar(object):
         interval = self.__ct.interval
         if self.__ct.enforcement_literal:
             return '%s(start = %s, size = %s, end = %s, is_present = %s)' % (
-                self.__ct.name, ShortName(self.__model, interval.start),
-                ShortName(self.__model,
-                          interval.size), ShortName(self.__model, interval.end),
+                self.__ct.name, ShortExprName(self.__model,
+                                              interval.start_view),
+                ShortExprName(self.__model, interval.size_view),
+                ShortExprName(self.__model, interval.end_view),
                 ShortName(self.__model, self.__ct.enforcement_literal[0]))
         else:
             return '%s(start = %s, size = %s, end = %s)' % (
-                self.__ct.name, ShortName(self.__model, interval.start),
-                ShortName(self.__model,
-                          interval.size), ShortName(self.__model, interval.end))
+                self.__ct.name, ShortExprName(self.__model,
+                                              interval.start_view),
+                ShortExprName(self.__model, interval.size_view),
+                ShortExprName(self.__model, interval.end_view))
 
     def Name(self):
         return self.__ct.name
@@ -1170,8 +1206,8 @@ class CpModel(object):
          sum(demands[i] if times[i] <= t) in [min_level, max_level]
 
     Args:
-      times: A list of integer variables which specify the time of the
-        filling or emptying the reservoir.
+      times: A list of integer variables which specify the time of the filling
+        or emptying the reservoir.
       demands: A list of integer values that specifies the amount of the
         emptying or filling.
       min_level: At any time, the level of the reservoir must be greater or
@@ -1230,8 +1266,8 @@ class CpModel(object):
     actions are actually performed.
 
     Args:
-      times: A list of integer variables which specify the time of the
-        filling or emptying the reservoir.
+      times: A list of integer variables which specify the time of the filling
+        or emptying the reservoir.
       demands: A list of integer values that specifies the amount of the
         emptying or filling.
       actives: a list of boolean variables. They indicates if the
@@ -1383,6 +1419,9 @@ class CpModel(object):
 
     def AddProdEquality(self, target, variables):
         """Deprecated, use AddMultiplicationEquality."""
+        warnings.warn(
+            'AddProdEquality is deprecated; use' + 'AddMultiplicationEquality.',
+            DeprecationWarning)
         return self.AddMultiplicationEquality(target, variables)
 
     # Scheduling support
@@ -1396,23 +1435,58 @@ class CpModel(object):
     Internally, it ensures that `start + size == end`.
 
     Args:
-      start: The start of the interval. It can be an integer value, or an
-        integer variable.
-      size: The size of the interval. It can be an integer value, or an integer
-        variable.
-      end: The end of the interval. It can be an integer value, or an integer
-        variable.
+      start: The start of the interval. It can be an affine or constant
+        expression.
+      size: The size of the interval. It can be an affine or constant
+        expression.
+      end: The end of the interval. It can be an affine or constant expression.
       name: The name of the interval variable.
 
     Returns:
       An `IntervalVar` object.
     """
 
-        start_index = self.GetOrMakeIndex(start)
-        size_index = self.GetOrMakeIndex(size)
-        end_index = self.GetOrMakeIndex(end)
-        return IntervalVar(self.__model, start_index, size_index, end_index,
-                           None, name)
+        self.Add(start + size == end)
+
+        start_view = self.ParseLinearExpression(start)
+        size_view = self.ParseLinearExpression(size)
+        end_view = self.ParseLinearExpression(end)
+        if len(start_view.vars) > 1:
+            raise TypeError(
+                'cp_model.NewIntervalVar: start must be affine or constant.')
+        if len(size_view.vars) > 1:
+            raise TypeError(
+                'cp_model.NewIntervalVar: size must be affine or constant.')
+        if len(end_view.vars) > 1:
+            raise TypeError(
+                'cp_model.NewIntervalVar: end must be affine or constant.')
+        return IntervalVar(self.__model, start_view, size_view, end_view, None,
+                           name)
+
+    def NewFixedSizeIntervalVar(self, start, size, name):
+        """Creates an interval variable from start, and a fixed size.
+
+    An interval variable is a constraint, that is itself used in other
+    constraints like NoOverlap.
+
+    Args:
+      start: The start of the interval. It can be an affine or constant
+        expression.
+      size: The size of the interval. It must be an integer value.
+      name: The name of the interval variable.
+
+    Returns:
+      An `IntervalVar` object.
+    """
+        cp_model_helper.AssertIsInt64(size)
+        start_view = self.ParseLinearExpression(start)
+        size_view = self.ParseLinearExpression(size)
+        end_view = self.ParseLinearExpression(start + size)
+        if len(start_view.vars) > 1:
+            raise TypeError(
+                'cp_model.NewIntervalVar: start must be affine or constant.')
+        return IntervalVar(self.__model, start_view, size_view, end_view, None,
+                           name)
 
     def NewOptionalIntervalVar(self, start, size, end, is_present, name):
         """Creates an optional interval var from start, size, end, and is_present.
@@ -1437,11 +1511,53 @@ class CpModel(object):
     Returns:
       An `IntervalVar` object.
     """
+
+        # Add the linear constraint.
+        self.Add(start + size == end).OnlyEnforceIf(is_present)
+
+        # Creates the IntervalConstraintProto object.
         is_present_index = self.GetOrMakeBooleanIndex(is_present)
-        start_index = self.GetOrMakeIndex(start)
-        size_index = self.GetOrMakeIndex(size)
-        end_index = self.GetOrMakeIndex(end)
-        return IntervalVar(self.__model, start_index, size_index, end_index,
+        start_view = self.ParseLinearExpression(start)
+        size_view = self.ParseLinearExpression(size)
+        end_view = self.ParseLinearExpression(end)
+        if len(start_view.vars) > 1:
+            raise TypeError(
+                'cp_model.NewIntervalVar: start must be affine or constant.')
+        if len(size_view.vars) > 1:
+            raise TypeError(
+                'cp_model.NewIntervalVar: size must be affine or constant.')
+        if len(end_view.vars) > 1:
+            raise TypeError(
+                'cp_model.NewIntervalVar: end must be affine or constant.')
+        return IntervalVar(self.__model, start_view, size_view, end_view,
+                           is_present_index, name)
+
+    def NewOptionalFixedSizeIntervalVar(self, start, size, is_present, name):
+        """Creates an interval variable from start, and a fixed size.
+
+    An interval variable is a constraint, that is itself used in other
+    constraints like NoOverlap.
+
+    Args:
+      start: The start of the interval. It can be an affine or constant
+        expression.
+      size: The size of the interval. It must be an integer value.
+      is_present: A literal that indicates if the interval is active or not. A
+        inactive interval is simply ignored by all constraints.
+      name: The name of the interval variable.
+
+    Returns:
+      An `IntervalVar` object.
+    """
+        cp_model_helper.AssertIsInt64(size)
+        start_view = self.ParseLinearExpression(start)
+        size_view = self.ParseLinearExpression(size)
+        end_view = self.ParseLinearExpression(start + size)
+        if len(start_view.vars) > 1:
+            raise TypeError(
+                'cp_model.NewIntervalVar: start must be affine or constant.')
+        is_present_index = self.GetOrMakeBooleanIndex(is_present)
+        return IntervalVar(self.__model, start_view, size_view, end_view,
                            is_present_index, name)
 
     def AddNoOverlap(self, interval_vars):
@@ -1504,12 +1620,44 @@ class CpModel(object):
     Returns:
       An instance of the `Constraint` class.
     """
+        return self.AddCumulativeWithEnergy(intervals, demands, [], capacity)
+
+    def AddCumulativeWithEnergy(self, intervals, demands, energies, capacity):
+        """Adds Cumulative(intervals, demands, energies, capacity).
+
+    This constraint enforces that:
+
+        for all t:
+          sum(demands[i]
+            if (start(intervals[t]) <= t < end(intervals[t])) and
+            (t is present)) <= capacity
+
+    The constraint assumes that:
+
+        for all t:
+          energies[t] == size(intervals[t]) * demands[t]
+
+    Args:
+      intervals: The list of intervals.
+      demands: The list of demands for each interval. Each demand must be >= 0.
+        Each demand can be an integer value, or an integer variable.
+      energies: The list of linear expressions representing the energy of each
+        task. This information is optional, and if given must be compatible with
+        the demand and the size of each task (energy = size * demand).
+      capacity: The maximum capacity of the cumulative constraint. It must be a
+        positive integer value or variable.
+
+    Returns:
+      An instance of the `Constraint` class.
+    """
         ct = Constraint(self.__model.constraints)
         model_ct = self.__model.constraints[ct.Index()]
         model_ct.cumulative.intervals.extend(
             [self.GetIntervalIndex(x) for x in intervals])
         model_ct.cumulative.demands.extend(
             [self.GetOrMakeIndex(x) for x in demands])
+        for e in energies:
+            model_ct.cumulative.energies.append(self.ParseLinearExpression(e))
         model_ct.cumulative.capacity = self.GetOrMakeIndex(capacity)
         return ct
 
@@ -1618,6 +1766,28 @@ class CpModel(object):
         else:
             return self.__model.variables[-var_index - 1]
 
+    def ParseLinearExpression(self, linear_expr):
+        """Returns a LinearExpressionProto built from a LinearExpr instance."""
+        result = cp_model_pb2.LinearExpressionProto()
+        if isinstance(linear_expr, numbers.Integral):
+            result.offset = linear_expr
+            return result
+
+        if isinstance(linear_expr, IntVar):
+            result.vars.append(self.GetOrMakeIndex(linear_expr))
+            result.coeffs.append(1)
+            return result
+
+        coeffs_map, constant = linear_expr.GetVarValueMap()
+        result.offset = constant
+        for t in coeffs_map.items():
+            if not isinstance(t[0], IntVar):
+                raise TypeError('Wrong argument' + str(t))
+            cp_model_helper.AssertIsInt64(t[1])
+            result.vars.append(t[0].Index())
+            result.coeffs.append(t[1])
+        return result
+
     def _SetObjective(self, obj, minimize):
         """Sets the objective of the model."""
         if isinstance(obj, IntVar):
@@ -1694,9 +1864,8 @@ class CpModel(object):
 
     Args:
       file: file to write the model to. If the filename ends with 'txt', the
-            model will be written as a text file, otherwise, the binary format
-            will be used.
-
+        model will be written as a text file, otherwise, the binary format will
+        be used.
 
     Returns:
       True if the model was correctly written.
@@ -1822,13 +1991,17 @@ class CpSolver(object):
 
         return self.__solution.status
 
-    # DEPRECATED, just use Solve() with the callback argument.
     def SolveWithSolutionCallback(self, model, callback):
         """DEPRECATED Use Solve() with the callback argument."""
+        warnings.warn(
+            'SolveWithSolutionCallback is deprecated; use Solve() with' +
+            'the callback argument.', DeprecationWarning)
         return self.Solve(model, callback)
 
     def SearchForAllSolutions(self, model, callback):
-        """Search for all solutions of a satisfiability problem.
+        """DEPRECATED Use Solve() with the right parameter.
+
+    Search for all solutions of a satisfiability problem.
 
     This method searches for all feasible solutions of a given model.
     Then it feeds the solution to the callback.
@@ -1846,6 +2019,9 @@ class CpSolver(object):
       * *INFEASIBLE* if the solver has proved there are no solution
       * *OPTIMAL* if all solutions have been found
     """
+        warnings.warn(
+            'SearchForAllSolutions is deprecated; use Solve() with' +
+            'enumerate_all_solutions = True.', DeprecationWarning)
         if model.HasObjective():
             raise TypeError('Search for all solutions is only defined on '
                             'satisfiability problems')

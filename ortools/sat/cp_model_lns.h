@@ -81,7 +81,7 @@ class NeighborhoodGeneratorHelper : public SubSolver {
   // they take in the given solution.
   Neighborhood FixGivenVariables(
       const CpSolverResponse& initial_solution,
-      const std::vector<int>& variables_to_fix) const;
+      const absl::flat_hash_set<int>& variables_to_fix) const;
 
   // Returns the neighborhood where the given constraints are removed.
   Neighborhood RemoveMarkedConstraints(
@@ -99,6 +99,9 @@ class NeighborhoodGeneratorHelper : public SubSolver {
 
   // Return a neighborhood that correspond to the full problem.
   Neighborhood FullNeighborhood() const;
+
+  // Indicate that the generator failed to generated a neighborhood.
+  Neighborhood NoNeighborhood() const;
 
   // Copies all variables from the in_model to the delta model of the
   // neighborhood. For all variables in fixed_variable_set, the domain will be
@@ -137,6 +140,19 @@ class NeighborhoodGeneratorHelper : public SubSolver {
     return active_variables_.size();
   }
 
+  bool DifficultyMeansFullNeighborhood(double difficulty) const {
+    absl::ReaderMutexLock lock(&graph_mutex_);
+    const int target_size = std::ceil(difficulty * active_variables_.size());
+    return target_size == active_variables_.size();
+  }
+
+  // Returns the vector of active variables. The graph_mutex_ must be
+  // locked before calling this method.
+  const std::vector<int>& ActiveVariablesWhileHoldingLock() const
+      ABSL_SHARED_LOCKS_REQUIRED(graph_mutex_) {
+    return active_variables_;
+  }
+
   // Constraints <-> Variables graph.
   // Note that only non-constant variable are listed here.
   const std::vector<std::vector<int>>& ConstraintToVar() const
@@ -162,6 +178,14 @@ class NeighborhoodGeneratorHelper : public SubSolver {
   std::vector<int> GetActiveIntervals(
       const CpSolverResponse& initial_solution) const;
 
+  // Returns one sub-vector per circuit or per single vehicle ciruit in a routes
+  // constraints. Each circuit is non empty, and does not contain any
+  // self-looping arcs. Path are sorted, starting from the arc with the lowest
+  // tail index, and going in sequence up to the last arc before the circuit is
+  // closed. Each entry correspond to the arc literal on the circuit.
+  std::vector<std::vector<int>> GetRoutingPaths(
+      const CpSolverResponse& initial_solution) const;
+
   // The initial problem.
   // Note that the domain of the variables are not updated here.
   const CpModelProto& ModelProto() const { return model_proto_; }
@@ -178,7 +202,15 @@ class NeighborhoodGeneratorHelper : public SubSolver {
   // Note: This mutex needs to be public for thread annotations.
   mutable absl::Mutex graph_mutex_;
 
+  // TODO(user): Display LNS statistics through the StatisticsString()
+  // method.
+
  private:
+  // Precompute stuff that will never change. During the execution, only the
+  // domain of the variable will change, so data that only depends on the
+  // constraints need to be computed just once.
+  void InitializeHelperData();
+
   // Recompute most of the class member. This needs to be called when the
   // domains of the variables are updated.
   void RecomputeHelperData();
@@ -381,9 +413,9 @@ class NeighborhoodGenerator {
 };
 
 // Pick a random subset of variables.
-class SimpleNeighborhoodGenerator : public NeighborhoodGenerator {
+class RelaxRandomVariablesGenerator : public NeighborhoodGenerator {
  public:
-  explicit SimpleNeighborhoodGenerator(
+  explicit RelaxRandomVariablesGenerator(
       NeighborhoodGeneratorHelper const* helper, const std::string& name)
       : NeighborhoodGenerator(name, helper) {}
   Neighborhood Generate(const CpSolverResponse& initial_solution,
@@ -393,9 +425,9 @@ class SimpleNeighborhoodGenerator : public NeighborhoodGenerator {
 // Pick a random subset of constraints and relax all the variables of these
 // constraints. Note that to satisfy the difficulty, we might not relax all the
 // variable of the "last" constraint.
-class SimpleConstraintNeighborhoodGenerator : public NeighborhoodGenerator {
+class RelaxRandomConstraintsGenerator : public NeighborhoodGenerator {
  public:
-  explicit SimpleConstraintNeighborhoodGenerator(
+  explicit RelaxRandomConstraintsGenerator(
       NeighborhoodGeneratorHelper const* helper, const std::string& name)
       : NeighborhoodGenerator(name, helper) {}
   Neighborhood Generate(const CpSolverResponse& initial_solution,
@@ -456,6 +488,47 @@ class SchedulingNeighborhoodGenerator : public NeighborhoodGenerator {
 class SchedulingTimeWindowNeighborhoodGenerator : public NeighborhoodGenerator {
  public:
   explicit SchedulingTimeWindowNeighborhoodGenerator(
+      NeighborhoodGeneratorHelper const* helper, const std::string& name)
+      : NeighborhoodGenerator(name, helper) {}
+
+  Neighborhood Generate(const CpSolverResponse& initial_solution,
+                        double difficulty, absl::BitGenRef random) final;
+};
+
+// This routing based LNS generator will relax random arcs in all the paths of
+// the circuit or routes constraints.
+class RoutingRandomNeighborhoodGenerator : public NeighborhoodGenerator {
+ public:
+  RoutingRandomNeighborhoodGenerator(NeighborhoodGeneratorHelper const* helper,
+                                     const std::string& name)
+      : NeighborhoodGenerator(name, helper) {}
+
+  Neighborhood Generate(const CpSolverResponse& initial_solution,
+                        double difficulty, absl::BitGenRef random) final;
+};
+
+// This routing based LNS generator will relax small sequences of arcs randomly
+// chosen in all the paths of the circuit or routes constraints.
+class RoutingPathNeighborhoodGenerator : public NeighborhoodGenerator {
+ public:
+  RoutingPathNeighborhoodGenerator(NeighborhoodGeneratorHelper const* helper,
+                                   const std::string& name)
+      : NeighborhoodGenerator(name, helper) {}
+
+  Neighborhood Generate(const CpSolverResponse& initial_solution,
+                        double difficulty, absl::BitGenRef random) final;
+};
+
+// This routing based LNS generator aims are relaxing one full path, and make
+// some room on the other paths to absorb the nodes of the relaxed path.
+//
+// In order to do so, it will relax the first and the last arc of each path in
+// the circuit or routes constraints. Then it will relax all arc literals in one
+// random path. Then it will relax random arcs in the remaining paths until it
+// reaches the given difficulty.
+class RoutingFullPathNeighborhoodGenerator : public NeighborhoodGenerator {
+ public:
+  RoutingFullPathNeighborhoodGenerator(
       NeighborhoodGeneratorHelper const* helper, const std::string& name)
       : NeighborhoodGenerator(name, helper) {}
 

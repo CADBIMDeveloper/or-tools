@@ -247,7 +247,7 @@ namespace operations_research {
 %unignore SymmetryBreaker;
 
 // UnsortedNullableRevBitset
-// TODO(corentinl) To removed from constraint_solveri.h (only use by table.cc)
+// TODO(user) To removed from constraint_solveri.h (only use by table.cc)
 %ignore UnsortedNullableRevBitset;
 
 // Assignment
@@ -814,6 +814,9 @@ namespace operations_research {
 %ignore PathOperator::number_of_nexts;
 // Methods:
 %unignore PathOperator::MakeNeighbor;
+
+// PathOperator::IterationParameters
+%ignore PathOperator::IterationParameters;
 
 // LocalSearchFilter
 %feature("director") LocalSearchFilter;
