@@ -15,10 +15,12 @@
 
 #include <cstdint>
 
+#include "absl/container/btree_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_split.h"
+#include "ortools/base/protobuf_util.h"
 #include "ortools/base/status_builder.h"
 #include "ortools/lp_data/lp_types.h"
 
@@ -34,6 +36,12 @@ class MPSReaderImpl {
   template <class Data>
   absl::Status ParseFile(const std::string& file_name, Data* data,
                          MPSReader::Form form);
+
+  // Loads instance from string. Useful with MapReduce. Automatically detects
+  // the file's format (free or fixed).
+  template <class Data>
+  absl::Status ParseProblemFromString(const std::string& source, Data* data,
+                                      MPSReader::Form form);
 
  private:
   // Number of fields in one line of MPS file.
@@ -81,7 +89,7 @@ class MPSReaderImpl {
 
   // Line processor.
   template <class DataWrapper>
-  absl::Status ProcessLine(const std::string& line, DataWrapper* data);
+  absl::Status ProcessLine(absl::string_view line, DataWrapper* data);
 
   // Process section OBJSENSE in MPS file.
   template <class DataWrapper>
@@ -129,7 +137,8 @@ class MPSReaderImpl {
     FREE_VARIABLE,
     INFINITE_LOWER_BOUND,
     INFINITE_UPPER_BOUND,
-    BINARY
+    BINARY,
+    SEMI_CONTINUOUS
   };
 
   // Different types of constraints for a given row.
@@ -258,6 +267,10 @@ class DataWrapper<LinearProgram> {
     data_->SetMaximizationProblem(maximize);
   }
 
+  void SetObjectiveOffset(double objective_offset) {
+    data_->SetObjectiveOffset(objective_offset);
+  }
+
   int FindOrCreateConstraint(const std::string& name) {
     return data_->FindOrCreateConstraint(name).value();
   }
@@ -287,6 +300,9 @@ class DataWrapper<LinearProgram> {
   void SetVariableTypeToInteger(int index) {
     data_->SetVariableType(ColIndex(index),
                            LinearProgram::VariableType::INTEGER);
+  }
+  void SetVariableTypeToSemiContinuous(int index) {
+    LOG(FATAL) << "Semi continuous variables are not supported";
   }
   void SetVariableBounds(int index, double lower_bound, double upper_bound) {
     data_->SetVariableBounds(ColIndex(index), lower_bound, upper_bound);
@@ -326,6 +342,10 @@ class DataWrapper<MPModelProto> {
   void SetName(const std::string& name) { data_->set_name(name); }
 
   void SetObjectiveDirection(bool maximize) { data_->set_maximize(maximize); }
+
+  void SetObjectiveOffset(double objective_offset) {
+    data_->set_objective_offset(objective_offset);
+  }
 
   int FindOrCreateConstraint(const std::string& name) {
     const auto it = constraint_indices_by_name_.find(name);
@@ -377,6 +397,9 @@ class DataWrapper<MPModelProto> {
   void SetVariableTypeToInteger(int index) {
     data_->mutable_variable(index)->set_is_integer(true);
   }
+  void SetVariableTypeToSemiContinuous(int index) {
+    semi_continuous_variables_.push_back(index);
+  }
   void SetVariableBounds(int index, double lower_bound, double upper_bound) {
     data_->mutable_variable(index)->set_lower_bound(lower_bound);
     data_->mutable_variable(index)->set_upper_bound(upper_bound);
@@ -420,6 +443,69 @@ class DataWrapper<MPModelProto> {
   void CleanUp() {
     google::protobuf::util::RemoveAt(data_->mutable_constraint(),
                                      constraints_to_delete_);
+
+    for (const int index : semi_continuous_variables_) {
+      MPVariableProto* mp_var = data_->mutable_variable(index);
+      // We detect that the lower bound was not set when it is left to its
+      // default value of zero.
+      const double lb =
+          mp_var->lower_bound() == 0 ? 1.0 : mp_var->lower_bound();
+      DCHECK_GT(lb, 0.0);
+      const double ub = mp_var->upper_bound();
+      mp_var->set_lower_bound(0.0);
+
+      // Create a new Boolean variable.
+      const int bool_var_index = data_->variable_size();
+      MPVariableProto* bool_var = data_->add_variable();
+      bool_var->set_lower_bound(0.0);
+      bool_var->set_upper_bound(1.0);
+      bool_var->set_is_integer(true);
+
+      // TODO(user): Experiment with the switch constant.
+      if (ub >= 1e8) {  // Use indicator constraints
+        // bool_var == 0 implies var == 0.
+        MPGeneralConstraintProto* const zero_constraint =
+            data_->add_general_constraint();
+        MPIndicatorConstraint* const zero_indicator =
+            zero_constraint->mutable_indicator_constraint();
+        zero_indicator->set_var_index(bool_var_index);
+        zero_indicator->set_var_value(0);
+        zero_indicator->mutable_constraint()->set_lower_bound(0.0);
+        zero_indicator->mutable_constraint()->set_upper_bound(0.0);
+        zero_indicator->mutable_constraint()->add_var_index(index);
+        zero_indicator->mutable_constraint()->add_coefficient(1.0);
+
+        // bool_var == 1 implies lb <= var <= ub
+        MPGeneralConstraintProto* const one_constraint =
+            data_->add_general_constraint();
+        MPIndicatorConstraint* const one_indicator =
+            one_constraint->mutable_indicator_constraint();
+        one_indicator->set_var_index(bool_var_index);
+        one_indicator->set_var_value(1);
+        one_indicator->mutable_constraint()->set_lower_bound(lb);
+        one_indicator->mutable_constraint()->set_upper_bound(ub);
+        one_indicator->mutable_constraint()->add_var_index(index);
+        one_indicator->mutable_constraint()->add_coefficient(1.0);
+      } else {  // Pure linear encoding.
+        // var >= bool_var * lb
+        MPConstraintProto* lower = data_->add_constraint();
+        lower->set_lower_bound(0.0);
+        lower->set_upper_bound(std::numeric_limits<double>::infinity());
+        lower->add_var_index(index);
+        lower->add_coefficient(1.0);
+        lower->add_var_index(bool_var_index);
+        lower->add_coefficient(-lb);
+
+        // var <= bool_var * ub
+        MPConstraintProto* upper = data_->add_constraint();
+        upper->set_lower_bound(-std::numeric_limits<double>::infinity());
+        upper->set_upper_bound(0.0);
+        upper->add_var_index(index);
+        upper->add_coefficient(1.0);
+        upper->add_var_index(bool_var_index);
+        upper->add_coefficient(-ub);
+      }
+    }
   }
 
  private:
@@ -427,7 +513,8 @@ class DataWrapper<MPModelProto> {
 
   absl::flat_hash_map<std::string, int> variable_indices_by_name_;
   absl::flat_hash_map<std::string, int> constraint_indices_by_name_;
-  absl::node_hash_set<int> constraints_to_delete_;
+  absl::btree_set<int> constraints_to_delete_;
+  std::vector<int> semi_continuous_variables_;
 };
 
 template <class Data>
@@ -444,12 +531,11 @@ absl::Status MPSReaderImpl::ParseFile(const std::string& file_name, Data* data,
     return ParseFile(file_name, data, MPSReader::FREE);
   }
 
-  // TODO(user): Use the form directly.
   free_form_ = form == MPSReader::FREE;
   Reset();
   DataWrapper<Data> data_wrapper(data);
   data_wrapper.SetUp();
-  for (const std::string& line :
+  for (absl::string_view line :
        FileLines(file_name, FileLineIterator::REMOVE_INLINE_CR)) {
     RETURN_IF_ERROR(ProcessLine(line, &data_wrapper));
   }
@@ -458,15 +544,38 @@ absl::Status MPSReaderImpl::ParseFile(const std::string& file_name, Data* data,
   return absl::OkStatus();
 }
 
+template <class Data>
+absl::Status MPSReaderImpl::ParseProblemFromString(const std::string& source,
+                                                   Data* data,
+                                                   MPSReader::Form form) {
+  if (form == MPSReader::AUTO_DETECT) {
+    if (ParseProblemFromString(source, data, MPSReader::FIXED).ok()) {
+      return absl::OkStatus();
+    }
+    return ParseProblemFromString(source, data, MPSReader::FREE);
+  }
+
+  free_form_ = form == MPSReader::FREE;
+  Reset();
+  DataWrapper<Data> data_wrapper(data);
+  data_wrapper.SetUp();
+  for (absl::string_view line : absl::StrSplit(source, '\n')) {
+    RETURN_IF_ERROR(ProcessLine(line, &data_wrapper));
+  }
+  data_wrapper.CleanUp();
+  DisplaySummary();
+  return absl::OkStatus();
+}
+
 template <class DataWrapper>
-absl::Status MPSReaderImpl::ProcessLine(const std::string& line,
+absl::Status MPSReaderImpl::ProcessLine(absl::string_view line,
                                         DataWrapper* data) {
   ++line_num_;
   line_ = line;
   if (IsCommentOrBlank()) {
     return absl::OkStatus();  // Skip blank lines and comments.
   }
-  if (!free_form_ && line_.find('\t') != std::string::npos) {
+  if (!free_form_ && absl::StrContains(line_, '\t')) {
     return InvalidArgumentError("File contains tabs.");
   }
   std::string section;
@@ -489,7 +598,7 @@ absl::Status MPSReaderImpl::ProcessLine(const std::string& line,
       // fixed form, the name has at most 8 characters, and starts at a specific
       // position in the NAME line. For MIPLIB2010 problems (eg, air04, glass4),
       // the name in fixed form ends up being preceded with a whitespace.
-      // TODO(user,user): Return an error for fixed form if the problem name
+      // TODO(user): Return an error for fixed form if the problem name
       // does not fit.
       if (free_form_) {
         if (fields_.size() >= 2) {
@@ -775,6 +884,13 @@ absl::Status MPSReaderImpl::StoreRightHandSide(const std::string& row_name,
     const Fractional upper_bound =
         (data->ConstraintUpperBound(row) == kInfinity) ? kInfinity : value;
     data->SetConstraintBounds(row, lower_bound, upper_bound);
+  } else {
+    // We treat minus the right hand side of COST as the objective offset, in
+    // line with what the MPS writer does and what Gurobi's MPS format
+    // expects.
+    Fractional value;
+    ASSIGN_OR_RETURN(value, GetDoubleFromString(row_value));
+    data->SetObjectiveOffset(-value);
   }
   return absl::OkStatus();
 }
@@ -850,6 +966,11 @@ absl::Status MPSReaderImpl::StoreBound(const std::string& bound_type_mnemonic,
       ASSIGN_OR_RETURN(upper_bound, GetDoubleFromString(bound_value));
       break;
     }
+    case SEMI_CONTINUOUS: {
+      ASSIGN_OR_RETURN(upper_bound, GetDoubleFromString(bound_value));
+      data->SetVariableTypeToSemiContinuous(col);
+      break;
+    }
     case FIXED_VARIABLE: {
       ASSIGN_OR_RETURN(lower_bound, GetDoubleFromString(bound_value));
       upper_bound = lower_bound;
@@ -920,6 +1041,8 @@ MPSReaderImpl::MPSReaderImpl()
   bound_name_to_id_map_["BV"] = BINARY;
   bound_name_to_id_map_["LI"] = LOWER_BOUND;
   bound_name_to_id_map_["UI"] = UPPER_BOUND;
+  bound_name_to_id_map_["SC"] = SEMI_CONTINUOUS;
+  // TODO(user): Support 'SI' (semi integer).
   integer_type_names_set_.insert("BV");
   integer_type_names_set_.insert("LI");
   integer_type_names_set_.insert("UI");
@@ -1043,6 +1166,36 @@ absl::Status MPSReader::ParseFile(const std::string& file_name,
 absl::Status MPSReader::ParseFile(const std::string& file_name,
                                   MPModelProto* data, Form form) {
   return MPSReaderImpl().ParseFile(file_name, data, form);
+}
+
+// Loads instance from string. Useful with MapReduce. Automatically detects
+// the file's format (free or fixed).
+absl::Status MPSReader::ParseProblemFromString(const std::string& source,
+                                               LinearProgram* data,
+                                               MPSReader::Form form) {
+  return MPSReaderImpl().ParseProblemFromString(source, data, form);
+}
+
+absl::Status MPSReader::ParseProblemFromString(const std::string& source,
+                                               MPModelProto* data,
+                                               MPSReader::Form form) {
+  return MPSReaderImpl().ParseProblemFromString(source, data, form);
+}
+
+absl::StatusOr<MPModelProto> MpsDataToMPModelProto(
+    const std::string& mps_data) {
+  MPModelProto model;
+  RETURN_IF_ERROR(MPSReaderImpl().ParseProblemFromString(
+      mps_data, &model, MPSReader::AUTO_DETECT));
+  return model;
+}
+
+absl::StatusOr<MPModelProto> MpsFileToMPModelProto(
+    const std::string& mps_file) {
+  MPModelProto model;
+  RETURN_IF_ERROR(
+      MPSReaderImpl().ParseFile(mps_file, &model, MPSReader::AUTO_DETECT));
+  return model;
 }
 
 }  // namespace glop

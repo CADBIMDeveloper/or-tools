@@ -27,17 +27,20 @@
 #define OR_TOOLS_GRAPH_PERFECT_MATCHING_H_
 
 #include <cstdint>
+#include <functional>
 #include <limits>
+#include <string>
 #include <vector>
 
+#include "absl/base/attributes.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "ortools/base/adjustable_priority_queue-inl.h"
 #include "ortools/base/adjustable_priority_queue.h"
-#include "ortools/base/int_type.h"
 #include "ortools/base/integral_types.h"
 #include "ortools/base/logging.h"
 #include "ortools/base/macros.h"
+#include "ortools/base/strong_int.h"
 #include "ortools/base/strong_vector.h"
 
 namespace operations_research {
@@ -98,7 +101,7 @@ class MinCostPerfectMatching {
   };
   ABSL_MUST_USE_RESULT Status Solve();
 
-  // Returns the cost of the perfect macthing. Only valid when the last solve
+  // Returns the cost of the perfect matching. Only valid when the last solve
   // status was OPTIMAL.
   int64_t OptimalCost() const {
     DCHECK(optimal_solution_found_);
@@ -166,13 +169,13 @@ class MinCostPerfectMatching {
 class BlossomGraph {
  public:
   // Typed index used by this class.
-  DEFINE_INT_TYPE(NodeIndex, int);
-  DEFINE_INT_TYPE(EdgeIndex, int);
-  DEFINE_INT_TYPE(CostValue, int64_t);
+  DEFINE_STRONG_INT_TYPE(NodeIndex, int);
+  DEFINE_STRONG_INT_TYPE(EdgeIndex, int);
+  DEFINE_STRONG_INT_TYPE(CostValue, int64_t);
 
   // Basic constants.
   // NOTE(user): Those can't be constexpr because of the or-tools export,
-  // which complains for constexpr DEFINE_INT_TYPE.
+  // which complains for constexpr DEFINE_STRONG_INT_TYPE.
   static const NodeIndex kNoNodeIndex;
   static const EdgeIndex kNoEdgeIndex;
   static const CostValue kMaxCostValue;

@@ -14,14 +14,25 @@
 #include "ortools/sat/precedences.h"
 
 #include <algorithm>
-#include <memory>
+#include <deque>
+#include <vector>
 
+#include "absl/container/btree_set.h"
+#include "absl/container/inlined_vector.h"
+#include "absl/types/span.h"
 #include "ortools/base/cleanup.h"
 #include "ortools/base/logging.h"
 #include "ortools/base/stl_util.h"
 #include "ortools/base/strong_vector.h"
 #include "ortools/sat/clause.h"
 #include "ortools/sat/cp_constraints.h"
+#include "ortools/sat/integer.h"
+#include "ortools/sat/model.h"
+#include "ortools/sat/sat_base.h"
+#include "ortools/sat/sat_solver.h"
+#include "ortools/util/bitset.h"
+#include "ortools/util/strong_integers.h"
+#include "ortools/util/time_limit.h"
 
 namespace operations_research {
 namespace sat {
@@ -282,7 +293,7 @@ void PrecedencesPropagator::AddArc(
   if (head == tail) {
     // A self-arc is either plain SAT or plain UNSAT or it forces something on
     // the given offset_var or presence_literal_index. In any case it could be
-    // presolved in something more efficent.
+    // presolved in something more efficient.
     VLOG(1) << "Self arc! This could be presolved. "
             << "var:" << tail << " offset:" << offset
             << " offset_var:" << offset_var
@@ -338,7 +349,7 @@ void PrecedencesPropagator::AddArc(
     // Since we add a new arc, we will need to consider its tail during the next
     // propagation. Note that the size of modified_vars_ will be automatically
     // updated when new integer variables are created since we register it with
-    // IntegerTrail in this class contructor.
+    // IntegerTrail in this class constructor.
     //
     // TODO(user): Adding arcs and then calling Untrail() before Propagate()
     // will cause this mecanism to break. Find a more robust implementation.
@@ -622,7 +633,7 @@ void PrecedencesPropagator::AnalyzePositiveCycle(
 // minimize the number of integer_trail_->Enqueue() as much as possible.
 //
 // TODO(user): The current algorithm is quite efficient, but there is probably
-// still room for improvments.
+// still room for improvements.
 bool PrecedencesPropagator::BellmanFordTarjan(Trail* trail) {
   const int num_nodes = impacted_arcs_.size();
 
@@ -864,11 +875,11 @@ int PrecedencesPropagator::
 
     if (clause.size() > 1) {
       // Extract the set of arc for which at least one must be present.
-      const std::set<Literal> clause_set(clause.begin(), clause.end());
+      const absl::btree_set<Literal> clause_set(clause.begin(), clause.end());
       std::vector<ArcIndex> arcs_in_clause;
       for (const ArcIndex arc_index : incoming_arcs_[target]) {
         const Literal literal(arcs_[arc_index].presence_literals.front());
-        if (gtl::ContainsKey(clause_set, literal.Negated())) {
+        if (clause_set.contains(literal.Negated())) {
           arcs_in_clause.push_back(arc_index);
         }
       }
@@ -919,6 +930,24 @@ int PrecedencesPropagator::AddGreaterThanAtLeastOneOfConstraints(Model* model) {
       num_added_constraints += AddGreaterThanAtLeastOneOfConstraintsFromClause(
           clause->AsSpan(), model);
     }
+
+    // It is common that there is only two alternatives to push a variable.
+    // In this case, our presolve most likely made sure that the two are
+    // controlled by a single Boolean. This allows to detect this and add the
+    // appropriate greater than at least one of.
+    const int num_booleans = solver->NumVariables();
+    if (num_booleans < 1e6) {
+      for (int i = 0; i < num_booleans; ++i) {
+        if (time_limit->LimitReached()) return num_added_constraints;
+        if (solver->IsModelUnsat()) return num_added_constraints;
+        num_added_constraints +=
+            AddGreaterThanAtLeastOneOfConstraintsFromClause(
+                {Literal(BooleanVariable(i), true),
+                 Literal(BooleanVariable(i), false)},
+                model);
+      }
+    }
+
   } else {
     num_added_constraints +=
         AddGreaterThanAtLeastOneOfConstraintsWithClauseAutoDetection(model);

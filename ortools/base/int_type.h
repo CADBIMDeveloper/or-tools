@@ -88,7 +88,6 @@
 // The class also defines a hash functor that allows the IntType to be used
 // as key to hashable containers such as hash_map and hash_set.
 //
-// We suggest using the IntTypeIndexedContainer wrapper around google3's
 // FixedArray and STL vector (see int-type-indexed-container.h) if an IntType is
 // intended to be used as an index into these containers.  These wrappers are
 // indexed in a type-safe manner using IntTypes to ensure type-safety.
@@ -152,6 +151,7 @@
 #include <ostream>  // NOLINT
 #include <type_traits>
 
+#include "absl/base/port.h"
 #include "absl/strings/string_view.h"
 #include "ortools/base/macros.h"
 
@@ -174,9 +174,9 @@ class IntType;
 // operators.
 //
 // The template parameter IntTypeName defines the name for the int type and must
-// be unique within a binary (the convenient DEFINE_INT_TYPE macro at the end of
-// the file generates a unique IntTypeName).  The parameter ValueType defines
-// the integer type value (see supported list above).
+// be unique within a binary (the convenient DEFINE_INT_TYPE macro at the
+// end of the file generates a unique IntTypeName).  The parameter ValueType
+// defines the integer type value (see supported list above).
 //
 // This class is NOT thread-safe.
 template <typename IntTypeName, typename _ValueType>

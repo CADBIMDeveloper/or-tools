@@ -134,6 +134,7 @@
 #ifndef OR_TOOLS_LINEAR_SOLVER_LINEAR_SOLVER_H_
 #define OR_TOOLS_LINEAR_SOLVER_LINEAR_SOLVER_H_
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -143,7 +144,7 @@
 #include <utility>
 #include <vector>
 
-#include "absl/container/flat_hash_map.h"
+#include "absl/base/port.h"
 #include "absl/flags/parse.h"
 #include "absl/flags/usage.h"
 #include "absl/status/status.h"
@@ -192,6 +193,10 @@ class MPSolver {
     CLP_LINEAR_PROGRAMMING = 0,
     GLPK_LINEAR_PROGRAMMING = 1,
     GLOP_LINEAR_PROGRAMMING = 2,  // Recommended default value. Made in Google.
+    // In-house linear programming solver based on the primal-dual hybrid
+    // gradient method. Sometimes faster than Glop for medium-size problems and
+    // scales to much larger problems than Glop.
+    PDLP_LINEAR_PROGRAMMING = 8,
 
     // Integer programming problems.
     // -----------------------------
@@ -507,6 +512,8 @@ class MPSolver {
    * true regardless of whether there's an ongoing Solve() or not. The Solve()
    * call may still linger for a while depending on the conditions.  If
    * interruption is not supported; returns false and does nothing.
+   * MPSolver::SolverTypeSupportsInterruption can be used to check if
+   * interruption is supported for a given solver type.
    */
   bool InterruptSolve();
 
@@ -534,21 +541,37 @@ class MPSolver {
 
   /**
    * Solves the model encoded by a MPModelRequest protocol buffer and fills the
-   * solution encoded as a MPSolutionResponse.
+   * solution encoded as a MPSolutionResponse. The solve is stopped prematurely
+   * if interrupt is non-null at set to true during (or before) solving.
+   * Interruption is only supported if SolverTypeSupportsInterruption() returns
+   * true for the requested solver. Passing a non-null interruption with any
+   * other solver type immediately returns an MPSOLVER_INCOMPATIBLE_OPTIONS
+   * error.
    *
-   * Note(user): This creates a temporary MPSolver and destroys it at the end.
-   * If you want to keep the MPSolver alive (for debugging, or for incremental
-   * solving), you should write another version of this function that creates
-   * the MPSolver object on the heap and returns it.
-   *
-   * Note(pawell): This attempts to first use `DirectlySolveProto()` (if
+   * Note(user): This attempts to first use `DirectlySolveProto()` (if
    * implemented). Consequently, this most likely does *not* override any of
    * the default parameters of the underlying solver. This behavior *differs*
    * from `MPSolver::Solve()` which by default sets the feasibility tolerance
    * and the gap limit (as of 2020/02/11, to 1e-7 and 0.0001, respectively).
    */
   static void SolveWithProto(const MPModelRequest& model_request,
-                             MPSolutionResponse* response);
+                             MPSolutionResponse* response,
+                             // `interrupt` is non-const because the internal
+                             // solver may set it to true itself, in some cases.
+                             std::atomic<bool>* interrupt = nullptr);
+
+  static bool SolverTypeSupportsInterruption(
+      const MPModelRequest::SolverType solver) {
+    // Interruption requires that MPSolver::InterruptSolve is supported for the
+    // underlying solver. Interrupting requests using SCIP is also not supported
+    // as of 2021/08/23, since InterruptSolve is not go/thread-safe
+    // for SCIP (see e.g. cl/350545631 for details).
+    return solver == MPModelRequest::GLOP_LINEAR_PROGRAMMING ||
+           solver == MPModelRequest::GUROBI_LINEAR_PROGRAMMING ||
+           solver == MPModelRequest::GUROBI_MIXED_INTEGER_PROGRAMMING ||
+           solver == MPModelRequest::SAT_INTEGER_PROGRAMMING ||
+           solver == MPModelRequest::PDLP_LINEAR_PROGRAMMING;
+  }
 
   /// Exports model to protocol buffer.
   void ExportModelToProto(MPModelProto* output_model) const;
@@ -588,7 +611,7 @@ class MPSolver {
    */
   absl::Status LoadSolutionFromProto(
       const MPSolutionResponse& response,
-      double tolerance = kDefaultPrimalTolerance);
+      double tolerance = std::numeric_limits<double>::infinity());
 
   /**
    * Resets values of out of bound variables to the corresponding bound and
@@ -785,6 +808,12 @@ class MPSolver {
   void SetCallback(MPCallback* mp_callback);
   bool SupportsCallbacks() const;
 
+  // Global counters of variables and constraints ever created across all
+  // MPSolver instances. Those are only updated after the destruction
+  // (or Clear()) of each MPSolver instance.
+  static int64_t global_num_variables();
+  static int64_t global_num_constraints();
+
   // DEPRECATED: Use TimeLimit() and SetTimeLimit(absl::Duration) instead.
   // NOTE: These deprecated functions used the convention time_limit = 0 to mean
   // "no limit", which now corresponds to time_limit_ = InfiniteDuration().
@@ -819,6 +848,7 @@ class MPSolver {
   friend class GLOPInterface;
   friend class BopInterface;
   friend class SatInterface;
+  friend class PdlpInterface;
   friend class KnapsackInterface;
 
   // Debugging: verify that the given MPVariable* belongs to this solver.
@@ -889,6 +919,12 @@ class MPSolver {
 
   // Permanent storage for SetSolverSpecificParametersAsString().
   std::string solver_specific_parameter_string_;
+
+  static absl::Mutex global_count_mutex_;
+#ifndef SWIG
+  static int64_t global_num_variables_ ABSL_GUARDED_BY(global_count_mutex_);
+  static int64_t global_num_constraints_ ABSL_GUARDED_BY(global_count_mutex_);
+#endif
 
   MPSolverResponseStatus LoadModelFromProtoInternal(
       const MPModelProto& input_model, bool clear_names,
@@ -1032,6 +1068,7 @@ class MPObjective {
   friend class GLOPInterface;
   friend class BopInterface;
   friend class SatInterface;
+  friend class PdlpInterface;
   friend class KnapsackInterface;
 
   // Constructor. An objective points to a single MPSolverInterface
@@ -1141,6 +1178,7 @@ class MPVariable {
   friend class MPVariableSolutionValueTest;
   friend class BopInterface;
   friend class SatInterface;
+  friend class PdlpInterface;
   friend class KnapsackInterface;
 
   // Constructor. A variable points to a single MPSolverInterface that
@@ -1282,6 +1320,7 @@ class MPConstraint {
   friend class GLOPInterface;
   friend class BopInterface;
   friend class SatInterface;
+  friend class PdlpInterface;
   friend class KnapsackInterface;
 
   // Constructor. A constraint points to a single MPSolverInterface
@@ -1549,11 +1588,17 @@ class MPSolverInterface {
   // solution is optimal.
   virtual MPSolver::ResultStatus Solve(const MPSolverParameters& param) = 0;
 
-  // Directly solves a MPModelRequest, bypassing the MPSolver data structures
-  // entirely. Returns {} (eg. absl::nullopt) if the feature is not supported by
-  // the underlying solver.
+  // Attempts to directly solve a MPModelRequest, bypassing the MPSolver data
+  // structures entirely. Like MPSolver::SolveWithProto(), optionally takes in
+  // an 'interrupt' boolean.
+  // Returns {} (eg. absl::nullopt) if direct-solve is not supported by the
+  // underlying solver (possibly because interrupt != nullptr), in which case
+  // the user should fall back to using MPSolver.
   virtual absl::optional<MPSolutionResponse> DirectlySolveProto(
-      const MPModelRequest& request) {
+      const MPModelRequest& request,
+      // `interrupt` is non-const because the internal
+      // solver may set it to true itself, in some cases.
+      std::atomic<bool>* interrupt) {
     return absl::nullopt;
   }
 

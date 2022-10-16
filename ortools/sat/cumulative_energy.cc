@@ -13,13 +13,17 @@
 
 #include "ortools/sat/cumulative_energy.h"
 
-#include <memory>
+#include <algorithm>
 #include <utility>
+#include <vector>
 
-#include "ortools/base/int_type.h"
 #include "ortools/base/iterator_adaptors.h"
 #include "ortools/base/logging.h"
-#include "ortools/sat/sat_base.h"
+#include "ortools/sat/integer.h"
+#include "ortools/sat/intervals.h"
+#include "ortools/sat/model.h"
+#include "ortools/sat/theta_tree.h"
+#include "ortools/util/strong_integers.h"
 
 namespace operations_research {
 namespace sat {
@@ -57,14 +61,10 @@ void AddCumulativeOverloadChecker(const std::vector<AffineExpression>& demands,
       energies.emplace_back(demand.constant * size.constant);
     } else if (demand.var == kNoIntegerVariable) {
       CHECK_GE(demand.constant, 0);
-      energies.push_back(size);
-      energies.back().coeff *= demand.constant;
-      energies.back().constant *= demand.constant;
+      energies.push_back(size.MultipliedBy(demand.constant));
     } else if (size.var == kNoIntegerVariable) {
       CHECK_GE(size.constant, 0);
-      energies.push_back(demand);
-      energies.back().coeff *= size.constant;
-      energies.back().constant *= size.constant;
+      energies.push_back(demand.MultipliedBy(size.constant));
     } else {
       // The case where both demand and size are variable should be rare.
       //
@@ -277,6 +277,150 @@ bool CumulativeEnergyConstraint::Propagate() {
     }
   }
   return true;
+}
+
+CumulativeIsAfterSubsetConstraint::CumulativeIsAfterSubsetConstraint(
+    IntegerVariable var, IntegerValue offset, AffineExpression capacity,
+    const std::vector<AffineExpression> demands,
+    const std::vector<int> subtasks, IntegerTrail* integer_trail,
+    SchedulingConstraintHelper* helper)
+    : var_to_push_(var),
+      offset_(offset),
+      capacity_(capacity),
+      demands_(demands),
+      subtasks_(subtasks),
+      integer_trail_(integer_trail),
+      helper_(helper) {
+  is_in_subtasks_.assign(helper->NumTasks(), false);
+  for (const int t : subtasks) is_in_subtasks_[t] = true;
+}
+
+bool CumulativeIsAfterSubsetConstraint::Propagate() {
+  if (!helper_->SynchronizeAndSetTimeDirection(true)) return false;
+
+  IntegerValue best_time = kMaxIntegerValue;
+  IntegerValue best_end_min = kMinIntegerValue;
+
+  IntegerValue previous_time = kMaxIntegerValue;
+  IntegerValue energy_after_time(0);
+  IntegerValue profile_height(0);
+
+  // If the capacity_max is low enough, we compute the exact possible subset
+  // of reachable "sum of demands" of all tasks used in the energy. We will use
+  // the highest reachable as the capacity max.
+  const IntegerValue capacity_max = integer_trail_->UpperBound(capacity_);
+  dp_.Reset(capacity_max.value());
+
+  // We consider the energy after a given time.
+  // From that we derive a bound on the end_min of the subtasks.
+  const auto& profile = helper_->GetEnergyProfile();
+  for (int i = profile.size() - 1; i >= 0;) {
+    // Skip tasks not relevant for this propagator.
+    {
+      const int t = profile[i].task;
+      if (!helper_->IsPresent(t) || !is_in_subtasks_[t]) {
+        --i;
+        continue;
+      }
+    }
+
+    const IntegerValue time = profile[i].time;
+    if (profile_height > 0) {
+      energy_after_time += profile_height * (previous_time - time);
+    }
+    previous_time = time;
+    const IntegerValue saved_capa_max = dp_.CurrentMax();
+
+    for (; i >= 0 && profile[i].time == time; --i) {
+      // Skip tasks not relevant for this propagator.
+      const int t = profile[i].task;
+      if (!helper_->IsPresent(t) || !is_in_subtasks_[t]) continue;
+
+      const IntegerValue demand_min = integer_trail_->LowerBound(demands_[t]);
+      const IntegerValue delta = profile[i].is_first ? -demand_min : demand_min;
+      profile_height += delta;
+      if (delta > 0) {
+        if (demands_[t].IsConstant()) {
+          dp_.Add(delta.value());
+        } else {
+          dp_.Add(capacity_max.value());  // Abort DP.
+        }
+      }
+    }
+
+    // We prefer higher time in case of ties since that should reduce the
+    // explanation size.
+    //
+    // Note that if the energy is zero, we don't push anything. Other propagator
+    // will make sure that the end_min is greater than the end_min of any of
+    // the task considered here. TODO(user): actually, we will push using the
+    // last task, and the reason will be non-optimal, fix.
+    if (energy_after_time == 0) continue;
+    DCHECK_GT(saved_capa_max, 0);
+    const IntegerValue end_min =
+        time + CeilRatio(energy_after_time, saved_capa_max);
+    if (end_min > best_end_min) {
+      best_time = time;
+      best_end_min = end_min;
+    }
+  }
+  DCHECK_EQ(profile_height, 0);
+
+  if (best_end_min == kMinIntegerValue) return true;
+  if (best_end_min + offset_ > integer_trail_->LowerBound(var_to_push_)) {
+    // Compute the reason.
+    // It is just the reason for the energy after time.
+    helper_->ClearReason();
+    for (int t = 0; t < helper_->NumTasks(); ++t) {
+      if (!is_in_subtasks_[t]) continue;
+      if (!helper_->IsPresent(t)) continue;
+
+      const IntegerValue size_min = helper_->SizeMin(t);
+      if (size_min == 0) continue;
+
+      const IntegerValue demand_min = integer_trail_->LowerBound(demands_[t]);
+      if (demand_min == 0) continue;
+
+      const IntegerValue end_min = helper_->EndMin(t);
+      if (end_min <= best_time) continue;
+
+      helper_->AddEndMinReason(t, std::min(best_time + size_min, end_min));
+      helper_->AddSizeMinReason(t);
+      helper_->AddPresenceReason(t);
+      if (demands_[t].var != kNoIntegerVariable) {
+        helper_->MutableIntegerReason()->push_back(
+            integer_trail_->LowerBoundAsLiteral(demands_[t].var));
+      }
+    }
+    if (capacity_.var != kNoIntegerVariable) {
+      helper_->MutableIntegerReason()->push_back(
+          integer_trail_->UpperBoundAsLiteral(capacity_.var));
+    }
+
+    // Propagate.
+    if (!helper_->PushIntegerLiteral(IntegerLiteral::GreaterOrEqual(
+            var_to_push_, best_end_min + offset_))) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void CumulativeIsAfterSubsetConstraint::RegisterWith(
+    GenericLiteralWatcher* watcher) {
+  helper_->SetTimeDirection(true);
+  const int id = watcher->Register(this);
+  watcher->WatchUpperBound(capacity_, id);
+  for (const int t : subtasks_) {
+    watcher->WatchLowerBound(helper_->Starts()[t], id);
+    watcher->WatchLowerBound(helper_->Ends()[t], id);
+    watcher->WatchLowerBound(helper_->Sizes()[t], id);
+    watcher->WatchLowerBound(demands_[t], id);
+    if (!helper_->IsPresent(t) && !helper_->IsAbsent(t)) {
+      watcher->WatchLiteral(helper_->PresenceLiteral(t), id);
+    }
+  }
 }
 
 }  // namespace sat

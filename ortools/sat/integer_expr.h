@@ -14,11 +14,15 @@
 #ifndef OR_TOOLS_SAT_INTEGER_EXPR_H_
 #define OR_TOOLS_SAT_INTEGER_EXPR_H_
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
+#include <utility>
 #include <vector>
 
-#include "ortools/base/int_type.h"
+#include "absl/types/span.h"
 #include "ortools/base/integral_types.h"
 #include "ortools/base/logging.h"
 #include "ortools/base/macros.h"
@@ -30,6 +34,8 @@
 #include "ortools/sat/sat_base.h"
 #include "ortools/sat/sat_solver.h"
 #include "ortools/util/rev.h"
+#include "ortools/util/strong_integers.h"
+#include "ortools/util/time_limit.h"
 
 namespace operations_research {
 namespace sat {
@@ -70,6 +76,13 @@ class IntegerSumLE : public PropagatorInterface {
   // mainly useful for the LP propagator since it can find relevant optimal
   // really late in the search tree.
   bool PropagateAtLevelZero();
+
+  // This is a pretty usage specific function. Returns the implied lower bound
+  // on target_var if the given integer literal is false (resp. true). If the
+  // variables do not appear both in the linear inequality, this returns two
+  // kMinIntegerValue.
+  std::pair<IntegerValue, IntegerValue> ConditionalLb(
+      IntegerLiteral integer_literal, IntegerVariable target_var) const;
 
  private:
   // Fills integer_reason_ with all the current lower_bounds. The real
@@ -136,7 +149,7 @@ class LevelZeroEquality : PropagatorInterface {
   IntegerTrail* integer_trail_;
 };
 
-// A min (resp max) contraint of the form min == MIN(vars) can be decomposed
+// A min (resp max) constraint of the form min == MIN(vars) can be decomposed
 // into two inequalities:
 //   1/ min <= MIN(vars), which is the same as for all v in vars, "min <= v".
 //      This can be taken care of by the LowerOrEqual(min, v) constraint.
@@ -208,47 +221,74 @@ class LinMinPropagator : public PropagatorInterface {
   int rev_unique_candidate_ = 0;
 };
 
-// Propagates a * b = c. Basic version, we don't extract any special cases, and
-// we only propagates the bounds.
+// Propagates a * b = p.
 //
-// TODO(user): For now this only works on variables that are non-negative.
-// TODO(user): Deal with overflow.
-class PositiveProductPropagator : public PropagatorInterface {
+// The bounds [min, max] of a and b will be propagated perfectly, but not
+// the bounds on p as this require more complex arithmetics.
+class ProductPropagator : public PropagatorInterface {
  public:
-  PositiveProductPropagator(IntegerVariable a, IntegerVariable b,
-                            IntegerVariable p, IntegerTrail* integer_trail);
+  ProductPropagator(AffineExpression a, AffineExpression b, AffineExpression p,
+                    IntegerTrail* integer_trail);
 
   bool Propagate() final;
   void RegisterWith(GenericLiteralWatcher* watcher);
 
  private:
-  const IntegerVariable a_;
-  const IntegerVariable b_;
-  const IntegerVariable p_;
+  // Maybe replace a_, b_ or c_ by their negation to simplify the cases.
+  bool CanonicalizeCases();
+
+  // Special case when all are >= 0.
+  // We use faster code and better reasons than the generic code.
+  bool PropagateWhenAllNonNegative();
+
+  // Internal helper, see code for more details.
+  bool PropagateMaxOnPositiveProduct(AffineExpression a, AffineExpression b,
+                                     IntegerValue min_p, IntegerValue max_p);
+
+  // Note that we might negate any two terms in CanonicalizeCases() during
+  // each propagation. This is fine.
+  AffineExpression a_;
+  AffineExpression b_;
+  AffineExpression p_;
+
   IntegerTrail* integer_trail_;
 
-  DISALLOW_COPY_AND_ASSIGN(PositiveProductPropagator);
+  DISALLOW_COPY_AND_ASSIGN(ProductPropagator);
 };
 
-// Propagates a / b = c. Basic version, we don't extract any special cases, and
-// we only propagates the bounds.
+// Propagates num / denom = div. Basic version, we don't extract any special
+// cases, and we only propagates the bounds. It expects denom to be > 0.
 //
-// TODO(user): For now this only works on variables that are non-negative.
-// TODO(user): This only propagate the direction => c, do the reverse.
 // TODO(user): Deal with overflow.
-// TODO(user): Unit-test this like the ProductPropagator.
 class DivisionPropagator : public PropagatorInterface {
  public:
-  DivisionPropagator(IntegerVariable a, IntegerVariable b, IntegerVariable c,
-                     IntegerTrail* integer_trail);
+  DivisionPropagator(AffineExpression num, AffineExpression denom,
+                     AffineExpression div, IntegerTrail* integer_trail);
 
   bool Propagate() final;
   void RegisterWith(GenericLiteralWatcher* watcher);
 
  private:
-  const IntegerVariable a_;
-  const IntegerVariable b_;
-  const IntegerVariable c_;
+  // Propagates the fact that the signs of each domain, if fixed, are
+  // compatible.
+  bool PropagateSigns();
+
+  // If both num and div >= 0, we can propagate their upper bounds.
+  bool PropagateUpperBounds(AffineExpression num, AffineExpression denom,
+                            AffineExpression div);
+
+  // When the sign of all 3 expressions are fixed, we can do morel propagation.
+  //
+  // By using negated expressions, we can make sure the domains of num, denom,
+  // and div are positive.
+  bool PropagatePositiveDomains(AffineExpression num, AffineExpression denom,
+                                AffineExpression div);
+
+  const AffineExpression num_;
+  const AffineExpression denom_;
+  const AffineExpression div_;
+  const AffineExpression negated_num_;
+  const AffineExpression negated_div_;
   IntegerTrail* integer_trail_;
 
   DISALLOW_COPY_AND_ASSIGN(DivisionPropagator);
@@ -258,34 +298,61 @@ class DivisionPropagator : public PropagatorInterface {
 // cases, and we only propagates the bounds. cst_b must be > 0.
 class FixedDivisionPropagator : public PropagatorInterface {
  public:
-  FixedDivisionPropagator(IntegerVariable a, IntegerValue b, IntegerVariable c,
-                          IntegerTrail* integer_trail);
+  FixedDivisionPropagator(AffineExpression a, IntegerValue b,
+                          AffineExpression c, IntegerTrail* integer_trail);
 
   bool Propagate() final;
   void RegisterWith(GenericLiteralWatcher* watcher);
 
  private:
-  const IntegerVariable a_;
+  const AffineExpression a_;
   const IntegerValue b_;
-  const IntegerVariable c_;
+  const AffineExpression c_;
+
   IntegerTrail* integer_trail_;
 
   DISALLOW_COPY_AND_ASSIGN(FixedDivisionPropagator);
+};
+
+// Propagates target == expr % mod. Basic version, we don't extract any special
+// cases, and we only propagates the bounds. mod must be > 0.
+class FixedModuloPropagator : public PropagatorInterface {
+ public:
+  FixedModuloPropagator(AffineExpression expr, IntegerValue mod,
+                        AffineExpression target, IntegerTrail* integer_trail);
+
+  bool Propagate() final;
+  void RegisterWith(GenericLiteralWatcher* watcher);
+
+ private:
+  bool PropagateSignsAndTargetRange();
+  bool PropagateBoundsWhenExprIsPositive(AffineExpression expr,
+                                         AffineExpression target);
+  bool PropagateOuterBounds();
+
+  const AffineExpression expr_;
+  const IntegerValue mod_;
+  const AffineExpression target_;
+  const AffineExpression negated_expr_;
+  const AffineExpression negated_target_;
+  IntegerTrail* integer_trail_;
+
+  DISALLOW_COPY_AND_ASSIGN(FixedModuloPropagator);
 };
 
 // Propagates x * x = s.
 // TODO(user): Only works for x nonnegative.
 class SquarePropagator : public PropagatorInterface {
  public:
-  SquarePropagator(IntegerVariable x, IntegerVariable s,
+  SquarePropagator(AffineExpression x, AffineExpression s,
                    IntegerTrail* integer_trail);
 
   bool Propagate() final;
   void RegisterWith(GenericLiteralWatcher* watcher);
 
  private:
-  const IntegerVariable x_;
-  const IntegerVariable s_;
+  const AffineExpression x_;
+  const AffineExpression s_;
   IntegerTrail* integer_trail_;
 
   DISALLOW_COPY_AND_ASSIGN(SquarePropagator);
@@ -561,6 +628,7 @@ inline void LoadLinearConstraint(const LinearConstraint& cst, Model* model) {
 
   // TODO(user): Remove the conversion!
   std::vector<int64_t> converted_coeffs;
+
   for (const IntegerValue v : cst.coeffs) converted_coeffs.push_back(v.value());
   if (cst.ub < kMaxIntegerValue) {
     model->Add(
@@ -697,7 +765,7 @@ inline std::function<void(Model*)> IsEqualToMinOf(
 
     IntegerVariable min_var;
     if (min_expr.vars.size() == 1 &&
-        std::abs(min_expr.coeffs[0].value()) == 1) {
+        std::abs(min_expr.coeffs[0].value()) == 1 && min_expr.offset == 0) {
       if (min_expr.coeffs[0].value() == 1) {
         min_var = min_expr.vars[0];
       } else {
@@ -769,69 +837,69 @@ void RegisterAndTransferOwnership(Model* model, T* ct) {
   model->TakeOwnership(ct);
 }
 // Adds the constraint: a * b = p.
-inline std::function<void(Model*)> ProductConstraint(IntegerVariable a,
-                                                     IntegerVariable b,
-                                                     IntegerVariable p) {
+inline std::function<void(Model*)> ProductConstraint(AffineExpression a,
+                                                     AffineExpression b,
+                                                     AffineExpression p) {
   return [=](Model* model) {
     IntegerTrail* integer_trail = model->GetOrCreate<IntegerTrail>();
     if (a == b) {
-      if (model->Get(LowerBound(a)) >= 0) {
+      if (integer_trail->LowerBound(a) >= 0) {
         RegisterAndTransferOwnership(model,
                                      new SquarePropagator(a, p, integer_trail));
-      } else if (model->Get(UpperBound(a)) <= 0) {
-        RegisterAndTransferOwnership(
-            model, new SquarePropagator(NegationOf(a), p, integer_trail));
-      } else {
-        LOG(FATAL) << "Not supported";
+        return;
       }
-    } else if (model->Get(LowerBound(a)) >= 0 &&
-               model->Get(LowerBound(b)) >= 0) {
-      RegisterAndTransferOwnership(
-          model, new PositiveProductPropagator(a, b, p, integer_trail));
-    } else if (model->Get(LowerBound(a)) >= 0 &&
-               model->Get(UpperBound(b)) <= 0) {
-      RegisterAndTransferOwnership(
-          model, new PositiveProductPropagator(a, NegationOf(b), NegationOf(p),
-                                               integer_trail));
-    } else if (model->Get(UpperBound(a)) <= 0 &&
-               model->Get(LowerBound(b)) >= 0) {
-      RegisterAndTransferOwnership(
-          model, new PositiveProductPropagator(NegationOf(a), b, NegationOf(p),
-                                               integer_trail));
-    } else if (model->Get(UpperBound(a)) <= 0 &&
-               model->Get(UpperBound(b)) <= 0) {
-      RegisterAndTransferOwnership(
-          model, new PositiveProductPropagator(NegationOf(a), NegationOf(b), p,
-                                               integer_trail));
-    } else {
-      LOG(FATAL) << "Not supported";
+      if (integer_trail->UpperBound(a) <= 0) {
+        RegisterAndTransferOwnership(
+            model, new SquarePropagator(a.Negated(), p, integer_trail));
+        return;
+      }
     }
+    RegisterAndTransferOwnership(model,
+                                 new ProductPropagator(a, b, p, integer_trail));
   };
 }
 
-// Adds the constraint: a / b = c.
-inline std::function<void(Model*)> DivisionConstraint(IntegerVariable a,
-                                                      IntegerVariable b,
-                                                      IntegerVariable c) {
+// Adds the constraint: num / denom = div. (denom > 0).
+inline std::function<void(Model*)> DivisionConstraint(AffineExpression num,
+                                                      AffineExpression denom,
+                                                      AffineExpression div) {
   return [=](Model* model) {
     IntegerTrail* integer_trail = model->GetOrCreate<IntegerTrail>();
-    DivisionPropagator* constraint =
-        new DivisionPropagator(a, b, c, integer_trail);
+    DivisionPropagator* constraint;
+    if (integer_trail->UpperBound(denom) < 0) {
+      constraint = new DivisionPropagator(num.Negated(), denom.Negated(), div,
+                                          integer_trail);
+
+    } else {
+      constraint = new DivisionPropagator(num, denom, div, integer_trail);
+    }
     constraint->RegisterWith(model->GetOrCreate<GenericLiteralWatcher>());
     model->TakeOwnership(constraint);
   };
 }
 
 // Adds the constraint: a / b = c where b is a constant.
-inline std::function<void(Model*)> FixedDivisionConstraint(IntegerVariable a,
+inline std::function<void(Model*)> FixedDivisionConstraint(AffineExpression a,
                                                            IntegerValue b,
-                                                           IntegerVariable c) {
+                                                           AffineExpression c) {
   return [=](Model* model) {
     IntegerTrail* integer_trail = model->GetOrCreate<IntegerTrail>();
     FixedDivisionPropagator* constraint =
-        b > 0
-            ? new FixedDivisionPropagator(a, b, c, integer_trail)
-            : new FixedDivisionPropagator(NegationOf(a), -b, c, integer_trail);
+        b > 0 ? new FixedDivisionPropagator(a, b, c, integer_trail)
+              : new FixedDivisionPropagator(a.Negated(), -b, c, integer_trail);
+    constraint->RegisterWith(model->GetOrCreate<GenericLiteralWatcher>());
+    model->TakeOwnership(constraint);
+  };
+}
+
+// Adds the constraint: a % b = c where b is a constant.
+inline std::function<void(Model*)> FixedModuloConstraint(AffineExpression a,
+                                                         IntegerValue b,
+                                                         AffineExpression c) {
+  return [=](Model* model) {
+    IntegerTrail* integer_trail = model->GetOrCreate<IntegerTrail>();
+    FixedModuloPropagator* constraint =
+        new FixedModuloPropagator(a, b, c, integer_trail);
     constraint->RegisterWith(model->GetOrCreate<GenericLiteralWatcher>());
     model->TakeOwnership(constraint);
   };

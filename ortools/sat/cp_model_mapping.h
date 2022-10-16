@@ -20,7 +20,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
-#include "ortools/base/int_type.h"
+#include "absl/meta/type_traits.h"
 #include "ortools/base/integral_types.h"
 #include "ortools/base/logging.h"
 #include "ortools/base/strong_vector.h"
@@ -31,6 +31,7 @@
 #include "ortools/sat/linear_constraint.h"
 #include "ortools/sat/model.h"
 #include "ortools/sat/sat_base.h"
+#include "ortools/util/strong_integers.h"
 
 namespace operations_research {
 namespace sat {
@@ -91,7 +92,7 @@ class CpModelMapping {
   // TODO(user): We could "easily" create an intermediate variable for more
   // complex linear expression. We could also identify duplicate expressions to
   // not create two identical integer variable.
-  AffineExpression LoadAffineView(const LinearExpressionProto& exp) const {
+  AffineExpression Affine(const LinearExpressionProto& exp) const {
     CHECK_LE(exp.vars().size(), 1);
     if (exp.vars().empty()) {
       return AffineExpression(IntegerValue(exp.offset()));
@@ -118,6 +119,13 @@ class CpModelMapping {
   std::vector<sat::Literal> Literals(const ProtoIndices& indices) const {
     std::vector<sat::Literal> result;
     for (const int i : indices) result.push_back(CpModelMapping::Literal(i));
+    return result;
+  }
+
+  template <typename List>
+  std::vector<AffineExpression> Affines(const List& list) const {
+    std::vector<AffineExpression> result;
+    for (const auto& i : list) result.push_back(Affine(i));
     return result;
   }
 

@@ -19,8 +19,9 @@
 #include <string>
 #include <vector>
 
+#include "absl/base/attributes.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "ortools/base/int_type.h"
 #include "ortools/base/integral_types.h"
 #include "ortools/base/logging.h"
 #include "ortools/base/macros.h"
@@ -33,12 +34,16 @@
 #include "ortools/sat/precedences.h"
 #include "ortools/sat/sat_base.h"
 #include "ortools/sat/sat_solver.h"
+#include "ortools/util/rev.h"
+#include "ortools/util/strong_integers.h"
 
 namespace operations_research {
 namespace sat {
 
-DEFINE_INT_TYPE(IntervalVariable, int32_t);
+DEFINE_STRONG_INDEX_TYPE(IntervalVariable);
 const IntervalVariable kNoIntervalVariable(-1);
+
+class SchedulingConstraintHelper;
 
 // This class maintains a set of intervals which correspond to three integer
 // variables (start, end and size). It automatically registers with the
@@ -137,6 +142,11 @@ class IntervalsRepository {
     return result;
   }
 
+  // Returns a SchedulingConstraintHelper corresponding to the given variables.
+  // Note that the order of interval in the helper will be the same.
+  SchedulingConstraintHelper* GetOrCreateHelper(
+      const std::vector<IntervalVariable>& variables);
+
  private:
   // External classes needed.
   Model* model_;
@@ -151,6 +161,12 @@ class IntervalsRepository {
   absl::StrongVector<IntervalVariable, AffineExpression> starts_;
   absl::StrongVector<IntervalVariable, AffineExpression> ends_;
   absl::StrongVector<IntervalVariable, AffineExpression> sizes_;
+
+  // We can share the helper for all the propagators that work on the same set
+  // of intervals.
+  absl::flat_hash_map<std::vector<IntervalVariable>,
+                      SchedulingConstraintHelper*>
+      helper_repository_;
 
   DISALLOW_COPY_AND_ASSIGN(IntervalsRepository);
 };
@@ -287,6 +303,25 @@ class SchedulingConstraintHelper : public PropagatorInterface,
   const std::vector<TaskTime>& TaskByDecreasingStartMax();
   const std::vector<TaskTime>& TaskByDecreasingEndMax();
   const std::vector<TaskTime>& TaskByIncreasingShiftedStartMin();
+
+  // Returns a sorted vector where each task appear twice, the first occurrence
+  // is at size (end_min - size_min) and the second one at (end_min).
+  //
+  // This is quite usage specific.
+  struct ProfileEvent {
+    IntegerValue time;
+    int task;
+    bool is_first;
+
+    bool operator<(const ProfileEvent& other) const {
+      if (time == other.time) {
+        if (task == other.task) return is_first > other.is_first;
+        return task < other.task;
+      }
+      return time < other.time;
+    }
+  };
+  const std::vector<ProfileEvent>& GetEnergyProfile();
 
   // Functions to clear and then set the current reason.
   void ClearReason();
@@ -432,6 +467,10 @@ class SchedulingConstraintHelper : public PropagatorInterface,
   std::vector<TaskTime> task_by_decreasing_start_max_;
   std::vector<TaskTime> task_by_decreasing_end_max_;
 
+  // Sorted vector returned by GetEnergyProfile().
+  bool recompute_energy_profile_ = true;
+  std::vector<ProfileEvent> energy_profile_;
+
   // This one is the most commonly used, so we optimized a bit more its
   // computation by detecting when there is nothing to do.
   std::vector<TaskTime> task_by_increasing_shifted_start_min_;
@@ -525,8 +564,7 @@ inline void SchedulingConstraintHelper::AddGenericReason(
   }
   CHECK_NE(a.var, kNoIntegerVariable);
 
-  // Here we assume that the upper_bound on a comes from the lower bound of b +
-  // c.
+  // Here we assume that the upper_bound on a comes from the bound on b + c.
   const IntegerValue slack = upper_bound - integer_trail_->UpperBound(b) -
                              integer_trail_->UpperBound(c);
   CHECK_GE(slack, 0);
@@ -537,8 +575,8 @@ inline void SchedulingConstraintHelper::AddGenericReason(
     integer_reason_.push_back(b.LowerOrEqual(upper_bound - c.constant));
   } else {
     integer_trail_->AppendRelaxedLinearReason(
-        slack, {IntegerValue(1), IntegerValue(1)},
-        {NegationOf(b.var), NegationOf(c.var)}, &integer_reason_);
+        slack, {b.coeff, c.coeff}, {NegationOf(b.var), NegationOf(c.var)},
+        &integer_reason_);
   }
 }
 
@@ -546,6 +584,7 @@ inline void SchedulingConstraintHelper::AddSizeMinReason(
     int t, IntegerValue lower_bound) {
   AddOtherReason(t);
   DCHECK(!IsAbsent(t));
+  if (lower_bound <= 0) return;
   AddGenericReason(sizes_[t].Negated(), -lower_bound, minus_ends_[t],
                    starts_[t]);
 }
@@ -553,7 +592,7 @@ inline void SchedulingConstraintHelper::AddSizeMinReason(
 inline void SchedulingConstraintHelper::AddSizeMaxReason(
     int t, IntegerValue upper_bound) {
   AddOtherReason(t);
-  CHECK(!IsAbsent(t));
+  DCHECK(!IsAbsent(t));
   AddGenericReason(sizes_[t], upper_bound, ends_[t], minus_starts_[t]);
 }
 

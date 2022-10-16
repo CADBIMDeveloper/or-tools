@@ -16,9 +16,14 @@
 
 #include <vector>
 
+#include "ortools/base/logging.h"
 #include "ortools/base/strong_vector.h"
 #include "ortools/sat/integer.h"
+#include "ortools/sat/model.h"
+#include "ortools/sat/sat_base.h"
+#include "ortools/sat/sat_parameters.pb.h"
 #include "ortools/sat/util.h"
+#include "ortools/util/strong_integers.h"
 
 namespace operations_research {
 namespace sat {
@@ -27,7 +32,7 @@ namespace sat {
 // objective bounds per unit change in the variable bounds.
 class PseudoCosts {
  public:
-  // Helper struct to get information relavant for pseudo costs from branching
+  // Helper struct to get information relevant for pseudo costs from branching
   // decisions.
   struct VariableBoundChange {
     IntegerVariable var = kNoIntegerVariable;

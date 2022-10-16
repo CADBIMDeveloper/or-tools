@@ -12,8 +12,14 @@
 // limitations under the License.
 
 // [START program]
+#include <stdlib.h>
+
+#include "ortools/base/logging.h"
 #include "ortools/sat/cp_model.h"
+#include "ortools/sat/cp_model.pb.h"
+#include "ortools/sat/cp_model_solver.h"
 #include "ortools/sat/model.h"
+#include "ortools/util/sorted_interval_list.h"
 
 namespace operations_research {
 namespace sat {
@@ -35,7 +41,7 @@ void SolutionHintingSampleSat() {
   // [END constraints]
 
   // [START objective]
-  cp_model.Maximize(LinearExpr::ScalProd({x, y, z}, {1, 2, 3}));
+  cp_model.Maximize(x + 2 * y + 3 * z);
   // [END objective]
 
   // Solution hinting: x <- 1, y <- 2

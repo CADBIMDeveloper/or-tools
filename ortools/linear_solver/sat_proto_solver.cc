@@ -24,6 +24,7 @@
 #include "ortools/sat/cp_model.pb.h"
 #include "ortools/sat/cp_model_solver.h"
 #include "ortools/sat/lp_utils.h"
+#include "ortools/sat/parameters_validation.h"
 #include "ortools/sat/sat_parameters.pb.h"
 #include "ortools/util/logging.h"
 #include "ortools/util/time_limit.h"
@@ -53,7 +54,7 @@ MPSolverResponseStatus ToMPSolverResponseStatus(sat::CpSolverStatus status,
     case sat::CpSolverStatus::MODEL_INVALID:
       return MPSOLVER_MODEL_INVALID;
     case sat::CpSolverStatus::FEASIBLE:
-      return has_objective ? MPSOLVER_FEASIBLE : MPSOLVER_OPTIMAL;
+      return MPSOLVER_FEASIBLE;
     case sat::CpSolverStatus::INFEASIBLE:
       return MPSOLVER_INFEASIBLE;
     case sat::CpSolverStatus::OPTIMAL:
@@ -63,15 +64,65 @@ MPSolverResponseStatus ToMPSolverResponseStatus(sat::CpSolverStatus status,
   }
   return MPSOLVER_ABNORMAL;
 }
+
+sat::CpSolverStatus FromMPSolverResponseStatus(MPSolverResponseStatus status) {
+  switch (status) {
+    case MPSolverResponseStatus::MPSOLVER_OPTIMAL:
+      return sat::OPTIMAL;
+    case MPSolverResponseStatus::MPSOLVER_INFEASIBLE:
+      return sat::INFEASIBLE;
+    case MPSolverResponseStatus::MPSOLVER_MODEL_INVALID:
+      return sat::MODEL_INVALID;
+    default: {
+    }
+  }
+  return sat::UNKNOWN;
+}
+
+MPSolutionResponse InfeasibleResponse(SolverLogger& logger,
+                                      std::string message) {
+  SOLVER_LOG(&logger, "Infeasible model detected in sat_solve_proto.\n",
+             message);
+
+  // This is needed for our benchmark scripts.
+  if (logger.LoggingIsEnabled()) {
+    sat::CpSolverResponse cp_response;
+    cp_response.set_status(sat::CpSolverStatus::INFEASIBLE);
+    SOLVER_LOG(&logger, CpSolverResponseStats(cp_response));
+  }
+
+  MPSolutionResponse response;
+  response.set_status(MPSolverResponseStatus::MPSOLVER_INFEASIBLE);
+  response.set_status_str(message);
+  return response;
+}
+
+MPSolutionResponse ModelInvalidResponse(SolverLogger& logger,
+                                        std::string message) {
+  SOLVER_LOG(&logger, "Invalid input detected in sat_solve_proto.\n", message);
+
+  // This is needed for our benchmark scripts.
+  if (logger.LoggingIsEnabled()) {
+    sat::CpSolverResponse cp_response;
+    cp_response.set_status(sat::CpSolverStatus::MODEL_INVALID);
+    SOLVER_LOG(&logger, CpSolverResponseStats(cp_response));
+  }
+
+  MPSolutionResponse response;
+  response.set_status(MPSolverResponseStatus::MPSOLVER_MODEL_INVALID);
+  response.set_status_str(message);
+  return response;
+}
+
 }  // namespace
 
 absl::StatusOr<MPSolutionResponse> SatSolveProto(
-    MPModelRequest request, std::atomic<bool>* interrupt_solve) {
-  // By default, we use 8 threads as it allows to try a good set of orthogonal
-  // parameters. This can be overridden by the user.
+    MPModelRequest request, std::atomic<bool>* interrupt_solve,
+    std::function<void(const std::string&)> logging_callback,
+    std::function<void(const MPSolution&)> solution_callback) {
   sat::SatParameters params;
-  params.set_num_search_workers(8);
   params.set_log_search_progress(request.enable_internal_solver_output());
+  // Set it now so that it can be overwritten by the solver specific parameters.
   if (request.has_solver_specific_parameters()) {
     // See EncodeSatParametersAsString() documentation.
     if (kProtoLiteSatParameters) {
@@ -90,8 +141,7 @@ absl::StatusOr<MPSolutionResponse> SatSolveProto(
     }
   }
   if (request.has_solver_time_limit_seconds()) {
-    params.set_max_time_in_seconds(
-        static_cast<double>(request.solver_time_limit_seconds()) / 1000.0);
+    params.set_max_time_in_seconds(request.solver_time_limit_seconds());
   }
 
   // TODO(user): We do not support all the parameters here. In particular the
@@ -101,38 +151,89 @@ absl::StatusOr<MPSolutionResponse> SatSolveProto(
   // calling SolveCpModel() and call a common config function from here or from
   // inside Solve()?
   SolverLogger logger;
+  if (logging_callback != nullptr) {
+    logger.AddInfoLoggingCallback(logging_callback);
+  }
   logger.EnableLogging(params.log_search_progress());
   logger.SetLogToStdOut(params.log_to_stdout());
 
+  // Model validation and delta handling.
   MPSolutionResponse response;
   if (!ExtractValidMPModelInPlaceOrPopulateResponseStatus(&request,
                                                           &response)) {
+    // Note that the ExtractValidMPModelInPlaceOrPopulateResponseStatus() can
+    // also close trivial model (empty or trivially infeasible). So this is not
+    // always the MODEL_INVALID status.
+    //
+    // The logging is only needed for our benchmark script, so we use UNKNOWN
+    // here, but we could log the proper status instead.
     if (logger.LoggingIsEnabled()) {
-      // This is needed for our benchmark scripts.
       sat::CpSolverResponse cp_response;
-      cp_response.set_status(sat::CpSolverStatus::MODEL_INVALID);
+      cp_response.set_status(FromMPSolverResponseStatus(response.status()));
       SOLVER_LOG(&logger, CpSolverResponseStats(cp_response));
     }
     return response;
   }
 
+  // We start by some extra validation since our code do not accept any kind
+  // of input.
+  MPModelProto* const mp_model = request.mutable_model();
+  if (!sat::MPModelProtoValidationBeforeConversion(params, *mp_model,
+                                                   &logger)) {
+    return ModelInvalidResponse(logger, "Extra CP-SAT validation failed.");
+  }
+
+  {
+    const std::string error = sat::ValidateParameters(params);
+    if (!error.empty()) {
+      return ModelInvalidResponse(
+          logger, absl::StrCat("Invalid CP-SAT parameters: ", error));
+    }
+  }
+
+  // This is good to do before any presolve.
+  if (!sat::MakeBoundsOfIntegerVariablesInteger(params, mp_model, &logger)) {
+    return InfeasibleResponse(logger,
+                              "An integer variable has an empty domain");
+  }
+
+  // Coefficients really close to zero can cause issues.
+  // We remove them right away according to our parameters.
+  RemoveNearZeroTerms(params, mp_model, &logger);
+
   // Note(user): the LP presolvers API is a bit weird and keep a reference to
   // the given GlopParameters, so we need to make sure it outlive them.
   const glop::GlopParameters glop_params;
-  MPModelProto* const mp_model = request.mutable_model();
   std::vector<std::unique_ptr<glop::Preprocessor>> for_postsolve;
-  const auto status =
-      ApplyMipPresolveSteps(glop_params, mp_model, &for_postsolve, &logger);
-  if (status == MPSolverResponseStatus::MPSOLVER_INFEASIBLE) {
-    if (params.log_search_progress()) {
-      // This is needed for our benchmark scripts.
-      sat::CpSolverResponse cp_response;
-      cp_response.set_status(sat::CpSolverStatus::INFEASIBLE);
-      LOG(INFO) << CpSolverResponseStats(cp_response);
+  if (!params.enumerate_all_solutions()) {
+    const glop::ProblemStatus status =
+        ApplyMipPresolveSteps(glop_params, mp_model, &for_postsolve, &logger);
+    switch (status) {
+      case glop::ProblemStatus::INIT:
+        // Continue with the solve.
+        break;
+      case glop::ProblemStatus::PRIMAL_INFEASIBLE:
+        return InfeasibleResponse(
+            logger, "Problem proven infeasible during MIP presolve");
+      case glop::ProblemStatus::INVALID_PROBLEM:
+        return ModelInvalidResponse(
+            logger, "Problem detected invalid during MIP presolve");
+      default:
+        // TODO(user): We put the INFEASIBLE_OR_UNBOUNBED case here since there
+        // is no return status that exactly matches it.
+        if (params.log_search_progress()) {
+          // This is needed for our benchmark scripts.
+          sat::CpSolverResponse cp_response;
+          cp_response.set_status(sat::CpSolverStatus::UNKNOWN);
+          LOG(INFO) << CpSolverResponseStats(cp_response);
+        }
+        response.set_status(MPSolverResponseStatus::MPSOLVER_UNKNOWN_STATUS);
+        if (status == glop::ProblemStatus::INFEASIBLE_OR_UNBOUNDED) {
+          response.set_status_str(
+              "Problem proven infeasible or unbounded during MIP presolve");
+        }
+        return response;
     }
-    response.set_status(MPSolverResponseStatus::MPSOLVER_INFEASIBLE);
-    response.set_status_str("Problem proven infeasible during MIP presolve");
-    return response;
   }
 
   // We need to do that before the automatic detection of integers.
@@ -145,6 +246,10 @@ absl::StatusOr<MPSolutionResponse> SatSolveProto(
   std::vector<double> var_scaling(num_variables, 1.0);
   if (params.mip_automatically_scale_variables()) {
     var_scaling = sat::DetectImpliedIntegers(mp_model, &logger);
+    if (!sat::MakeBoundsOfIntegerVariablesInteger(params, mp_model, &logger)) {
+      return InfeasibleResponse(
+          logger, "A detected integer variable has an empty domain");
+    }
   }
   if (params.mip_var_scaling() != 1.0) {
     const std::vector<double> other_scaling = sat::ScaleContinuousVariables(
@@ -206,6 +311,33 @@ absl::StatusOr<MPSolutionResponse> SatSolveProto(
         interrupt_solve);
   }
 
+  auto post_solve = [&](const sat::CpSolverResponse& cp_response) {
+    MPSolution mp_solution;
+    mp_solution.set_objective_value(cp_response.objective_value());
+    // Postsolve the bound shift and scaling.
+    glop::ProblemSolution glop_solution((glop::RowIndex(old_num_constraints)),
+                                        (glop::ColIndex(old_num_variables)));
+    for (int v = 0; v < glop_solution.primal_values.size(); ++v) {
+      glop_solution.primal_values[glop::ColIndex(v)] =
+          static_cast<double>(cp_response.solution(v)) / var_scaling[v];
+    }
+    for (int i = for_postsolve.size(); --i >= 0;) {
+      for_postsolve[i]->RecoverSolution(&glop_solution);
+    }
+    for (int v = 0; v < glop_solution.primal_values.size(); ++v) {
+      mp_solution.add_variable_value(
+          glop_solution.primal_values[glop::ColIndex(v)]);
+    }
+    return mp_solution;
+  };
+
+  if (solution_callback != nullptr) {
+    sat_model.Add(sat::NewFeasibleSolutionObserver(
+        [&](const sat::CpSolverResponse& cp_response) {
+          solution_callback(post_solve(cp_response));
+        }));
+  }
+
   // Solve.
   const sat::CpSolverResponse cp_response =
       sat::SolveCpModel(cp_model, &sat_model);
@@ -213,26 +345,30 @@ absl::StatusOr<MPSolutionResponse> SatSolveProto(
   // Convert the response.
   //
   // TODO(user): Implement the row and column status.
+  response.mutable_solve_info()->set_solve_wall_time_seconds(
+      cp_response.wall_time());
+  response.mutable_solve_info()->set_solve_user_time_seconds(
+      cp_response.user_time());
   response.set_status(
       ToMPSolverResponseStatus(cp_response.status(), cp_model.has_objective()));
   if (response.status() == MPSOLVER_FEASIBLE ||
       response.status() == MPSOLVER_OPTIMAL) {
     response.set_objective_value(cp_response.objective_value());
     response.set_best_objective_bound(cp_response.best_objective_bound());
+    MPSolution post_solved_solution = post_solve(cp_response);
+    *response.mutable_variable_value() =
+        std::move(*post_solved_solution.mutable_variable_value());
+  }
 
-    // Postsolve the bound shift and scaling.
-    glop::ProblemSolution solution((glop::RowIndex(old_num_constraints)),
-                                   (glop::ColIndex(old_num_variables)));
-    for (int v = 0; v < solution.primal_values.size(); ++v) {
-      solution.primal_values[glop::ColIndex(v)] =
-          static_cast<double>(cp_response.solution(v)) / var_scaling[v];
-    }
-    for (int i = for_postsolve.size(); --i >= 0;) {
-      for_postsolve[i]->RecoverSolution(&solution);
-    }
-    for (int v = 0; v < solution.primal_values.size(); ++v) {
-      response.add_variable_value(solution.primal_values[glop::ColIndex(v)]);
-    }
+  // Copy and postsolve any additional solutions.
+  //
+  // TODO(user): Remove the postsolve hack of copying to a response.
+  for (int i = 0; i < cp_response.additional_solutions().size(); ++i) {
+    sat::CpSolverResponse temp;
+    *temp.mutable_solution() = cp_response.additional_solutions(i).values();
+    MPSolution post_solved_solution = post_solve(temp);
+    *(response.add_additional_solutions()->mutable_variable_value()) =
+        std::move(*post_solved_solution.mutable_variable_value());
   }
 
   return response;

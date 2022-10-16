@@ -12,7 +12,7 @@
 // limitations under the License.
 
 // This is the skeleton for the official flatzinc interpreter.  Much
-// of the funcionalities are fixed (name of parameters, format of the
+// of the functionalities are fixed (name of parameters, format of the
 // input): see http://www.minizinc.org/downloads/doc-1.6/flatzinc-spec.pdf
 
 #include <limits>
@@ -28,9 +28,8 @@
 #include <vector>
 
 #include "absl/flags/flag.h"
-#include "absl/flags/parse.h"
-#include "absl/flags/usage.h"
 #include "ortools/base/commandlineflags.h"
+#include "ortools/base/init_google.h"
 #include "ortools/base/integral_types.h"
 #include "ortools/base/logging.h"
 #include "ortools/base/threadpool.h"

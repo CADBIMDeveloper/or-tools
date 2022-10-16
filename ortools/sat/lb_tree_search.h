@@ -14,14 +14,29 @@
 #ifndef OR_TOOLS_SAT_LB_TREE_SEARCH_H_
 #define OR_TOOLS_SAT_LB_TREE_SEARCH_H_
 
+#include <stdint.h>
+
+#include <algorithm>
+#include <functional>
 #include <limits>
+#include <string>
 #include <vector>
 
+#include "absl/strings/string_view.h"
+#include "absl/time/time.h"
+#include "ortools/base/strong_vector.h"
 #include "ortools/sat/integer.h"
 #include "ortools/sat/integer_search.h"
+#include "ortools/sat/linear_programming_constraint.h"
+#include "ortools/sat/model.h"
 #include "ortools/sat/sat_base.h"
+#include "ortools/sat/sat_decision.h"
+#include "ortools/sat/sat_parameters.pb.h"
 #include "ortools/sat/sat_solver.h"
 #include "ortools/sat/synchronization.h"
+#include "ortools/sat/util.h"
+#include "ortools/util/strong_integers.h"
+#include "ortools/util/time_limit.h"
 
 namespace operations_research {
 namespace sat {
@@ -49,79 +64,110 @@ class LbTreeSearch {
 
  private:
   // Code a binary tree.
+  DEFINE_STRONG_INDEX_TYPE(NodeIndex);
   struct Node {
     Node(Literal l, IntegerValue lb)
-        : literal(l),
-          objective_lb(lb),
-          true_objective(lb),
-          false_objective(lb) {}
+        : literal(l), true_objective(lb), false_objective(lb) {}
+
+    // The objective lower bound at this node.
+    IntegerValue MinObjective() const {
+      return std::min(true_objective, false_objective);
+    }
 
     // Invariant: the objective bounds only increase.
-    void UpdateObjective() {
-      objective_lb =
-          std::max(objective_lb, std::min(true_objective, false_objective));
+    void UpdateObjective(IntegerValue v) {
+      true_objective = std::max(true_objective, v);
+      false_objective = std::max(false_objective, v);
     }
     void UpdateTrueObjective(IntegerValue v) {
       true_objective = std::max(true_objective, v);
-      UpdateObjective();
     }
     void UpdateFalseObjective(IntegerValue v) {
       false_objective = std::max(false_objective, v);
-      UpdateObjective();
     }
 
     // The decision for the true and false branch under this node.
     /*const*/ Literal literal;
 
-    // The objective lower bound at this node.
-    IntegerValue objective_lb;
-
     // The objective lower bound in both branches.
-    // This is only updated when we backtrack over this node.
     IntegerValue true_objective;
     IntegerValue false_objective;
 
     // Points to adjacent nodes in the tree. Large if no connection.
-    int true_child = std::numeric_limits<int32_t>::max();
-    int false_child = std::numeric_limits<int32_t>::max();
+    NodeIndex true_child = NodeIndex(std::numeric_limits<int32_t>::max());
+    NodeIndex false_child = NodeIndex(std::numeric_limits<int32_t>::max());
 
-    // Instead of storing the full reason for an objective LB increase in one
-    // the branches (which can lead to a quadratic memory usage), we stores the
-    // level of the highest decision needed, not counting this node literal.
-    // Basically, the reason for true_objective without {literal} only includes
-    // literal with levels in [0, true_level].
-    //
-    // This allows us to slighlty reduce the size of the overall tree. If both
-    // branches have a low enough level, then we can backjump in the search tree
-    // and skip all the nodes in-between by connecting directly the correct
-    // ancestor to this node. Note that when we do that, the level of the nodes
-    // in the sub-branch change, but this still work.
-    int true_level = std::numeric_limits<int32_t>::max();
-    int false_level = std::numeric_limits<int32_t>::max();
+    // Indicates if this nodes was removed from the tree.
+    bool is_deleted = false;
   };
 
-  // Returns true if this node objective lb is greater than the root level
-  // objective lower bound.
-  bool NodeImprovesLowerBound(const LbTreeSearch::Node& node);
+  // Display the current tree, this is mainly here to investigate ideas to
+  // improve the code.
+  void DebugDisplayTree(NodeIndex root) const;
+
+  // Updates the objective of the node in the current branch at level n from
+  // the one at level n - 1.
+  void UpdateObjectiveFromParent(int level);
+
+  // Updates the objective of the node in the current branch at level n - 1 from
+  // the one at level n.
+  void UpdateParentObjective(int level);
+
+  // Returns false on conflict.
+  bool FullRestart();
+
+  // Mark the given node as deleted. Its literal is assumed to be set. We also
+  // delete the subtree that is not longer relevant.
+  void MarkAsDeletedNodeAndUnreachableSubtree(Node& node);
+
+  // Used in the solve logs.
+  std::string SmallProgressString() const;
 
   // Model singleton class used here.
   TimeLimit* time_limit_;
   ModelRandomGenerator* random_;
   SatSolver* sat_solver_;
+  IntegerEncoder* integer_encoder_;
   IntegerTrail* integer_trail_;
   SharedResponseManager* shared_response_;
   SatDecisionPolicy* sat_decision_;
   IntegerSearchHelper* search_helper_;
   IntegerVariable objective_var_;
+  const SatParameters& parameters_;
+
+  // This can stay null. Otherwise it will be the lp constraint with
+  // objective_var_ as objective.
+  LinearProgrammingConstraint* lp_constraint_ = nullptr;
+
+  // We temporarily cache the shared_response_ objective lb here.
+  IntegerValue current_objective_lb_;
 
   // Memory for all the nodes.
-  std::vector<Node> nodes_;
+  int num_nodes_in_tree_ = 0;
+  absl::StrongVector<NodeIndex, Node> nodes_;
 
   // The list of nodes in the current branch, in order from the root.
-  std::vector<int> current_branch_;
+  std::vector<NodeIndex> current_branch_;
 
   // Our heuristic used to explore the tree. See code for detail.
   std::function<BooleanOrIntegerLiteral()> search_heuristic_;
+
+  int64_t num_rc_detected_ = 0;
+
+  // Counts the number of decisions we are taking while exploring the search
+  // tree.
+  int64_t num_decisions_taken_ = 0;
+
+  // Used to trigger the initial restarts and imports.
+  int num_full_restarts_ = 0;
+  int64_t num_decisions_taken_at_last_restart_ = 0;
+  int64_t num_decisions_taken_at_last_level_zero_ = 0;
+
+  // Count the number of time we are back to decision level zero.
+  int64_t num_back_to_root_node_ = 0;
+
+  // Used to display periodic info to the log.
+  absl::Time last_logging_time_;
 };
 
 }  // namespace sat

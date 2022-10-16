@@ -18,21 +18,16 @@ import collections
 from absl import app
 from absl import flags
 from google.protobuf import text_format
-from ortools.data import pywraprcpsp
 from ortools.sat.python import cp_model
+from ortools.scheduling import pywraprcpsp
 
 FLAGS = flags.FLAGS
-
 flags.DEFINE_string('input', '', 'Input file to parse and solve.')
-flags.DEFINE_string('output_proto', '',
-                    'Output file to write the cp_model proto to.')
+flags.DEFINE_string('output_proto', '', 'Output file to write the cp_model proto to.')
 flags.DEFINE_string('params', '', 'Sat solver parameters.')
-flags.DEFINE_bool('use_interval_makespan', True,
-                  'Whether we encode the makespan using an interval or not.')
+flags.DEFINE_bool('use_interval_makespan', True, 'Whether we encode the makespan using an interval or not.')
 flags.DEFINE_integer('horizon', -1, 'Force horizon.')
-flags.DEFINE_bool(
-    'use_main_interval_for_tasks', True,
-    'Creates a main interval for each task, and use it in precedences')
+flags.DEFINE_bool('use_main_interval_for_tasks', True, 'Creates a main interval for each task, and use it in precedences')
 
 
 def PrintProblemStatistics(problem):
@@ -109,104 +104,96 @@ def SolveRcpsp(problem, proto_file, params):
                             horizon += abs(d)
     print(f'  - horizon = {horizon}')
 
-    # Containers used to build resources.
-    intervals_per_resource = collections.defaultdict(list)
-    demands_per_resource = collections.defaultdict(list)
-    presences_per_resource = collections.defaultdict(list)
-    starts_per_resource = collections.defaultdict(list)
-
-    # Starts and ends for each task (shared between all alternatives)
+    # Containers.
     task_starts = {}
     task_ends = {}
+    task_durations = {}
+    task_intervals = {}
+    task_to_resource_demands = collections.defaultdict(list)
 
-    # Containers for per-recipe per task alternatives variables.
-    presences_per_task = collections.defaultdict(list)
-    durations_per_task = collections.defaultdict(list)
+    task_to_presence_literals = collections.defaultdict(list)
+    task_to_recipe_durations = collections.defaultdict(list)
+    task_resource_to_fixed_demands = collections.defaultdict(dict)
 
-    one = model.NewConstant(1)
+    resource_to_sum_of_demand_max = collections.defaultdict(int)
 
-    # Create tasks variables.
+    # Create task variables.
     for t in all_active_tasks:
         task = problem.tasks[t]
+        num_recipes = len(task.recipes)
+        all_recipes = range(num_recipes)
 
-        if len(task.recipes) == 1:
-            # Create main and unique interval.
-            recipe = task.recipes[0]
-            task_starts[t] = model.NewIntVar(0, horizon, f'start_of_task_{t}')
-            task_ends[t] = model.NewIntVar(0, horizon, f'end_of_task_{t}')
-            interval = model.NewIntervalVar(task_starts[t], recipe.duration,
-                                            task_ends[t], f'interval_{t}')
+        start_var = model.NewIntVar(0, horizon, f'start_of_task_{t}')
+        end_var = model.NewIntVar(0, horizon, f'end_of_task_{t}')
 
-            # Store as a single alternative for later.
-            presences_per_task[t].append(one)
-            durations_per_task[t].append(recipe.duration)
+        literals = []
+        if num_recipes > 1:
+            # Create one literal per recipe.
+            literals = [
+                model.NewBoolVar(f'is_present_{t}_{r}') for r in all_recipes
+            ]
 
-            # Register the interval in resources specified by the demands.
-            for i in range(len(recipe.demands)):
-                demand = recipe.demands[i]
-                res = recipe.resources[i]
-                demands_per_resource[res].append(demand)
-                if problem.resources[res].renewable:
-                    intervals_per_resource[res].append(interval)
-                else:
-                    starts_per_resource[res].append(task_starts[t])
-                    presences_per_resource[res].append(1)
-        else:  # Multiple alternative recipes.
-            all_recipes = range(len(task.recipes))
+            # Exactly one recipe must be performed.
+            model.AddExactlyOne(literals)
 
-            start = model.NewIntVar(0, horizon, f'start_of_task_{t}')
-            end = model.NewIntVar(0, horizon, f'end_of_task_{t}')
+        else:
+            literals = [1]
 
-            # Store for precedences.
-            task_starts[t] = start
-            task_ends[t] = end
+        # Temporary data structure to fill in 0 demands.
+        demand_matrix = collections.defaultdict(int)
 
-            # Create one optional interval per recipe.
-            for r in all_recipes:
-                recipe = task.recipes[r]
-                is_present = model.NewBoolVar(f'is_present_{t}_{r}')
-                interval = model.NewOptionalIntervalVar(start, recipe.duration,
-                                                        end, is_present,
-                                                        f'interval_{t}_{r}')
+        # Scan recipes and build the demand matrix and the vector of durations.
+        for recipe_index, recipe in enumerate(task.recipes):
+            task_to_recipe_durations[t].append(recipe.duration)
+            for demand, resource in zip(recipe.demands, recipe.resources):
+                demand_matrix[(resource, recipe_index)] = demand
 
-                # Store alternative variables.
-                presences_per_task[t].append(is_present)
-                durations_per_task[t].append(recipe.duration)
+        # Create the duration variable from the accumulated durations.
+        duration_var = model.NewIntVarFromDomain(
+            cp_model.Domain.FromValues(task_to_recipe_durations[t]),
+            f'duration_of_task_{t}')
 
-                # Register the interval in resources specified by the demands.
-                for i in range(len(recipe.demands)):
-                    demand = recipe.demands[i]
-                    res = recipe.resources[i]
-                    demands_per_resource[res].append(demand)
-                    if problem.resources[res].renewable:
-                        intervals_per_resource[res].append(interval)
-                    else:
-                        starts_per_resource[res].append(start)
-                        presences_per_resource[res].append(is_present)
-
-            # Exactly one alternative must be performed.
-            model.Add(sum(presences_per_task[t]) == 1)
-
-            # linear encoding of the duration.
-            min_duration = min(durations_per_task[t])
-            max_duration = max(durations_per_task[t])
-            shifted = [x - min_duration for x in durations_per_task[t]]
-
-            duration = model.NewIntVar(min_duration, max_duration,
-                                       f'duration_of_task_{t}')
+        # Link the recipe literals and the duration_var.
+        for r in range(num_recipes):
             model.Add(
-                duration == min_duration +
-                cp_model.LinearExpr.ScalProd(presences_per_task[t], shifted))
+                duration_var == task_to_recipe_durations[t][r]).OnlyEnforceIf(
+                    literals[r])
 
-            # We do not create a 'main' interval. Instead, we link start, end, and
-            # duration.
-            model.Add(start + duration == end)
+        # Create the interval of the task.
+        task_interval = model.NewIntervalVar(start_var, duration_var, end_var,
+                                             f'task_interval_{t}')
+
+        # Store task variables.
+        task_starts[t] = start_var
+        task_ends[t] = end_var
+        task_durations[t] = duration_var
+        task_intervals[t] = task_interval
+        task_to_presence_literals[t] = literals
+
+        # Create the demand variable of the task for each resource.
+        for resource in all_resources:
+            demands = [
+                demand_matrix[(resource, recipe)] for recipe in all_recipes
+            ]
+            task_resource_to_fixed_demands[(t, resource)] = demands
+            demand_var = model.NewIntVarFromDomain(
+                cp_model.Domain.FromValues(demands), f'demand_{t}_{resource}')
+            task_to_resource_demands[t].append(demand_var)
+
+            # Link the recipe literals and the demand_var.
+            for r in all_recipes:
+                model.Add(demand_var == demand_matrix[(resource,
+                                                       r)]).OnlyEnforceIf(
+                                                           literals[r])
+
+            resource_to_sum_of_demand_max[resource] += max(demands)
 
     # Create makespan variable
     makespan = model.NewIntVar(0, horizon, 'makespan')
-    interval_makespan = model.NewIntervalVar(
-        makespan, model.NewIntVar(1, horizon, 'interval_makespan_size'),
-        model.NewConstant(horizon + 1), 'interval_makespan')
+    makespan_size = model.NewIntVar(1, horizon, 'interval_makespan_size')
+    interval_makespan = model.NewIntervalVar(makespan, makespan_size,
+                                             model.NewConstant(horizon + 1),
+                                             'interval_makespan')
 
     # Add precedences.
     if problem.is_rcpsp_max:
@@ -222,7 +209,7 @@ def SolveRcpsp(problem, proto_file, params):
                 num_next_modes = len(problem.tasks[next_id].recipes)
                 for m1 in range(num_modes):
                     s1 = task_starts[task_id]
-                    p1 = presences_per_task[task_id][m1]
+                    p1 = task_to_presence_literals[task_id][m1]
                     if next_id == num_tasks - 1:
                         delay = delay_matrix.recipe_delays[m1].min_delays[0]
                         model.Add(s1 + delay <= makespan).OnlyEnforceIf(p1)
@@ -231,8 +218,8 @@ def SolveRcpsp(problem, proto_file, params):
                             delay = delay_matrix.recipe_delays[m1].min_delays[
                                 m2]
                             s2 = task_starts[next_id]
-                            p2 = presences_per_task[next_id][m2]
-                            model.Add(s1 + delay <= s2).OnlyEnforceIf([p1, p2])
+                            p2 = task_to_presence_literals[next_id][m2]
+                            model.Add(s1 + delay <= s2).OnlyEnforceIf(p1, p2)
     else:
         # Normal dependencies (task ends before the start of successors).
         for t in all_active_tasks:
@@ -251,35 +238,43 @@ def SolveRcpsp(problem, proto_file, params):
         resource = problem.resources[r]
         c = resource.max_capacity
         if c == -1:
-            c = sum(demands_per_resource[r])
+            print(f'No capacity: {resource}')
+            c = resource_to_sum_of_demand_max[r]
 
-        if problem.is_resource_investment:
-            # RIP problems have only renewable resources.
-            capacity = model.NewIntVar(0, c, f'capacity_of_{r}')
-            model.AddCumulative(intervals_per_resource[r],
-                                demands_per_resource[r], capacity)
-            capacities.append(capacity)
-            max_cost += c * resource.unit_cost
-        elif resource.renewable:
-            if intervals_per_resource[r]:
+        # RIP problems have only renewable resources, and no makespan.
+        if problem.is_resource_investment or resource.renewable:
+            intervals = [task_intervals[t] for t in all_active_tasks]
+            demands = [task_to_resource_demands[t][r] for t in all_active_tasks]
+
+            if problem.is_resource_investment:
+                capacity = model.NewIntVar(0, c, f'capacity_of_{r}')
+                model.AddCumulative(intervals, demands, capacity)
+                capacities.append(capacity)
+                max_cost += c * resource.unit_cost
+            else:  # Standard renewable resource.
                 if FLAGS.use_interval_makespan:
-                    model.AddCumulative(
-                        intervals_per_resource[r] + [interval_makespan],
-                        demands_per_resource[r] + [c], c)
-                else:
-                    model.AddCumulative(intervals_per_resource[r],
-                                        demands_per_resource[r], c)
-        elif presences_per_resource[r]:  # Non empty non renewable resource.
+                    intervals.append(interval_makespan)
+                    demands.append(c)
+
+                model.AddCumulative(intervals, demands, c)
+        else:  # Non empty non renewable resource. (single mode only)
             if problem.is_consumer_producer:
-                model.AddReservoirConstraint(starts_per_resource[r],
-                                             demands_per_resource[r],
+                reservoir_starts = []
+                reservoir_demands = []
+                for t in all_active_tasks:
+                    if task_resource_to_fixed_demands[(t, r)][0]:
+                        reservoir_starts.append(task_starts[t])
+                        reservoir_demands.append(
+                            task_resource_to_fixed_demands[(t, r)][0])
+                model.AddReservoirConstraint(reservoir_starts,
+                                             reservoir_demands,
                                              resource.min_capacity,
                                              resource.max_capacity)
-            else:
+            else:  # No producer-consumer. We just sum the demands.
                 model.Add(
-                    sum(presences_per_resource[r][i] *
-                        demands_per_resource[r][i]
-                        for i in range(len(presences_per_resource[r]))) <= c)
+                    cp_model.LinearExpr.Sum([
+                        task_to_resource_demands[t][r] for t in all_active_tasks
+                    ]) <= c)
 
     # Objective.
     if problem.is_resource_investment:
@@ -305,7 +300,7 @@ def SolveRcpsp(problem, proto_file, params):
     solver.Solve(model)
 
 
-def main(_):
+def main(_=None):
     rcpsp_parser = pywraprcpsp.RcpspParser()
     rcpsp_parser.ParseFile(FLAGS.input)
     SolveRcpsp(rcpsp_parser.Problem(), FLAGS.output_proto, FLAGS.params)

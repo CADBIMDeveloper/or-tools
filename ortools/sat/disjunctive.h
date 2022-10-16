@@ -18,7 +18,6 @@
 #include <functional>
 #include <vector>
 
-#include "ortools/base/int_type.h"
 #include "ortools/base/macros.h"
 #include "ortools/sat/integer.h"
 #include "ortools/sat/intervals.h"
@@ -26,6 +25,7 @@
 #include "ortools/sat/precedences.h"
 #include "ortools/sat/sat_base.h"
 #include "ortools/sat/theta_tree.h"
+#include "ortools/util/strong_integers.h"
 
 namespace operations_research {
 namespace sat {
@@ -96,7 +96,7 @@ class TaskSet {
   //   [Bunch of tasks]   ...   [Bunch of tasks]     ...    [critical tasks].
   //
   // We call "critical tasks" the last group. These tasks will be solely
-  // responsible for for the end-min of the whole set. The returned
+  // responsible for the end-min of the whole set. The returned
   // critical_index will be the index of the first critical task in
   // SortedTasks().
   //

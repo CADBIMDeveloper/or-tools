@@ -13,10 +13,22 @@
 
 #include "ortools/sat/presolve_util.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <utility>
+#include <vector>
 
-#include "ortools/base/map_util.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/meta/type_traits.h"
+#include "absl/types/span.h"
+#include "ortools/base/logging.h"
+#include "ortools/base/strong_vector.h"
+#include "ortools/sat/cp_model.pb.h"
 #include "ortools/sat/cp_model_utils.h"
+#include "ortools/util/bitset.h"
+#include "ortools/util/sorted_interval_list.h"
+#include "ortools/util/strong_integers.h"
 
 namespace operations_research {
 namespace sat {
@@ -87,8 +99,7 @@ std::vector<std::pair<int, Domain>> DomainDeductions::ProcessClause(
   for (const int ref : clause) {
     const Index index = IndexFromLiteral(ref);
     for (int i = 0; i < to_process.size(); ++i) {
-      domains[i] = domains[i].UnionWith(
-          gtl::FindOrDieNoPrint(deductions_, {index, to_process[i]}));
+      domains[i] = domains[i].UnionWith(deductions_.at({index, to_process[i]}));
     }
   }
 
@@ -105,7 +116,6 @@ template <typename ProtoWithVarsAndCoeffs>
 int64_t GetVarCoeffAndCopyOtherTerms(
     const int var, const ProtoWithVarsAndCoeffs& proto,
     std::vector<std::pair<int, int64_t>>* terms) {
-  bool found = false;
   int64_t var_coeff = 0;
   const int size = proto.vars().size();
   for (int i = 0; i < size; ++i) {
@@ -117,15 +127,13 @@ int64_t GetVarCoeffAndCopyOtherTerms(
     }
 
     if (ref == var) {
-      CHECK(!found);
-      found = true;
-      var_coeff = coeff;
+      // If var appear multiple time, we add its coefficient.
+      var_coeff += coeff;
       continue;
     } else {
       terms->push_back({ref, coeff});
     }
   }
-  CHECK(found);
   return var_coeff;
 }
 
@@ -139,7 +147,7 @@ void SortAndMergeTerms(std::vector<std::pair<int, int64_t>>* terms,
   std::sort(terms->begin(), terms->end());
   int current_var = 0;
   int64_t current_coeff = 0;
-  for (const auto entry : *terms) {
+  for (const auto& entry : *terms) {
     CHECK(RefIsPositive(entry.first));
     if (entry.first == current_var) {
       current_coeff += entry.second;
@@ -181,15 +189,16 @@ void AddTermsFromVarDefinition(const int var, const int64_t var_coeff,
 }
 }  // namespace
 
-void SubstituteVariable(int var, int64_t var_coeff_in_definition,
+bool SubstituteVariable(int var, int64_t var_coeff_in_definition,
                         const ConstraintProto& definition,
                         ConstraintProto* ct) {
   CHECK(RefIsPositive(var));
   CHECK_EQ(std::abs(var_coeff_in_definition), 1);
 
-  // Copy all the terms (except the one refering to var).
+  // Copy all the terms (except the one referring to var).
   std::vector<std::pair<int, int64_t>> terms;
   int64_t var_coeff = GetVarCoeffAndCopyOtherTerms(var, ct->linear(), &terms);
+  if (var_coeff == 0) return false;
 
   if (var_coeff_in_definition < 0) var_coeff *= -1;
 
@@ -206,6 +215,7 @@ void SubstituteVariable(int var, int64_t var_coeff_in_definition,
   FillDomainInProto(rhs.AdditionWith(offset), ct->mutable_linear());
 
   SortAndMergeTerms(&terms, ct->mutable_linear());
+  return true;
 }
 
 }  // namespace sat

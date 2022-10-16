@@ -1,6 +1,5 @@
 var searchData=
 [
-  ['anymetadata_1308',['AnyMetadata',['../classoperations__research_1_1_p_r_o_t_o_b_u_f___f_i_n_a_l.html#a9b35d94da3444084fc3673b7717b6cfe',1,'operations_research::PROTOBUF_FINAL']]],
-  ['internalhelper_1309',['InternalHelper',['../classoperations__research_1_1_p_r_o_t_o_b_u_f___f_i_n_a_l.html#ab618dbbac4a8d749da0d85c32932df36',1,'operations_research::PROTOBUF_FINAL']]],
-  ['tablestruct_5fortools_5f2fgraph_5f2fflow_5f5fproblem_5f2eproto_1310',['TableStruct_ortools_2fgraph_2fflow_5fproblem_2eproto',['../classoperations__research_1_1_p_r_o_t_o_b_u_f___f_i_n_a_l.html#a2d7fd8369ce911e1514d514079ebed45',1,'operations_research::PROTOBUF_FINAL']]]
+  ['ebertgraphbase_3c_20nodeindextype_2c_20arcindextype_2c_20ebertgraph_3c_20nodeindextype_2c_20arcindextype_20_3e_20_3e_0',['EbertGraphBase&lt; NodeIndexType, ArcIndexType, EbertGraph&lt; NodeIndexType, ArcIndexType &gt; &gt;',['../classoperations__research_1_1_ebert_graph.html#a73dbd9f38775b3bd2727594c935502c3',1,'operations_research::EbertGraph']]],
+  ['ebertgraphbase_3c_20nodeindextype_2c_20arcindextype_2c_20forwardebertgraph_3c_20nodeindextype_2c_20arcindextype_20_3e_20_3e_1',['EbertGraphBase&lt; NodeIndexType, ArcIndexType, ForwardEbertGraph&lt; NodeIndexType, ArcIndexType &gt; &gt;',['../classoperations__research_1_1_forward_ebert_graph.html#a8fdd2d0396c7ec0609a4351f716aef5f',1,'operations_research::ForwardEbertGraph']]]
 ];

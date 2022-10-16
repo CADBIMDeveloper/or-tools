@@ -21,6 +21,7 @@
 #include <memory>
 #include <string>
 
+#include "absl/base/port.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/memory/memory.h"
 #include "absl/synchronization/mutex.h"
@@ -267,7 +268,8 @@ class TimeLimit {
    * i.e. \c LimitReached() returns true when the value of
    * external_boolean_as_limit is true whatever the time limits are.
    *
-   * Note : The external_boolean_as_limit can be modified during solve.
+   * Note that users of the TimeLimit can modify the provided atomic for their
+   * own internal logic (see SharedTimeLimit::Stop() for example).
    */
   void RegisterExternalBooleanAsLimit(
       std::atomic<bool>* external_boolean_as_limit) {
@@ -288,6 +290,18 @@ class TimeLimit {
   template <typename Parameters>
   void ResetLimitFromParameters(const Parameters& parameters);
   void MergeWithGlobalTimeLimit(TimeLimit* other);
+
+  /**
+   * Overwrites the deterministic time limit with the new value.
+   */
+  void ChangeDeterministicLimit(double new_limit) {
+    deterministic_limit_ = new_limit;
+  }
+
+  /**
+   * Queries the deterministic time limit.
+   */
+  double GetDeterministicLimit() const { return deterministic_limit_; }
 
   /**
    * Returns information about the time limit object in a human-readable form.
@@ -383,6 +397,13 @@ class SharedTimeLimit {
   double GetElapsedDeterministicTime() const {
     absl::ReaderMutexLock lock(&mutex_);
     return time_limit_->GetElapsedDeterministicTime();
+  }
+
+  std::atomic<bool>* ExternalBooleanAsLimit() const {
+    absl::ReaderMutexLock lock(&mutex_);
+    // We can simply return the "external bool" and remain thread-safe because
+    // it's wrapped in std::atomic.
+    return time_limit_->ExternalBooleanAsLimit();
   }
 
  private:
@@ -496,9 +517,9 @@ inline void TimeLimit::ResetTimers(double limit_in_seconds,
 #endif  // HAS_PERF_SUBSYSTEM
   start_ns_ = absl::GetCurrentTimeNanos();
   last_ns_ = start_ns_;
-  limit_ns_ = limit_in_seconds >= 1e-9 * (kint64max - start_ns_)
-                  ? kint64max
-                  : static_cast<int64_t>(limit_in_seconds * 1e9) + start_ns_;
+  // Note that duration arithmetic is properly saturated.
+  limit_ns_ = (absl::Seconds(limit_in_seconds) + absl::Nanoseconds(start_ns_)) /
+              absl::Nanoseconds(1);
 }
 
 template <typename Parameters>

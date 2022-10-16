@@ -13,6 +13,8 @@
 
 #include "ortools/linear_solver/sat_solver_utils.h"
 
+#include <memory>
+
 #include "absl/memory/memory.h"
 #include "ortools/glop/parameters.pb.h"
 #include "ortools/glop/preprocessor.h"
@@ -24,7 +26,7 @@ namespace operations_research {
   names.push_back(#name);         \
   lp_preprocessors.push_back(absl::make_unique<name>(&glop_params));
 
-MPSolverResponseStatus ApplyMipPresolveSteps(
+glop::ProblemStatus ApplyMipPresolveSteps(
     const glop::GlopParameters& glop_params, MPModelProto* model,
     std::vector<std::unique_ptr<glop::Preprocessor>>* for_postsolve,
     SolverLogger* logger) {
@@ -32,7 +34,7 @@ MPSolverResponseStatus ApplyMipPresolveSteps(
 
   // TODO(user): General constraints are currently not supported.
   if (!model->general_constraint().empty()) {
-    return MPSolverResponseStatus::MPSOLVER_NOT_SOLVED;
+    return glop::ProblemStatus::INIT;
   }
 
   // We need to copy the hint because LinearProgramToMPModelProto() loose it.
@@ -73,13 +75,7 @@ MPSolverResponseStatus ApplyMipPresolveSteps(
       names[i].resize(header.size(), ' ');  // padding.
       SOLVER_LOG(logger, names[i], lp.GetDimensionString());
       const glop::ProblemStatus status = preprocessor->status();
-      if (status != glop::ProblemStatus::INIT) {
-        if (status == glop::ProblemStatus::PRIMAL_INFEASIBLE ||
-            status == glop::ProblemStatus::INFEASIBLE_OR_UNBOUNDED) {
-          return MPSolverResponseStatus::MPSOLVER_INFEASIBLE;
-        }
-        return MPSolverResponseStatus::MPSOLVER_NOT_SOLVED;
-      }
+      if (status != glop::ProblemStatus::INIT) return status;
       if (need_postsolve) for_postsolve->push_back(std::move(preprocessor));
     }
   }
@@ -87,9 +83,13 @@ MPSolverResponseStatus ApplyMipPresolveSteps(
   // Finally, we make sure all domains contain zero.
   if (!hint_is_present) {
     auto shift_bounds =
-        absl::make_unique<glop::ShiftVariableBoundsPreprocessor>(&glop_params);
+        std::make_unique<glop::ShiftVariableBoundsPreprocessor>(&glop_params);
     shift_bounds->UseInMipContext();
-    if (shift_bounds->Run(&lp)) {
+    const bool need_postsolve = shift_bounds->Run(&lp);
+    if (shift_bounds->status() != glop::ProblemStatus::INIT) {
+      return shift_bounds->status();
+    }
+    if (need_postsolve) {
       for_postsolve->push_back(std::move(shift_bounds));
     }
   }
@@ -102,7 +102,7 @@ MPSolverResponseStatus ApplyMipPresolveSteps(
     *model->mutable_solution_hint() = copy_of_hint;
   }
 
-  return MPSolverResponseStatus::MPSOLVER_NOT_SOLVED;
+  return glop::ProblemStatus::INIT;
 }
 
 #undef ADD_LP_PREPROCESSOR

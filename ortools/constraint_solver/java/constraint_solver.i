@@ -51,14 +51,23 @@ struct FailureProtect {
 
 /* Global JNI reference deleter */
 class GlobalRefGuard {
-  JNIEnv *jenv_;
+  JavaVM *jvm_;
   jobject jref_;
   // non-copyable
   GlobalRefGuard(const GlobalRefGuard &) = delete;
   GlobalRefGuard &operator=(const GlobalRefGuard &) = delete;
   public:
-  GlobalRefGuard(JNIEnv *jenv, jobject jref): jenv_(jenv), jref_(jref) {}
-  ~GlobalRefGuard() { jenv_->DeleteGlobalRef(jref_); }
+  GlobalRefGuard(JavaVM *jvm, jobject jref): jvm_(jvm), jref_(jref) {}
+  ~GlobalRefGuard() {
+    JNIEnv *jenv = NULL;
+    JavaVMAttachArgs args;
+    args.version = JNI_VERSION_1_2;
+    args.name = NULL;
+    args.group = NULL;
+    jvm_->AttachCurrentThread((void**)&jenv, &args);
+    jenv->DeleteGlobalRef(jref_);
+    jvm_->DetachCurrentThread();
+  }
 };
 %}
 
@@ -149,7 +158,12 @@ PROTECT_FROM_FAILURE(Solver::Fail(), arg1);
     jobject $input_object = jenv->NewGlobalRef($input);
 
     // Global JNI reference deleter
-    auto $input_guard = std::make_shared<GlobalRefGuard>(jenv, $input_object);
+    std::shared_ptr<GlobalRefGuard> $input_guard;
+    {
+      JavaVM* jvm;
+      jenv->GetJavaVM(&jvm);
+      $input_guard = std::make_shared<GlobalRefGuard>(jvm, $input_object);
+    }
     $1 = [jenv, $input_object, $input_method_id, $input_guard](LAMBDA_PARAM) -> LAMBDA_RETURN {
       return jenv->JNI_METHOD($input_object, $input_method_id, LAMBDA_CALL);
     };
@@ -176,7 +190,12 @@ PROTECT_FROM_FAILURE(Solver::Fail(), arg1);
     jobject $input_object = jenv->NewGlobalRef($input);
 
     // Global JNI reference deleter
-    auto $input_guard = std::make_shared<GlobalRefGuard>(jenv, $input_object);
+    std::shared_ptr<GlobalRefGuard> $input_guard;
+    {
+      JavaVM* jvm;
+      jenv->GetJavaVM(&jvm);
+      $input_guard = std::make_shared<GlobalRefGuard>(jvm, $input_object);
+    }
     $1 = [jenv, $input_object, $input_method_id, $input_guard]() -> LAMBDA_RETURN {
       return jenv->JNI_METHOD($input_object, $input_method_id);
     };
@@ -202,7 +221,12 @@ PROTECT_FROM_FAILURE(Solver::Fail(), arg1);
     jobject $input_object = jenv->NewGlobalRef($input);
 
     // Global JNI reference deleter
-    auto $input_guard = std::make_shared<GlobalRefGuard>(jenv, $input_object);
+    std::shared_ptr<GlobalRefGuard> $input_guard;
+    {
+      JavaVM* jvm;
+      jenv->GetJavaVM(&jvm);
+      $input_guard = std::make_shared<GlobalRefGuard>(jvm, $input_object);
+    }
     $1 = [jenv, $input_object, $input_method_id, $input_guard]() -> std::string {
       jstring js = (jstring) jenv->CallObjectMethod($input_object, $input_method_id);
       // convert the Java String to const char* C string.
@@ -235,7 +259,12 @@ PROTECT_FROM_FAILURE(Solver::Fail(), arg1);
     jobject $input_object = jenv->NewGlobalRef($input);
 
     // Global JNI reference deleter
-    auto $input_guard = std::make_shared<GlobalRefGuard>(jenv, $input_object);
+    std::shared_ptr<GlobalRefGuard> $input_guard;
+    {
+      JavaVM* jvm;
+      jenv->GetJavaVM(&jvm);
+      $input_guard = std::make_shared<GlobalRefGuard>(jvm, $input_object);
+    }
     $1 = [jenv, $input_object, $input_method_id,
     $input_guard](operations_research::Solver* solver) -> void {
       jclass solver_class = jenv->FindClass(
@@ -689,7 +718,11 @@ import java.util.function.LongConsumer;
 // Used to wrap Closure (std::function<void()>)
 // see https://docs.oracle.com/javase/8/docs/api/java/lang/Runnable.html
 import java.lang.Runnable;
+
+// Used to keep alive java references to objects passed to the C++ layer.
+import java.util.HashSet;
 %}
+
 // note: SWIG does not support multiple %typemap(javacode) Type, so we have to
 // define all Solver tweak here (ed and not in the macro DEFINE_CALLBACK_*)
 %typemap(javacode) Solver %{
@@ -772,7 +805,66 @@ import java.lang.Runnable;
     }
     return array;
   }
+
+  // Ensure that the GC doesn't collect any DecisionBuilder set from Java
+  // as the underlying C++ class stores a shallow copy
+  private HashSet<DecisionBuilder> keepAliveDecisionBuilders;
+  public void keepAliveDecisionBuilder(DecisionBuilder db) {
+    if (keepAliveDecisionBuilders == null) {
+      keepAliveDecisionBuilders = new HashSet<DecisionBuilder>();
+    }
+    keepAliveDecisionBuilders.add(db);
+  }
+  public void keepAliveDecisionBuilder(DecisionBuilder[] dbs) {
+    for (DecisionBuilder db : dbs) {
+      keepAliveDecisionBuilder(db);
+    }
+  }
 %}
+
+// Do not keep a reference of the decision builder in the java instance as it
+// is not stored inside the c++ layer.
+%typemap (javacode) SearchMonitor %{
+  public void keepAliveDecisionBuilder(DecisionBuilder db) {}
+%}
+
+%typemap(javaimports) DefaultPhaseParameters %{
+// Used to keep alive java references to objects passed to the C++ layer.
+import java.util.HashSet;
+%}
+
+%typemap(javacode) DefaultPhaseParameters %{
+  // Ensure that the GC doesn't collect any DecisionBuilder set from Java
+  // as the underlying C++ class stores a shallow copy
+  private HashSet<DecisionBuilder> keepAliveDecisionBuilders;
+  public void keepAliveDecisionBuilder(DecisionBuilder db) {
+    if (keepAliveDecisionBuilders == null) {
+      keepAliveDecisionBuilders = new HashSet<DecisionBuilder>();
+    }
+    keepAliveDecisionBuilders.add(db);
+  }
+%}
+
+// Do not keep a reference of the decision builder in the java instance as it
+// is not stored inside the c++ layer.
+%typemap (javacode) SearchLimit  %{
+  public void keepAliveDecisionBuilder(DecisionBuilder db) {}
+%}
+
+// Do not keep a reference of the decision builder in the java instance as it
+// is not stored inside the c++ layer.
+%typemap (javacode) OptimizeVar %{
+  public void keepAliveDecisionBuilder(DecisionBuilder db) {}
+%}
+
+%typemap(javain,
+         post="      keepAliveDecisionBuilder($javainput);"
+         ) DecisionBuilder* "DecisionBuilder.getCPtr($javainput)"
+
+%typemap(javain,
+         post="      keepAliveDecisionBuilder($javainput);"
+         ) const std::vector<DecisionBuilder*>& dbs "$javainput"
+
 %ignore Solver::SearchLogParameters;
 %ignore Solver::ActiveSearch;
 %ignore Solver::SetSearchContext;
@@ -1409,6 +1501,10 @@ import java.util.function.LongToIntFunction;
 %rename (restartAtPathStartOnSynchronize) PathOperator::RestartAtPathStartOnSynchronize;
 %rename (setNextBaseToIncrement) PathOperator::SetNextBaseToIncrement;
 
+// PathOperator::IterationParameters
+%ignore PathOperator::IterationParameters;
+//%ignore PathOperator::IterationParameters::start_empty_path_class;
+
 // PathWithPreviousNodesOperator
 %unignore PathWithPreviousNodesOperator;
 %rename (isPathStart) PathWithPreviousNodesOperator::IsPathStart;
@@ -1491,6 +1587,7 @@ CONVERT_VECTOR(operations_research::SymmetryBreaker, SymmetryBreaker);
 %rename (value) *::Value;
 %rename (accept) *::Accept;
 %rename (toString) *::DebugString;
+%rename("%(lowercamelcase)s", %$isvariable) "";
 
 // Add needed import to mainJNI.java
 %pragma(java) jniclassimports=%{

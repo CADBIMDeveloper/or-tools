@@ -109,12 +109,14 @@ public class InitialRoutes
 
         // Create and register a transit callback.
         // [START transit_callback]
-        int transitCallbackIndex = routing.RegisterTransitCallback((long fromIndex, long toIndex) => {
-            // Convert from routing variable Index to distance matrix NodeIndex.
-            var fromNode = manager.IndexToNode(fromIndex);
-            var toNode = manager.IndexToNode(toIndex);
-            return data.DistanceMatrix[fromNode, toNode];
-        });
+        int transitCallbackIndex = routing.RegisterTransitCallback((long fromIndex, long toIndex) =>
+                                                                   {
+                                                                       // Convert from routing variable Index to
+                                                                       // distance matrix NodeIndex.
+                                                                       var fromNode = manager.IndexToNode(fromIndex);
+                                                                       var toNode = manager.IndexToNode(toIndex);
+                                                                       return data.DistanceMatrix[fromNode, toNode];
+                                                                   });
         // [END transit_callback]
 
         // Define cost of each arc.
@@ -131,7 +133,7 @@ public class InitialRoutes
         distanceDimension.SetGlobalSpanCostCoefficient(100);
         // [END distance_constraint]
 
-        // Get inital solution from routes.
+        // Get initial solution from routes.
         // [START print_initial_solution]
         Assignment initialSolution = routing.ReadAssignmentFromRoutes(data.InitialRoutes, true);
         // Print initial solution on console.

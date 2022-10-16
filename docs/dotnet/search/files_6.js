@@ -1,4 +1,5 @@
 var searchData=
 [
-  ['knapsacksolver_2ecs_5649',['KnapsackSolver.cs',['../KnapsackSolver_8cs.html',1,'']]]
+  ['valcstpair_2ecs_0',['ValCstPair.cs',['../ValCstPair_8cs.html',1,'']]],
+  ['variablehelper_2ecs_1',['VariableHelper.cs',['../VariableHelper_8cs.html',1,'']]]
 ];

@@ -1,7 +1,5 @@
 FROM ortools/make:archlinux_swig AS env
-# Currently dotnet-sdk (.Net 5) is broken
-# see: https://github.com/google/or-tools/issues/2465
-RUN pacman -Syu --noconfirm dotnet-sdk-3.1
+RUN pacman -Syu --noconfirm dotnet-sdk-3.1 dotnet-sdk
 # Trigger first run experience by running arbitrary cmd
 RUN dotnet --info
 
@@ -10,7 +8,7 @@ WORKDIR /home/project
 COPY . .
 
 FROM devel AS build
-RUN make third_party
+RUN make third_party BUILD_DOTNET=ON BUILD_JAVA=OFF BUILD_PYTHON=OFF
 RUN make dotnet
 
 FROM build AS test

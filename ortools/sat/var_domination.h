@@ -15,7 +15,11 @@
 #define OR_TOOLS_SAT_VAR_DOMINATION_H_
 
 #include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
 
+#include "absl/types/span.h"
 #include "ortools/algorithms/dynamic_partition.h"
 #include "ortools/base/strong_vector.h"
 #include "ortools/sat/cp_model_utils.h"
@@ -50,7 +54,7 @@ class VarDomination {
   VarDomination() {}
 
   // This is the translation used from "ref" to IntegerVariable. The API
-  // understand the cp_mode.proto ref, but internally we only store
+  // understand the cp_model.proto ref, but internally we only store
   // IntegerVariable.
   static IntegerVariable RefToIntegerVariable(int ref) {
     return RefIsPositive(ref) ? IntegerVariable(2 * ref)
@@ -61,7 +65,7 @@ class VarDomination {
                                    : NegatedRef(var.value() / 2);
   }
 
-  // Reset the class to a clean state.
+  // Resets the class to a clean state.
   // At the beginning, we assume that there is no constraint.
   void Reset(int num_variables);
 
@@ -101,11 +105,14 @@ class VarDomination {
   // once. One then needs to redo the calls to ActivityShouldNotIncrease() and
   // ActivityShouldNotDecrease(). And finally call EndSecondPhase() before
   // querying the domination information.
-  void EndFirstPhase();
+  //
+  // If EndFirstPhase() return false, there is no point continuing.
+  bool EndFirstPhase();
   void EndSecondPhase();
 
   // This is true if this variable was never restricted by any call. We can thus
-  // fix it to its lower bound.
+  // fix it to its lower bound. Note that we don't do that here as the
+  // DualBoundStrengthening class will take care of that.
   bool CanFreelyDecrease(int ref) const;
   bool CanFreelyDecrease(IntegerVariable var) const;
 
@@ -170,7 +177,7 @@ class VarDomination {
 
   // This do not change after EndFirstPhase().
   //
-  // We will add to the Dynamic partion, a set of subset S, each meaning that
+  // We will add to the Dynamic partition, a set of subset S, each meaning that
   // any variable in S can only dominate or be dominated by another variable in
   // S.
   std::vector<int> tmp_vars_;

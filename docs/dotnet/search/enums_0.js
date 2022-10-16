@@ -1,4 +1,4 @@
 var searchData=
 [
-  ['basisstatus_10364',['BasisStatus',['../classGoogle_1_1OrTools_1_1LinearSolver_1_1Solver.html#afd922eb2bef96597c426557a8056f76d',1,'Google::OrTools::LinearSolver::Solver']]]
+  ['type_0',['Type',['../classGoogle_1_1OrTools_1_1Sat_1_1BoundedLinearExpression.html#a1d1cfd8ffb84e947f82999c682b666a7',1,'Google::OrTools::Sat::BoundedLinearExpression']]]
 ];

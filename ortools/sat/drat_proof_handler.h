@@ -18,6 +18,9 @@
 #include <string>
 #include <vector>
 
+#if !defined(__PORTABLE_PLATFORM__)
+#include "ortools/base/file.h"
+#endif  // !defined(__PORTABLE_PLATFORM__)
 #include "absl/types/span.h"
 #include "ortools/base/strong_vector.h"
 #include "ortools/sat/drat_checker.h"
@@ -97,7 +100,7 @@ class DratProofHandler {
   // We need to keep track of the variable newly created.
   int variable_index_;
 
-  // Temporary vector used for sorting the outputed clauses.
+  // Temporary vector used for sorting the outputted clauses.
   std::vector<Literal> values_;
 
   // This mapping will be applied to all clause passed to AddClause() or

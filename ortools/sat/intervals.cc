@@ -14,11 +14,23 @@
 #include "ortools/sat/intervals.h"
 
 #include <algorithm>
-#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
+#include "ortools/base/logging.h"
+#include "ortools/base/strong_vector.h"
 #include "ortools/sat/integer.h"
+#include "ortools/sat/integer_expr.h"
+#include "ortools/sat/linear_constraint.h"
+#include "ortools/sat/model.h"
+#include "ortools/sat/precedences.h"
+#include "ortools/sat/sat_base.h"
+#include "ortools/sat/sat_solver.h"
 #include "ortools/util/sort.h"
+#include "ortools/util/strong_integers.h"
 
 namespace operations_research {
 namespace sat {
@@ -97,6 +109,21 @@ SchedulingConstraintHelper::SchedulingConstraintHelper(
   }
 }
 
+// TODO(user): Ideally we should sort the vector of variables, but right now
+// we cannot since we often use this with a parallel vector of demands. So this
+// "sorting" should happen in the presolver so we can share as much as possible.
+SchedulingConstraintHelper* IntervalsRepository::GetOrCreateHelper(
+    const std::vector<IntervalVariable>& variables) {
+  const auto it = helper_repository_.find(variables);
+  if (it != helper_repository_.end()) return it->second;
+
+  SchedulingConstraintHelper* helper =
+      new SchedulingConstraintHelper(variables, model_);
+  helper_repository_[variables] = helper;
+  model_->TakeOwnership(helper);
+  return helper;
+}
+
 SchedulingConstraintHelper::SchedulingConstraintHelper(int num_tasks,
                                                        Model* model)
     : trail_(model->GetOrCreate<Trail>()),
@@ -151,12 +178,23 @@ bool SchedulingConstraintHelper::UpdateCachedValues(int t) {
 
   IntegerValue smin = integer_trail_->LowerBound(starts_[t]);
   IntegerValue smax = integer_trail_->UpperBound(starts_[t]);
-  IntegerValue dmin = integer_trail_->LowerBound(sizes_[t]);
-  IntegerValue dmax = integer_trail_->UpperBound(sizes_[t]);
   IntegerValue emin = integer_trail_->LowerBound(ends_[t]);
   IntegerValue emax = integer_trail_->UpperBound(ends_[t]);
 
+  // We take the max for the corner case where the size of an optional interval
+  // is used elsewhere and has a domain with negative value.
+  //
+  // TODO(user): maybe we should just disallow size with a negative domain, but
+  // is is harder to enforce if we have a linear expression for size.
+  IntegerValue dmin =
+      std::max(IntegerValue(0), integer_trail_->LowerBound(sizes_[t]));
+  IntegerValue dmax = integer_trail_->UpperBound(sizes_[t]);
+
   // Detect first if we have a conflict using the relation start + size = end.
+  if (dmax < 0) {
+    AddSizeMaxReason(t, dmax);
+    return PushTaskAbsence(t);
+  }
   if (smin + dmin - emax > 0) {
     ClearReason();
     AddStartMinReason(t, smin);
@@ -184,6 +222,10 @@ bool SchedulingConstraintHelper::UpdateCachedValues(int t) {
   emin = std::max(emin, smin + dmin);
   emax = std::min(emax, smax + dmax);
 
+  if (emin != cached_end_min_[t]) {
+    recompute_energy_profile_ = true;
+  }
+
   cached_start_min_[t] = smin;
   cached_end_min_[t] = emin;
   cached_negated_start_max_[t] = -smax;
@@ -193,6 +235,7 @@ bool SchedulingConstraintHelper::UpdateCachedValues(int t) {
   // Note that we use the cached value here for EndMin()/StartMax().
   const IntegerValue new_shifted_start_min = EndMin(t) - dmin;
   if (new_shifted_start_min != cached_shifted_start_min_[t]) {
+    recompute_energy_profile_ = true;
     recompute_shifted_start_min_ = true;
     cached_shifted_start_min_[t] = new_shifted_start_min;
   }
@@ -258,6 +301,7 @@ void SchedulingConstraintHelper::InitSortedVectors() {
     task_by_negated_shifted_end_max_[t].task_index = t;
   }
 
+  recompute_energy_profile_ = true;
   recompute_shifted_start_min_ = true;
   recompute_negated_shifted_end_max_ = true;
 }
@@ -274,6 +318,7 @@ void SchedulingConstraintHelper::SetTimeDirection(bool is_forward) {
     std::swap(task_by_increasing_shifted_start_min_,
               task_by_negated_shifted_end_max_);
 
+    recompute_energy_profile_ = true;
     std::swap(cached_start_min_, cached_negated_end_max_);
     std::swap(cached_end_min_, cached_negated_start_max_);
     std::swap(cached_shifted_start_min_, cached_negated_shifted_end_max_);
@@ -290,8 +335,9 @@ bool SchedulingConstraintHelper::SynchronizeAndSetTimeDirection(
     }
   } else {
     for (int t = 0; t < recompute_cache_.size(); ++t) {
-      if (recompute_cache_[t])
+      if (recompute_cache_[t]) {
         if (!UpdateCachedValues(t)) return false;
+      }
     }
   }
   recompute_all_cache_ = false;
@@ -367,26 +413,58 @@ SchedulingConstraintHelper::TaskByIncreasingShiftedStartMin() {
   return task_by_increasing_shifted_start_min_;
 }
 
+// TODO(user): Avoid recomputing it if nothing changed.
+const std::vector<SchedulingConstraintHelper::ProfileEvent>&
+SchedulingConstraintHelper::GetEnergyProfile() {
+  if (energy_profile_.empty()) {
+    const int num_tasks = NumTasks();
+    for (int t = 0; t < num_tasks; ++t) {
+      energy_profile_.push_back(
+          {cached_shifted_start_min_[t], t, /*is_first=*/true});
+      energy_profile_.push_back({cached_end_min_[t], t, /*is_first=*/false});
+    }
+  } else {
+    if (!recompute_energy_profile_) return energy_profile_;
+    for (ProfileEvent& ref : energy_profile_) {
+      const int t = ref.task;
+      if (ref.is_first) {
+        ref.time = cached_shifted_start_min_[t];
+      } else {
+        ref.time = cached_end_min_[t];
+      }
+    }
+  }
+  IncrementalSort(energy_profile_.begin(), energy_profile_.end());
+  recompute_energy_profile_ = false;
+  return energy_profile_;
+}
+
 // Produces a relaxed reason for StartMax(before) < EndMin(after).
 void SchedulingConstraintHelper::AddReasonForBeingBefore(int before,
                                                          int after) {
   AddOtherReason(before);
   AddOtherReason(after);
 
+  // The reason will be a linear expression greater than a value. Note that all
+  // coeff must be positive, and we will use the variable lower bound.
   std::vector<IntegerVariable> vars;
+  std::vector<IntegerValue> coeffs;
 
   // Reason for StartMax(before).
   const IntegerValue smax_before = StartMax(before);
   if (smax_before >= integer_trail_->UpperBound(starts_[before])) {
     if (starts_[before].var != kNoIntegerVariable) {
       vars.push_back(NegationOf(starts_[before].var));
+      coeffs.push_back(starts_[before].coeff);
     }
   } else {
     if (ends_[before].var != kNoIntegerVariable) {
       vars.push_back(NegationOf(ends_[before].var));
+      coeffs.push_back(ends_[before].coeff);
     }
     if (sizes_[before].var != kNoIntegerVariable) {
       vars.push_back(sizes_[before].var);
+      coeffs.push_back(sizes_[before].coeff);
     }
   }
 
@@ -395,21 +473,23 @@ void SchedulingConstraintHelper::AddReasonForBeingBefore(int before,
   if (emin_after <= integer_trail_->LowerBound(ends_[after])) {
     if (ends_[after].var != kNoIntegerVariable) {
       vars.push_back(ends_[after].var);
+      coeffs.push_back(ends_[after].coeff);
     }
   } else {
     if (starts_[after].var != kNoIntegerVariable) {
       vars.push_back(starts_[after].var);
+      coeffs.push_back(starts_[after].coeff);
     }
     if (sizes_[after].var != kNoIntegerVariable) {
       vars.push_back(sizes_[after].var);
+      coeffs.push_back(sizes_[after].coeff);
     }
   }
 
   DCHECK_LT(smax_before, emin_after);
   const IntegerValue slack = emin_after - smax_before - 1;
-  integer_trail_->AppendRelaxedLinearReason(
-      slack, std::vector<IntegerValue>(vars.size(), IntegerValue(1)), vars,
-      &integer_reason_);
+  integer_trail_->AppendRelaxedLinearReason(slack, coeffs, vars,
+                                            &integer_reason_);
 }
 
 bool SchedulingConstraintHelper::PushIntegerLiteral(IntegerLiteral lit) {
@@ -538,10 +618,11 @@ void SchedulingConstraintHelper::ImportOtherReasons(
 }
 
 std::string SchedulingConstraintHelper::TaskDebugString(int t) const {
-  return absl::StrCat("t=", t, " is_present=", IsPresent(t),
-                      " min_size=", SizeMin(t).value(), " start=[",
-                      StartMin(t).value(), ",", StartMax(t).value(), "]",
-                      " end=[", EndMin(t).value(), ",", EndMax(t).value(), "]");
+  return absl::StrCat("t=", t, " is_present=", IsPresent(t), " size=[",
+                      SizeMin(t).value(), ",", SizeMax(t).value(), "]",
+                      " start=[", StartMin(t).value(), ",", StartMax(t).value(),
+                      "]", " end=[", EndMin(t).value(), ",", EndMax(t).value(),
+                      "]");
 }
 
 IntegerValue SchedulingConstraintHelper::GetMinOverlap(int t,

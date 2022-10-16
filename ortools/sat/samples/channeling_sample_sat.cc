@@ -11,7 +11,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <stdlib.h>
+
+#include "absl/types/span.h"
+#include "ortools/base/logging.h"
 #include "ortools/sat/cp_model.h"
+#include "ortools/sat/cp_model.pb.h"
+#include "ortools/sat/cp_model_solver.h"
 #include "ortools/sat/model.h"
 #include "ortools/sat/sat_parameters.pb.h"
 
@@ -35,7 +41,7 @@ void ChannelingSampleSat() {
 
   // Create our two half-reified constraints.
   // First, b implies (y == 10 - x).
-  cp_model.AddEquality(LinearExpr::Sum({x, y}), 10).OnlyEnforceIf(b);
+  cp_model.AddEquality(x + y, 10).OnlyEnforceIf(b);
   // Second, not(b) implies y == 0.
   cp_model.AddEquality(y, 0).OnlyEnforceIf(Not(b));
 

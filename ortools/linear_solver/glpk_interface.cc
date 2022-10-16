@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/attributes.h"
 #include "absl/memory/memory.h"
 #include "absl/strings/str_format.h"
 #include "ortools/base/commandlineflags.h"
@@ -31,6 +32,7 @@
 #include "ortools/base/integral_types.h"
 #include "ortools/base/logging.h"
 #include "ortools/base/timer.h"
+#include "ortools/glpk/glpk_env_deleter.h"
 #include "ortools/linear_solver/linear_solver.h"
 
 extern "C" {
@@ -211,10 +213,13 @@ class GLPKInterface : public MPSolverInterface {
 // Creates a LP/MIP instance with the specified name and minimization objective.
 GLPKInterface::GLPKInterface(MPSolver* const solver, bool mip)
     : MPSolverInterface(solver), lp_(nullptr), mip_(mip) {
+  // Make sure glp_free_env() is called at the exit of the current thread.
+  SetupGlpkEnvAutomaticDeletion();
+
   lp_ = glp_create_prob();
   glp_set_prob_name(lp_, solver_->name_.c_str());
   glp_set_obj_dir(lp_, GLP_MIN);
-  mip_callback_info_ = absl::make_unique<GLPKInformation>(maximize_);
+  mip_callback_info_ = std::make_unique<GLPKInformation>(maximize_);
 }
 
 // Frees the LP memory allocations.
@@ -673,7 +678,8 @@ int64_t GLPKInterface::iterations() const {
   if (!mip_ && CheckSolutionIsSynchronized()) {
     return lpx_get_int_parm(lp_, LPX_K_ITCNT);
   }
-#elif GLP_MAJOR_VERSION == 4 && GLP_MINOR_VERSION >= 53
+#elif (GLP_MAJOR_VERSION == 4 && GLP_MINOR_VERSION >= 53) || \
+    GLP_MAJOR_VERSION >= 5
   if (!mip_ && CheckSolutionIsSynchronized()) {
     return glp_get_it_cnt(lp_);
   }

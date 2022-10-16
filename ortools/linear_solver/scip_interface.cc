@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/base/attributes.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/optional.h"
@@ -66,7 +67,7 @@ class SCIPInterface : public MPSolverInterface {
   void SetOptimizationDirection(bool maximize) override;
   MPSolver::ResultStatus Solve(const MPSolverParameters& param) override;
   absl::optional<MPSolutionResponse> DirectlySolveProto(
-      const MPModelRequest& request) override;
+      const MPModelRequest& request, std::atomic<bool>* interrupt) override;
   void Reset() override;
 
   void SetVariableBounds(int var_index, double lb, double ub) override;
@@ -713,7 +714,7 @@ MPSolver::ResultStatus SCIPInterface::Solve(const MPSolverParameters& param) {
     CHECK_EQ(scip_constraint_handler_->mp_callback(), callback_);
   } else if (callback_ != nullptr) {
     scip_constraint_handler_ =
-        absl::make_unique<ScipConstraintHandlerForMPCallback>(callback_);
+        std::make_unique<ScipConstraintHandlerForMPCallback>(callback_);
     RegisterConstraintHandler<EmptyStruct>(scip_constraint_handler_.get(),
                                            scip_);
     AddCallbackConstraint<EmptyStruct>(scip_, scip_constraint_handler_.get(),
@@ -860,9 +861,12 @@ void SCIPInterface::SetSolution(SCIP_SOL* solution) {
 }
 
 absl::optional<MPSolutionResponse> SCIPInterface::DirectlySolveProto(
-    const MPModelRequest& request) {
+    const MPModelRequest& request, std::atomic<bool>* interrupt) {
   // ScipSolveProto doesn't solve concurrently.
   if (solver_->GetNumThreads() > 1) return absl::nullopt;
+
+  // Interruption via atomic<bool> is not directly supported by SCIP.
+  if (interrupt != nullptr) return absl::nullopt;
 
   const auto status_or = ScipSolveProto(request);
   if (status_or.ok()) return status_or.value();

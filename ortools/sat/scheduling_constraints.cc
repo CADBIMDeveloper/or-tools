@@ -13,8 +13,22 @@
 
 #include "ortools/sat/scheduling_constraints.h"
 
+#include <algorithm>
+#include <functional>
+#include <vector>
+
+#include "absl/types/span.h"
+#include "ortools/base/logging.h"
+#include "ortools/base/macros.h"
 #include "ortools/sat/integer.h"
+#include "ortools/sat/integer_expr.h"
+#include "ortools/sat/intervals.h"
+#include "ortools/sat/linear_constraint.h"
+#include "ortools/sat/model.h"
+#include "ortools/sat/precedences.h"
 #include "ortools/sat/sat_base.h"
+#include "ortools/sat/sat_solver.h"
+#include "ortools/util/strong_integers.h"
 
 namespace operations_research {
 namespace sat {
@@ -68,7 +82,7 @@ bool SelectedMinPropagator::Propagate() {
 
   // Push the given integer literal if lit is true. Note that if lit is still
   // not assigned, we may still be able to deduce something.
-  // TODO(user,user): Move this to integer_trail, and remove from here and
+  // TODO(user): Move this to integer_trail, and remove from here and
   // from scheduling helper.
   const auto push_bound = [&](Literal enforcement_lit, IntegerLiteral i_lit) {
     if (assignment.LiteralIsFalse(enforcement_lit)) return true;
@@ -192,10 +206,8 @@ bool SelectedMinPropagator::Propagate() {
     }
   }
 
-  // All propagations and checks belows rely of the presence of the target.
+  // All propagations and checks belows rely on the presence of the target.
   if (!assignment.LiteralIsTrue(enforcement_literal_)) return true;
-
-  DCHECK_GE(integer_trail_->LowerBound(target_), min_of_mins);
 
   // Note that the case num_possible == 1, num_selected_vars == 0 shouldn't
   // happen because we assume that the enforcement <=> at_least_one_present
@@ -360,7 +372,7 @@ std::function<void(Model*)> SpanOfIntervals(
       if (repository->IsOptional(span)) {
         clause.push_back(repository->PresenceLiteral(span).Negated());
       }
-      sat_solver->AddProblemClause(clause);
+      sat_solver->AddProblemClause(clause, /*is_safe=*/false);
     }
 
     // Link target start and end to the starts and ends of the tasks.

@@ -1,3 +1,6 @@
+# Need a Centos 7 to avoid this:
+# https://github.com/google/or-tools/issues/2520#issuecomment-825119882
+# note: PEP 599 manylinux2014 is also based on Centos 7 which will reach End of Life (EOL) on June 30th, 2024
 FROM centos:7 AS env
 
 #############
@@ -9,20 +12,22 @@ RUN yum -y update \
 && yum clean all \
 && rm -rf /var/cache/yum
 
-# Bump to gcc-9
+# Bump to gcc-11
 RUN yum -y update \
 && yum -y install centos-release-scl \
-&& yum -y install devtoolset-9 \
+&& yum -y install devtoolset-11 \
 && yum clean all \
-&& echo "source /opt/rh/devtoolset-9/enable" >> /etc/bashrc
-SHELL ["/bin/bash", "--login", "-c"]
-# RUN gcc --version
+&& echo "source /opt/rh/devtoolset-11/enable" >> /etc/bashrc
+SHELL ["/usr/bin/bash", "--login", "-c"]
+ENTRYPOINT ["/usr/bin/bash", "--login", "-c"]
+CMD ["/usr/bin/bash", "--login"]
+# RUN g++ --version
 
-# Install CMake 3.20.1
-RUN wget "https://cmake.org/files/v3.20/cmake-3.20.1-linux-x86_64.sh" \
-&& chmod a+x cmake-3.20.1-linux-x86_64.sh \
-&& ./cmake-3.20.1-linux-x86_64.sh --prefix=/usr/local/ --skip-license \
-&& rm cmake-3.20.1-linux-x86_64.sh
+# Install CMake 3.22.2
+RUN wget -q "https://cmake.org/files/v3.22/cmake-3.22.2-linux-x86_64.sh" \
+&& chmod a+x cmake-3.22.2-linux-x86_64.sh \
+&& ./cmake-3.22.2-linux-x86_64.sh --prefix=/usr/local/ --skip-license \
+&& rm cmake-3.22.2-linux-x86_64.sh
 
 # Install Swig 4.0.2
 RUN curl --location-trusted \
@@ -48,7 +53,7 @@ ENV JAVA_HOME=/usr/lib/jvm/java
 # see https://docs.microsoft.com/en-us/dotnet/core/install/linux-centos#centos-7-
 RUN rpm -Uvh https://packages.microsoft.com/config/centos/7/packages-microsoft-prod.rpm \
 && yum -y update \
-&& yum -y install dotnet-sdk-3.1 \
+&& yum -y install dotnet-sdk-3.1 dotnet-sdk-6.0 \
 && yum clean all \
 && rm -rf /var/cache/yum
 # Trigger first run experience by running arbitrary cmd
@@ -77,8 +82,8 @@ ENV ORTOOLS_GIT_BRANCH ${ORTOOLS_GIT_BRANCH:-master}
 ARG ORTOOLS_GIT_SHA1
 ENV ORTOOLS_GIT_SHA1 ${ORTOOLS_GIT_SHA1:-unknown}
 RUN git clone -b "${ORTOOLS_GIT_BRANCH}" --single-branch https://github.com/google/or-tools \
-&& echo "sha1: $(cd or-tools && git rev-parse --verify HEAD)" \
-&& echo "expected sha1: ${ORTOOLS_GIT_SHA1}"
+&& cd or-tools \
+&& git reset --hard "${ORTOOLS_GIT_SHA1}"
 
 # Build delivery
 FROM devel AS delivery

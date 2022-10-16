@@ -15,12 +15,14 @@
 #define OR_TOOLS_SAT_LINEAR_PROGRAMMING_CONSTRAINT_H_
 
 #include <cstdint>
+#include <functional>
 #include <limits>
+#include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
-#include "ortools/base/int_type.h"
 #include "ortools/base/strong_vector.h"
 #include "ortools/glop/revised_simplex.h"
 #include "ortools/lp_data/lp_data.h"
@@ -33,9 +35,12 @@
 #include "ortools/sat/linear_constraint.h"
 #include "ortools/sat/linear_constraint_manager.h"
 #include "ortools/sat/model.h"
+#include "ortools/sat/sat_base.h"
+#include "ortools/sat/sat_parameters.pb.h"
 #include "ortools/sat/util.h"
 #include "ortools/sat/zero_half_cuts.h"
 #include "ortools/util/rev.h"
+#include "ortools/util/strong_integers.h"
 #include "ortools/util/time_limit.h"
 
 namespace operations_research {
@@ -96,6 +101,8 @@ class ScatteredIntegerVector {
     return dense_vector_[col];
   }
 
+  const bool IsSparse() const { return is_sparse_; }
+
  private:
   // If is_sparse is true we maintain the non_zeros positions and bool vector
   // of dense_vector_. Otherwise we don't. Note that we automatically switch
@@ -126,6 +133,7 @@ class ScatteredIntegerVector {
 // However, by default, we interpret the LP result by recomputing everything
 // in integer arithmetic, so we are exact.
 class LinearProgrammingDispatcher;
+
 class LinearProgrammingConstraint : public PropagatorInterface,
                                     ReversibleInterface {
  public:
@@ -143,6 +151,7 @@ class LinearProgrammingConstraint : public PropagatorInterface,
   // The main objective variable should be equal to the linear sum of
   // the arguments passed to SetObjectiveCoefficient().
   void SetMainObjectiveVariable(IntegerVariable ivar) { objective_cp_ = ivar; }
+  IntegerVariable ObjectiveVariable() const { return objective_cp_; }
 
   // Register a new cut generator with this constraint.
   void AddCutGenerator(CutGenerator generator);
@@ -222,6 +231,16 @@ class LinearProgrammingConstraint : public PropagatorInterface,
   // Returns some statistics about this LP.
   std::string Statistics() const;
 
+  // Important: this is only temporarily valid.
+  IntegerSumLE* LatestOptimalConstraintOrNull() const {
+    if (optimal_constraints_.empty()) return nullptr;
+    return optimal_constraints_.back().get();
+  }
+
+  const std::vector<std::unique_ptr<IntegerSumLE>>& OptimalConstraints() const {
+    return optimal_constraints_;
+  }
+
  private:
   // Helper methods for branching. Returns true if branching on the given
   // variable helps with more propagation or finds a conflict.
@@ -264,6 +283,7 @@ class LinearProgrammingConstraint : public PropagatorInterface,
 
   // Computes and adds the corresponding type of cuts.
   // This can currently only be called at the root node.
+  void AddObjectiveCut();
   void AddCGCuts();
   void AddMirCuts();
   void AddZeroHalfCuts();
@@ -317,7 +337,7 @@ class LinearProgrammingConstraint : public PropagatorInterface,
   // Shortcut for an integer linear expression type.
   using LinearExpression = std::vector<std::pair<glop::ColIndex, IntegerValue>>;
 
-  // Converts a dense represenation of a linear constraint to a sparse one
+  // Converts a dense representation of a linear constraint to a sparse one
   // expressed in terms of IntegerVariable.
   void ConvertToLinearConstraint(
       const absl::StrongVector<glop::ColIndex, IntegerValue>& dense_vector,
@@ -413,8 +433,10 @@ class LinearProgrammingConstraint : public PropagatorInterface,
   // Temporary data for cuts.
   ZeroHalfCutHelper zero_half_cut_helper_;
   CoverCutHelper cover_cut_helper_;
+  FlowCoverCutHelper flow_cover_cut_helper_;
   IntegerRoundingCutHelper integer_rounding_cut_helper_;
   LinearConstraint cut_;
+  LinearConstraint tmp_constraint_;
 
   ScatteredIntegerVector tmp_scattered_vector_;
 
@@ -423,6 +445,12 @@ class LinearProgrammingConstraint : public PropagatorInterface,
   std::vector<IntegerValue> tmp_var_ubs_;
   std::vector<glop::RowIndex> tmp_slack_rows_;
   std::vector<IntegerValue> tmp_slack_bounds_;
+  std::vector<ImpliedBoundsProcessor::SlackInfo> tmp_ib_slack_infos_;
+  std::vector<std::pair<glop::ColIndex, IntegerValue>> tmp_terms_;
+
+  // Used by AddCGCuts().
+  std::vector<std::pair<glop::RowIndex, double>> tmp_lp_multipliers_;
+  std::vector<std::pair<glop::RowIndex, IntegerValue>> tmp_integer_multipliers_;
 
   // Used by ScaleLpMultiplier().
   mutable std::vector<std::pair<glop::RowIndex, double>> tmp_cp_multipliers_;
@@ -443,7 +471,7 @@ class LinearProgrammingConstraint : public PropagatorInterface,
   IntegerVariable objective_cp_;
 
   // Singletons from Model.
-  const SatParameters& sat_parameters_;
+  const SatParameters& parameters_;
   Model* model_;
   TimeLimit* time_limit_;
   IntegerTrail* integer_trail_;
@@ -536,17 +564,40 @@ class LinearProgrammingConstraint : public PropagatorInterface,
 // Important: only positive variable do appear here.
 class LinearProgrammingDispatcher
     : public absl::flat_hash_map<IntegerVariable,
-                                 LinearProgrammingConstraint*> {
- public:
-  explicit LinearProgrammingDispatcher(Model* model) {}
-};
+                                 LinearProgrammingConstraint*> {};
 
 // A class that stores the collection of all LP constraints in a model.
 class LinearProgrammingConstraintCollection
-    : public std::vector<LinearProgrammingConstraint*> {
- public:
-  LinearProgrammingConstraintCollection() {}
-};
+    : public std::vector<LinearProgrammingConstraint*> {};
+
+// TODO(user): Move the cut "graph" based cut generator out of this class, there
+// is no reason to keep them here.
+
+// Given a graph with nodes in [0, num_nodes) and a set of arcs (the order is
+// important), this will:
+//   - Start with each nodes in separate "subsets".
+//   - Consider the arc in order, and each time one connects two separate
+//     subsets, merge the two subsets into a new one.
+//   - Stops when there is only 2 subset left.
+//   - Output all subsets generated this way (at most 2 * num_nodes). The
+//     subsets spans will point in the subset_data vector (which will be of size
+//     exactly num_nodes).
+//
+// Only subsets of size >= min_subset_size will be returned. This is mainly here
+// to exclude subsets of size 1.
+//
+// This is an heuristic to generate interesting cuts for TSP or other graph
+// based constraints. We roughly follow the algorithm described in section 6 of
+// "The Traveling Salesman Problem, A computational Study", David L. Applegate,
+// Robert E. Bixby, Vasek Chvatal, William J. Cook.
+//
+// Note that this is mainly a "symmetric" case algo, but it does still work for
+// the asymmetric case.
+void GenerateInterestingSubsets(int num_nodes,
+                                const std::vector<std::pair<int, int>>& arcs,
+                                int min_subset_size, int stop_at_num_components,
+                                std::vector<int>* subset_data,
+                                std::vector<absl::Span<const int>>* subsets);
 
 // Cut generator for the circuit constraint, where in any feasible solution, the
 // arcs that are present (variable at 1) must form a circuit through all the
@@ -569,6 +620,26 @@ CutGenerator CreateCVRPCutGenerator(int num_nodes,
                                     const std::vector<Literal>& literals,
                                     const std::vector<int64_t>& demands,
                                     int64_t capacity, Model* model);
+
+// Try to find a subset where the current LP capacity of the outgoing or
+// incoming arc is not enough to satisfy the demands.
+//
+// We support the special value -1 for tail or head that means that the arc
+// comes from (or is going to) outside the nodes in [0, num_nodes). Such arc
+// must still have a capacity assigned to it.
+//
+// TODO(user): Support general linear expression for capacities.
+// TODO(user): Some model applies the same capacity to both an arc and its
+// reverse. Also support this case.
+CutGenerator CreateFlowCutGenerator(
+    int num_nodes, const std::vector<int>& tails, const std::vector<int>& heads,
+    const std::vector<AffineExpression>& arc_capacities,
+    std::function<void(const std::vector<bool>& in_subset,
+                       IntegerValue* min_incoming_flow,
+                       IntegerValue* min_outgoing_flow)>
+        get_flows,
+    Model* model);
+
 }  // namespace sat
 }  // namespace operations_research
 

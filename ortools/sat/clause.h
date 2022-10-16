@@ -23,14 +23,15 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/attributes.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/random/bit_gen_ref.h"
 #include "absl/types/span.h"
 #include "ortools/base/hash.h"
-#include "ortools/base/int_type.h"
 #include "ortools/base/integral_types.h"
+#include "ortools/base/logging.h"
 #include "ortools/base/macros.h"
 #include "ortools/base/strong_vector.h"
 #include "ortools/sat/drat_proof_handler.h"
@@ -40,6 +41,7 @@
 #include "ortools/sat/util.h"
 #include "ortools/util/bitset.h"
 #include "ortools/util/stats.h"
+#include "ortools/util/strong_integers.h"
 #include "ortools/util/time_limit.h"
 
 namespace operations_research {
@@ -51,10 +53,10 @@ namespace sat {
 // indirection.
 class SatClause {
  public:
-  // Creates a sat clause. There must be at least 2 literals. Smaller clause are
-  // treated separatly and never constructed. In practice, we do use
-  // BinaryImplicationGraph for the clause of size 2, so this is mainly used for
-  // size at least 3.
+  // Creates a sat clause. There must be at least 2 literals.
+  // Clause with one literal fix variable directly and are never constructed.
+  // Note that in practice, we use BinaryImplicationGraph for the clause of size
+  // 2, so this is used for size at least 3.
   static SatClause* Create(absl::Span<const Literal> literals);
 
   // Non-sized delete because this is a tail-padded class.
@@ -163,7 +165,7 @@ class LiteralWatchers : public SatPropagator {
   explicit LiteralWatchers(Model* model);
   ~LiteralWatchers() override;
 
-  // Must be called before adding clauses refering to such variables.
+  // Must be called before adding clauses referring to such variables.
   void Resize(int num_variables);
 
   // SatPropagator API.
@@ -218,7 +220,7 @@ class LiteralWatchers : public SatPropagator {
   // that some learned clause are kept forever (heuristics) and do not appear
   // here.
   bool IsRemovable(SatClause* const clause) const {
-    return gtl::ContainsKey(clauses_info_, clause);
+    return clauses_info_.contains(clause);
   }
   int64_t num_removable_clauses() const { return clauses_info_.size(); }
   absl::flat_hash_map<SatClause*, ClauseInfo>* mutable_clauses_info() {
@@ -357,9 +359,7 @@ class LiteralWatchers : public SatPropagator {
   // pointers. We currently do not use std::unique_ptr<SatClause> because it
   // can't be used with some STL algorithms like std::partition.
   //
-  // Note that the unit clauses are not kept here and if the parameter
-  // treat_binary_clauses_separately is true, the binary clause are not kept
-  // here either.
+  // Note that the unit clauses and binary clause are not kept here.
   std::vector<SatClause*> clauses_;
 
   int to_minimize_index_ = 0;
@@ -481,7 +481,9 @@ class BinaryImplicationGraph : public SatPropagator {
   void Resize(int num_variables);
 
   // Returns true if there is no constraints in this class.
-  bool IsEmpty() { return num_implications_ == 0 && at_most_ones_.empty(); }
+  bool IsEmpty() const final {
+    return num_implications_ == 0 && at_most_ones_.empty();
+  }
 
   // Adds the binary clause (a OR b), which is the same as (not a => b).
   // Note that it is also equivalent to (not b => a).
@@ -518,9 +520,9 @@ class BinaryImplicationGraph : public SatPropagator {
                                     std::vector<Literal>* c);
   void MinimizeConflictFirst(const Trail& trail, std::vector<Literal>* c,
                              SparseBitset<BooleanVariable>* marked);
-  void MinimizeConflictFirstWithTransitiveReduction(
-      const Trail& trail, std::vector<Literal>* c,
-      SparseBitset<BooleanVariable>* marked, absl::BitGenRef random);
+  void MinimizeConflictFirstWithTransitiveReduction(const Trail& trail,
+                                                    std::vector<Literal>* c,
+                                                    absl::BitGenRef random);
 
   // This must only be called at decision level 0 after all the possible
   // propagations. It:
@@ -583,6 +585,7 @@ class BinaryImplicationGraph : public SatPropagator {
   // This function will transform each of the given constraint into a maximal
   // one in the underlying implication graph. Constraints that are redundant
   // after other have been expanded (i.e. included into) will be cleared.
+  // Note that the order of constraints will be conserved.
   //
   // Returns false if the model is detected to be UNSAT (this needs to call
   // DetectEquivalences() if not already done).
@@ -711,6 +714,18 @@ class BinaryImplicationGraph : public SatPropagator {
   // TODO(user): consider at most ones.
   void CleanupAllRemovedVariables();
 
+  // ExpandAtMostOneWithWeight() will increase this, so a client can put a limit
+  // on this possibly expansive operation.
+  void ResetWorkDone() { work_done_in_mark_descendants_ = 0; }
+  int64_t WorkDone() const { return work_done_in_mark_descendants_; }
+
+  // Same as ExpandAtMostOne() but try to maximize the weight in the clique.
+  template <bool use_weight = true>
+  std::vector<Literal> ExpandAtMostOneWithWeight(
+      const absl::Span<const Literal> at_most_one,
+      const absl::StrongVector<LiteralIndex, bool>& can_be_included,
+      const absl::StrongVector<LiteralIndex, double>& expanded_lp_values);
+
  private:
   // Simple wrapper to not forget to output newly fixed variable to the DRAT
   // proof if needed. This will propagate rigth away the implications.
@@ -734,13 +749,8 @@ class BinaryImplicationGraph : public SatPropagator {
   // if this is called with any sub-clique of the result we will get the same
   // maximal clique.
   std::vector<Literal> ExpandAtMostOne(
-      const absl::Span<const Literal> at_most_one);
-
-  // Same as ExpandAtMostOne() but try to maximize the weight in the clique.
-  std::vector<Literal> ExpandAtMostOneWithWeight(
       const absl::Span<const Literal> at_most_one,
-      const absl::StrongVector<LiteralIndex, bool>& can_be_included,
-      const absl::StrongVector<LiteralIndex, double>& expanded_lp_values);
+      int64_t max_num_explored_nodes);
 
   // Process all at most one constraints starting at or after base_index in
   // at_most_one_buffer_. This replace literal by their representative, remove
@@ -773,9 +783,9 @@ class BinaryImplicationGraph : public SatPropagator {
   int64_t num_implications_ = 0;
 
   // Internal representation of at_most_one constraints. Each entry point to the
-  // start of a constraint in the buffer. Contraints are terminated by
+  // start of a constraint in the buffer. Constraints are terminated by
   // kNoLiteral. When LiteralIndex is true, then all entry in the at most one
-  // constraint must be false except the one refering to LiteralIndex.
+  // constraint must be false except the one referring to LiteralIndex.
   //
   // TODO(user): We could be more cache efficient by combining this with
   // implications_ in some way. Do some propagation speed benchmark.

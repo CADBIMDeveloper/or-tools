@@ -76,12 +76,14 @@ public class Vrp
 
         // Create and register a transit callback.
         // [START transit_callback]
-        int transitCallbackIndex = routing.RegisterTransitCallback((long fromIndex, long toIndex) => {
-            // Convert from routing variable Index to distance matrix NodeIndex.
-            var fromNode = manager.IndexToNode(fromIndex);
-            var toNode = manager.IndexToNode(toIndex);
-            return 1;
-        });
+        int transitCallbackIndex = routing.RegisterTransitCallback((long fromIndex, long toIndex) =>
+                                                                   {
+                                                                       // Convert from routing variable Index to
+                                                                       // distance matrix NodeIndex.
+                                                                       var fromNode = manager.IndexToNode(fromIndex);
+                                                                       var toNode = manager.IndexToNode(toIndex);
+                                                                       return 1;
+                                                                   });
         // [END transit_callback]
 
         // Define cost of each arc.
@@ -106,7 +108,7 @@ public class Vrp
         searchParameters.FirstSolutionStrategy = FirstSolutionStrategy.Types.Value.PathCheapestArc;
         searchParameters.LocalSearchMetaheuristic = LocalSearchMetaheuristic.Types.Value.GuidedLocalSearch;
         searchParameters.LogSearch = true;
-        searchParameters.TimeLimit = new Duration { Seconds = 10 };
+        searchParameters.TimeLimit = new Duration { Seconds = 5 };
         // [END parameters]
 
         // Solve the problem.

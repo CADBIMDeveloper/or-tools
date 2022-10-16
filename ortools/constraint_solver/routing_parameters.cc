@@ -14,6 +14,7 @@
 #include "ortools/constraint_solver/routing_parameters.h"
 
 #include <cstdint>
+#include <string>
 
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
@@ -26,6 +27,7 @@
 #include "ortools/constraint_solver/constraint_solver.h"
 #include "ortools/constraint_solver/routing_enums.pb.h"
 #include "ortools/constraint_solver/solver_parameters.pb.h"
+#include "ortools/sat/sat_parameters.pb.h"
 #include "ortools/util/optional_boolean.pb.h"
 
 namespace operations_research {
@@ -60,6 +62,8 @@ RoutingSearchParameters DefaultRoutingSearchParameters() {
       "cheapest_insertion_first_solution_use_neighbors_ratio_for_"
       "initialization: false "
       "cheapest_insertion_add_unperformed_entries: false "
+      "local_cheapest_insertion_evaluate_pickup_delivery_costs_independently: "
+      "true "
       "local_search_operators {"
       "  use_relocate: BOOL_TRUE"
       "  use_relocate_pair: BOOL_TRUE"
@@ -107,8 +111,11 @@ RoutingSearchParameters DefaultRoutingSearchParameters() {
       "use_depth_first_search: false "
       "use_cp: BOOL_TRUE "
       "use_cp_sat: BOOL_FALSE "
-      "continuous_scheduling_solver: GLOP "
-      "mixed_integer_scheduling_solver: CP_SAT "
+      "use_generalized_cp_sat: BOOL_FALSE "
+      "sat_parameters { linearization_level: 2 num_search_workers: 1 } "
+      "continuous_scheduling_solver: SCHEDULING_GLOP "
+      "mixed_integer_scheduling_solver: SCHEDULING_CP_SAT "
+      "disable_scheduling_beware_this_may_degrade_performance: false "
       "optimization_step: 0.0 "
       "number_of_solutions_to_collect: 1 "
       // No "time_limit" by default.
@@ -308,8 +315,10 @@ std::string FindErrorInRoutingSearchParameters(
   }
   const RoutingSearchParameters::SchedulingSolver continuous_scheduling_solver =
       search_parameters.continuous_scheduling_solver();
-  if (continuous_scheduling_solver == RoutingSearchParameters::UNSET ||
-      continuous_scheduling_solver == RoutingSearchParameters::CP_SAT) {
+  if (continuous_scheduling_solver ==
+          RoutingSearchParameters::SCHEDULING_UNSET ||
+      continuous_scheduling_solver ==
+          RoutingSearchParameters::SCHEDULING_CP_SAT) {
     return StrCat("Invalid value for continuous_scheduling_solver: ",
                   RoutingSearchParameters::SchedulingSolver_Name(
                       continuous_scheduling_solver));
@@ -317,7 +326,8 @@ std::string FindErrorInRoutingSearchParameters(
   const RoutingSearchParameters::SchedulingSolver
       mixed_integer_scheduling_solver =
           search_parameters.mixed_integer_scheduling_solver();
-  if (mixed_integer_scheduling_solver == RoutingSearchParameters::UNSET) {
+  if (mixed_integer_scheduling_solver ==
+      RoutingSearchParameters::SCHEDULING_UNSET) {
     return StrCat("Invalid value for mixed_integer_scheduling_solver: ",
                   RoutingSearchParameters::SchedulingSolver_Name(
                       mixed_integer_scheduling_solver));
@@ -367,6 +377,17 @@ std::string FindErrorInRoutingSearchParameters(
           "Invalid value for "
           "multi_armed_bandit_compound_operator_exploration_coefficient: ",
           exploration_coefficient);
+    }
+  }
+
+  {
+    const sat::SatParameters& sat_parameters =
+        search_parameters.sat_parameters();
+    if (sat_parameters.enumerate_all_solutions() &&
+        (sat_parameters.num_search_workers() > 1 ||
+         sat_parameters.interleave_search())) {
+      return "sat_parameters.enumerate_all_solutions cannot be true in parallel"
+             " search";
     }
   }
 

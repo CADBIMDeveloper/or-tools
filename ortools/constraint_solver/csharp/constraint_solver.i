@@ -247,7 +247,7 @@ namespace operations_research {
 %unignore SymmetryBreaker;
 
 // UnsortedNullableRevBitset
-// TODO(corentinl) To removed from constraint_solveri.h (only use by table.cc)
+// TODO(user) To removed from constraint_solveri.h (only use by table.cc)
 %ignore UnsortedNullableRevBitset;
 
 // Assignment
@@ -405,7 +405,7 @@ namespace operations_research {
 // Methods:
 %rename (Add) Solver::AddConstraint;
 // Rename NewSearch and EndSearch to add pinning. See the overrides of
-// NewSearch in ../../open_source/csharp/constraint_solver/SolverHelper.cs
+// NewSearch in ../../csharp/constraint_solver/SolverHelper.cs
 %rename (NewSearchAux) Solver::NewSearch;
 %rename (EndSearchAux) Solver::EndSearch;
 
@@ -814,6 +814,9 @@ namespace operations_research {
 %ignore PathOperator::number_of_nexts;
 // Methods:
 %unignore PathOperator::MakeNeighbor;
+
+// PathOperator::IterationParameters
+%ignore PathOperator::IterationParameters;
 
 // LocalSearchFilter
 %feature("director") LocalSearchFilter;

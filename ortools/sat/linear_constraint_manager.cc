@@ -15,13 +15,26 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdlib>
 #include <limits>
+#include <string>
 #include <utility>
+#include <vector>
 
-#include "absl/container/flat_hash_set.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/meta/type_traits.h"
+#include "absl/strings/str_cat.h"
+#include "ortools/base/hash.h"
+#include "ortools/base/logging.h"
 #include "ortools/base/strong_vector.h"
+#include "ortools/lp_data/lp_types.h"
 #include "ortools/sat/integer.h"
 #include "ortools/sat/linear_constraint.h"
+#include "ortools/sat/model.h"
+#include "ortools/sat/sat_parameters.pb.h"
+#include "ortools/util/strong_integers.h"
+#include "ortools/util/time_limit.h"
 
 namespace operations_research {
 namespace sat {
@@ -55,9 +68,9 @@ std::string LinearConstraintManager::Statistics() const {
     absl::StrAppend(
         &result, "  shortened constraints: ", num_shortened_constraints_, "\n");
   }
-  if (num_splitted_constraints_ > 0) {
-    absl::StrAppend(
-        &result, "  splitted constraints: ", num_splitted_constraints_, "\n");
+  if (num_split_constraints_ > 0) {
+    absl::StrAppend(&result, "  split constraints: ", num_split_constraints_,
+                    "\n");
   }
   if (num_coeff_strenghtening_ > 0) {
     absl::StrAppend(&result,
@@ -142,7 +155,7 @@ LinearConstraintManager::ConstraintIndex LinearConstraintManager::Add(
 
   // If an identical constraint exists, only updates its bound.
   const size_t key = ComputeHashOfTerms(ct);
-  if (gtl::ContainsKey(equiv_constraints_, key)) {
+  if (equiv_constraints_.contains(key)) {
     const ConstraintIndex ct_index = equiv_constraints_[key];
     if (constraint_infos_[ct_index].constraint.vars == ct.vars &&
         constraint_infos_[ct_index].constraint.coeffs == ct.coeffs) {
@@ -391,7 +404,7 @@ bool LinearConstraintManager::SimplifyConstraint(LinearConstraint* ct) {
   // computation. We should check this.
   if (ct->ub != kMaxIntegerValue && max_magnitude > max_sum - ct->ub) {
     if (ct->lb != kMinIntegerValue) {
-      ++num_splitted_constraints_;
+      ++num_split_constraints_;
     } else {
       term_changed = true;
       ++num_coeff_strenghtening_;
@@ -416,7 +429,7 @@ bool LinearConstraintManager::SimplifyConstraint(LinearConstraint* ct) {
 
   if (ct->lb != kMinIntegerValue && max_magnitude > ct->lb - min_sum) {
     if (ct->ub != kMaxIntegerValue) {
-      ++num_splitted_constraints_;
+      ++num_split_constraints_;
     } else {
       term_changed = true;
       ++num_coeff_strenghtening_;

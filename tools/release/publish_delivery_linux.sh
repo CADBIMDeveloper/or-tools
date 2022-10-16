@@ -60,15 +60,16 @@ function publish_java() {
   fi
   # Maven central need gpg sign and we store the release key encoded using openssl
   local OPENSSL_PRG=openssl
-  if [ -x "$(command -v openssl11)" ]; then
+  if [[ -x "$(command -v openssl11)" ]]; then
     OPENSSL_PRG=openssl11
   fi
   command -v $OPENSSL_PRG | xargs echo "openssl: " | tee -a build.log
   command -v gpg
   command -v gpg | xargs echo "gpg: " | tee -a build.log
 
-  echo -n "Publish Java..." | tee -a publish.log
-  make publish_java_runtime -l 4 UNIX_PYTHON_VER=3.9
+  echo -n "Publish native Java..." | tee -a publish.log
+
+  cmake --build temp_java --target java_native_deploy -v
   echo "DONE" | tee -a publish.log
 
   echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" > "${ROOT_DIR}/export/java_publish"

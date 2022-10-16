@@ -25,8 +25,10 @@
 #define OR_TOOLS_ALGORITHMS_FIND_GRAPH_SYMMETRIES_H_
 
 #include <memory>
+#include <string>
 #include <vector>
 
+#include "absl/numeric/int128.h"
 #include "absl/status/status.h"
 #include "absl/time/time.h"
 #include "ortools/algorithms/dynamic_partition.h"

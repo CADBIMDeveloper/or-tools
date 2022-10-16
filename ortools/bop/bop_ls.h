@@ -29,18 +29,19 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/random/random.h"
 #include "ortools/base/hash.h"
-#include "ortools/base/random.h"
 #include "ortools/base/strong_vector.h"
 #include "ortools/bop/bop_base.h"
 #include "ortools/bop/bop_solution.h"
 #include "ortools/bop/bop_types.h"
 #include "ortools/sat/boolean_problem.pb.h"
 #include "ortools/sat/sat_solver.h"
+#include "ortools/util/strong_integers.h"
 
 namespace operations_research {
 namespace bop {
@@ -116,7 +117,7 @@ class LocalSearchAssignmentIterator;
 class LocalSearchOptimizer : public BopOptimizerBase {
  public:
   LocalSearchOptimizer(const std::string& name, int max_num_decisions,
-                       sat::SatSolver* sat_propagator);
+                       absl::BitGenRef random, sat::SatSolver* sat_propagator);
   ~LocalSearchOptimizer() override;
 
  private:
@@ -140,6 +141,9 @@ class LocalSearchOptimizer : public BopOptimizerBase {
   // the iterator continues its iteration of the next assignments each time
   // Optimize() is called until everything is explored or a solution is found.
   std::unique_ptr<LocalSearchAssignmentIterator> assignment_iterator_;
+
+  // Random generator.
+  absl::BitGenRef random_;
 };
 
 //------------------------------------------------------------------------------
@@ -201,13 +205,13 @@ class BacktrackableIntegerSet {
 template <typename IntType>
 class NonOrderedSetHasher {
  public:
-  NonOrderedSetHasher() : random_("Random seed") {}
+  explicit NonOrderedSetHasher(absl::BitGenRef random) : random_(random) {}
 
   // Initializes the NonOrderedSetHasher to hash sets of integer in [0, n).
   void Initialize(int size) {
     hashes_.resize(size);
     for (IntType i(0); i < size; ++i) {
-      hashes_[i] = random_.Rand64();
+      hashes_[i] = absl::Uniform<uint64_t>(random_);
     }
   }
 
@@ -232,7 +236,7 @@ class NonOrderedSetHasher {
   bool IsInitialized() const { return !hashes_.empty(); }
 
  private:
-  MTRandom random_;
+  absl::BitGenRef random_;
   absl::StrongVector<IntType, uint64_t> hashes_;
 };
 
@@ -266,7 +270,7 @@ class AssignmentAndConstraintFeasibilityMaintainer {
   // Note that the constraint indices used in this class are not the same as
   // the one used in the given LinearBooleanProblem here.
   explicit AssignmentAndConstraintFeasibilityMaintainer(
-      const sat::LinearBooleanProblem& problem);
+      const sat::LinearBooleanProblem& problem, absl::BitGenRef random);
 
   // When we construct the problem, we treat the objective as one constraint.
   // This is the index of this special "objective" constraint.
@@ -372,7 +376,7 @@ class AssignmentAndConstraintFeasibilityMaintainer {
   // constraint infeasible. An "up" direction means that the constraint activity
   // is lower than the lower bound and we need to make the activity move up to
   // fix the infeasibility.
-  DEFINE_INT_TYPE(ConstraintIndexWithDirection, int32_t);
+  DEFINE_STRONG_INDEX_TYPE(ConstraintIndexWithDirection);
   ConstraintIndexWithDirection FromConstraintIndex(ConstraintIndex index,
                                                    bool up) const {
     return ConstraintIndexWithDirection(2 * index.value() + (up ? 1 : 0));
@@ -383,7 +387,7 @@ class AssignmentAndConstraintFeasibilityMaintainer {
   void MakeObjectiveConstraintInfeasible(int delta);
 
   // Local structure to represent the sparse matrix by variable used for fast
-  // update of the contraint values.
+  // update of the constraint values.
   struct ConstraintEntry {
     ConstraintEntry(ConstraintIndex c, int64_t w) : constraint(c), weight(w) {}
     ConstraintIndex constraint;
@@ -507,6 +511,7 @@ class LocalSearchAssignmentIterator {
   LocalSearchAssignmentIterator(const ProblemState& problem_state,
                                 int max_num_decisions,
                                 int max_num_broken_constraints,
+                                absl::BitGenRef random,
                                 SatWrapper* sat_wrapper);
   ~LocalSearchAssignmentIterator();
 

@@ -12,8 +12,13 @@
 // limitations under the License.
 
 // [START program]
+#include <stdlib.h>
+
+#include "ortools/base/logging.h"
 #include "ortools/sat/cp_model.h"
-#include "ortools/sat/model.h"
+#include "ortools/sat/cp_model.pb.h"
+#include "ortools/sat/cp_model_solver.h"
+#include "ortools/util/sorted_interval_list.h"
 
 namespace operations_research {
 namespace sat {
@@ -35,7 +40,7 @@ void CopyModelSat() {
   // [END constraints]
 
   // [START objective]
-  cp_model.Maximize(LinearExpr::ScalProd({x, y, z}, {1, 2, 3}));
+  cp_model.Maximize(x + 2 * y + 3 * z);
   // [END objective]
 
   const CpSolverResponse initial_response = Solve(cp_model.Build());
@@ -49,7 +54,7 @@ void CopyModelSat() {
   IntVar copy_of_x = copy.GetIntVarFromProtoIndex(x.index());
   IntVar copy_of_y = copy.GetIntVarFromProtoIndex(y.index());
 
-  copy.AddLessOrEqual(LinearExpr::Sum({copy_of_x, copy_of_y}), 1);
+  copy.AddLessOrEqual(copy_of_x + copy_of_y, 1);
 
   const CpSolverResponse modified_response = Solve(copy.Build());
   LOG(INFO) << "Optimal value of the modified model: "

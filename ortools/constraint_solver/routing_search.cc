@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/attributes.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/flags/flag.h"
@@ -122,6 +123,18 @@ void VehicleTypeCurator::Update(
       }
     }
   }
+}
+
+bool VehicleTypeCurator::HasCompatibleVehicleOfType(
+    int type, const std::function<bool(int)>& vehicle_is_compatible) const {
+  for (const VehicleClassEntry& vehicle_class_entry :
+       sorted_vehicle_classes_per_type_[type]) {
+    for (int vehicle :
+         vehicles_per_vehicle_class_[vehicle_class_entry.vehicle_class]) {
+      if (vehicle_is_compatible(vehicle)) return true;
+    }
+  }
+  return false;
 }
 
 std::pair<int, int> VehicleTypeCurator::GetCompatibleVehicleOfType(
@@ -217,16 +230,22 @@ std::string IntVarFilteredDecisionBuilder::DebugString() const {
 
 IntVarFilteredHeuristic::IntVarFilteredHeuristic(
     Solver* solver, const std::vector<IntVar*>& vars,
+    const std::vector<IntVar*>& secondary_vars,
     LocalSearchFilterManager* filter_manager)
     : assignment_(solver->MakeAssignment()),
       solver_(solver),
       vars_(vars),
+      base_vars_size_(vars.size()),
       delta_(solver->MakeAssignment()),
       is_in_delta_(vars_.size(), false),
       empty_(solver->MakeAssignment()),
       filter_manager_(filter_manager),
+      objective_upper_bound_(std::numeric_limits<int64_t>::max()),
       number_of_decisions_(0),
       number_of_rejects_(0) {
+  if (!secondary_vars.empty()) {
+    vars_.insert(vars_.end(), secondary_vars.begin(), secondary_vars.end());
+  }
   assignment_->MutableIntVarContainer()->Resize(vars_.size());
   delta_indices_.reserve(vars_.size());
 }
@@ -242,11 +261,9 @@ void IntVarFilteredHeuristic::ResetSolution() {
 }
 
 Assignment* const IntVarFilteredHeuristic::BuildSolution() {
-  ResetSolution();
   if (!InitializeSolution()) {
     return nullptr;
   }
-  SynchronizeFilters();
   if (BuildSolutionInternal()) {
     return assignment_;
   }
@@ -255,12 +272,12 @@ Assignment* const IntVarFilteredHeuristic::BuildSolution() {
 
 const Assignment* RoutingFilteredHeuristic::BuildSolutionFromRoutes(
     const std::function<int64_t(int64_t)>& next_accessor) {
-  ResetSolution();
-  ResetVehicleIndices();
-  // NOTE: We don't need to clear or pre-set the two following vectors as the
-  // for loop below will set all elements.
-  start_chain_ends_.resize(model()->vehicles());
-  end_chain_starts_.resize(model()->vehicles());
+  // NOTE(b/219043402): The filter manager must first be synchronized with a
+  // valid solution that properly connects route starts to route ends in order
+  // for future FilterAccept() calls to correctly detect infeasibilities.
+  if (!InitializeSolution()) {
+    return nullptr;
+  }
 
   for (int v = 0; v < model_->vehicles(); v++) {
     int64_t node = model_->Start(v);
@@ -268,40 +285,56 @@ const Assignment* RoutingFilteredHeuristic::BuildSolutionFromRoutes(
       const int64_t next = next_accessor(node);
       DCHECK_NE(next, node);
       SetValue(node, next);
+      // TODO(user): Add vehicle values to delta when this method will be
+      // used with cost filtering. The code should be similar to this:
+      // if (HasSecondaryVars()) {
+      //   SetValue(SecondaryVarIndex(node), v);
+      // }
       SetVehicleIndex(node, v);
       node = next;
     }
-    // We relax all routes from start to end, so routes can now be extended
-    // by inserting nodes between the start and end.
-    start_chain_ends_[v] = model()->Start(v);
-    end_chain_starts_[v] = model()->End(v);
   }
-  if (!Commit()) {
+  if (!Evaluate(/*commit=*/true).has_value()) {
+    ResetVehicleIndices();
     return nullptr;
   }
-  SynchronizeFilters();
   if (BuildSolutionInternal()) {
     return assignment_;
   }
   return nullptr;
 }
 
-bool IntVarFilteredHeuristic::Commit() {
+std::optional<int64_t> IntVarFilteredHeuristic::Evaluate(bool commit) {
   ++number_of_decisions_;
   const bool accept = FilterAccept();
   if (accept) {
-    const Assignment::IntContainer& delta_container = delta_->IntVarContainer();
-    const int delta_size = delta_container.Size();
-    Assignment::IntContainer* const container =
-        assignment_->MutableIntVarContainer();
-    for (int i = 0; i < delta_size; ++i) {
-      const IntVarElement& delta_element = delta_container.Element(i);
-      IntVar* const var = delta_element.Var();
-      DCHECK_EQ(var, vars_[delta_indices_[i]]);
-      container->AddAtPosition(var, delta_indices_[i])
-          ->SetValue(delta_element.Value());
+    if (filter_manager_ != nullptr) {
+      // objective upper_bound_ is used to reduce the number of potential
+      // insertion candidates, specifically when filter_manager_ filters cost.
+      // Rationale: the best cost candidate will always be valid and will be
+      // inserted so no use accepting degrading ones. However when a candidate
+      // is committed, the upper bound is relaxed to make sure further
+      // (cost-degrading) insertions will be accepted
+      // (cf. SynchronizeFilters()).
+      DCHECK_LE(filter_manager_->GetAcceptedObjectiveValue(),
+                objective_upper_bound_);
+      objective_upper_bound_ = filter_manager_->GetAcceptedObjectiveValue();
     }
-    SynchronizeFilters();
+    if (commit) {
+      const Assignment::IntContainer& delta_container =
+          delta_->IntVarContainer();
+      const int delta_size = delta_container.Size();
+      Assignment::IntContainer* const container =
+          assignment_->MutableIntVarContainer();
+      for (int i = 0; i < delta_size; ++i) {
+        const IntVarElement& delta_element = delta_container.Element(i);
+        IntVar* const var = delta_element.Var();
+        DCHECK_EQ(var, vars_[delta_indices_[i]]);
+        container->AddAtPosition(var, delta_indices_[i])
+            ->SetValue(delta_element.Value());
+      }
+      SynchronizeFilters();
+    }
   } else {
     ++number_of_rejects_;
   }
@@ -311,11 +344,13 @@ bool IntVarFilteredHeuristic::Commit() {
   }
   delta_->Clear();
   delta_indices_.clear();
-  return accept;
+  return accept ? std::optional<int64_t>{objective_upper_bound_} : std::nullopt;
 }
 
 void IntVarFilteredHeuristic::SynchronizeFilters() {
   if (filter_manager_) filter_manager_->Synchronize(assignment_, delta_);
+  // Resetting the upper bound to allow cost-increasing insertions.
+  objective_upper_bound_ = std::numeric_limits<int64_t>::max();
 }
 
 bool IntVarFilteredHeuristic::FilterAccept() {
@@ -323,17 +358,25 @@ bool IntVarFilteredHeuristic::FilterAccept() {
   LocalSearchMonitor* const monitor = solver_->GetLocalSearchMonitor();
   return filter_manager_->Accept(monitor, delta_, empty_,
                                  std::numeric_limits<int64_t>::min(),
-                                 std::numeric_limits<int64_t>::max());
+                                 objective_upper_bound_);
 }
 
 // RoutingFilteredHeuristic
 
 RoutingFilteredHeuristic::RoutingFilteredHeuristic(
-    RoutingModel* model, LocalSearchFilterManager* filter_manager)
-    : IntVarFilteredHeuristic(model->solver(), model->Nexts(), filter_manager),
+    RoutingModel* model, LocalSearchFilterManager* filter_manager,
+    bool omit_secondary_vars)
+    : IntVarFilteredHeuristic(
+          model->solver(), model->Nexts(),
+          omit_secondary_vars || model->CostsAreHomogeneousAcrossVehicles()
+              ? std::vector<IntVar*>()
+              : model->VehicleVars(),
+          filter_manager),
       model_(model) {}
 
 bool RoutingFilteredHeuristic::InitializeSolution() {
+  ResetSolution();
+  ResetVehicleIndices();
   // Find the chains of nodes (when nodes have their "Next" value bound in the
   // current solution, it forms a link in a chain). Eventually, starts[end]
   // will contain the index of the first node of the chain ending at node 'end'
@@ -343,10 +386,8 @@ bool RoutingFilteredHeuristic::InitializeSolution() {
   // starts and ends.
 
   // Start by adding partial start chains to current assignment.
-  start_chain_ends_.clear();
-  start_chain_ends_.resize(model()->vehicles(), -1);
-  end_chain_starts_.clear();
-  end_chain_starts_.resize(model()->vehicles(), -1);
+  start_chain_ends_.resize(model()->vehicles());
+  end_chain_starts_.resize(model()->vehicles());
 
   ResetVehicleIndices();
   for (int vehicle = 0; vehicle < model()->vehicles(); ++vehicle) {
@@ -354,6 +395,9 @@ bool RoutingFilteredHeuristic::InitializeSolution() {
     while (!model()->IsEnd(node) && Var(node)->Bound()) {
       const int64_t next = Var(node)->Min();
       SetValue(node, next);
+      if (HasSecondaryVars()) {
+        SetValue(SecondaryVarIndex(node), vehicle);
+      }
       SetVehicleIndex(node, vehicle);
       node = next;
     }
@@ -383,7 +427,7 @@ bool RoutingFilteredHeuristic::InitializeSolution() {
     ends[starts[node]] = ends[current];
   }
 
-  // Set each route to be the concatenation of the chain at its starts and the
+  // Set each route to be the concatenation of the chain at its start and the
   // chain at its end, without nodes in between.
   for (int vehicle = 0; vehicle < model()->vehicles(); ++vehicle) {
     end_chain_starts_[vehicle] = starts[model()->End(vehicle)];
@@ -391,18 +435,24 @@ bool RoutingFilteredHeuristic::InitializeSolution() {
     if (!model()->IsEnd(node)) {
       int64_t next = starts[model()->End(vehicle)];
       SetValue(node, next);
+      if (HasSecondaryVars()) {
+        SetValue(SecondaryVarIndex(node), vehicle);
+      }
       SetVehicleIndex(node, vehicle);
       node = next;
       while (!model()->IsEnd(node)) {
         next = Var(node)->Min();
         SetValue(node, next);
+        if (HasSecondaryVars()) {
+          SetValue(SecondaryVarIndex(node), vehicle);
+        }
         SetVehicleIndex(node, vehicle);
         node = next;
       }
     }
   }
 
-  if (!Commit()) {
+  if (!Evaluate(/*commit=*/true).has_value()) {
     ResetVehicleIndices();
     return false;
   }
@@ -419,9 +469,13 @@ void RoutingFilteredHeuristic::MakeDisjunctionNodesUnperformed(int64_t node) {
 }
 
 void RoutingFilteredHeuristic::MakeUnassignedNodesUnperformed() {
-  for (int index = 0; index < Size(); ++index) {
+  for (int index = 0; index < model_->Size(); ++index) {
+    DCHECK(!IsSecondaryVar(index));
     if (!Contains(index)) {
       SetValue(index, index);
+      if (HasSecondaryVars()) {
+        SetValue(SecondaryVarIndex(index), -1);
+      }
     }
   }
 }
@@ -472,13 +526,15 @@ CheapestInsertionFilteredHeuristic::CheapestInsertionFilteredHeuristic(
     std::function<int64_t(int64_t, int64_t, int64_t)> evaluator,
     std::function<int64_t(int64_t)> penalty_evaluator,
     LocalSearchFilterManager* filter_manager)
-    : RoutingFilteredHeuristic(model, filter_manager),
+    : RoutingFilteredHeuristic(model, filter_manager,
+                               /*omit_secondary_vars=*/evaluator != nullptr),
       evaluator_(std::move(evaluator)),
       penalty_evaluator_(std::move(penalty_evaluator)) {}
 
 std::vector<std::vector<CheapestInsertionFilteredHeuristic::StartEndValue>>
 CheapestInsertionFilteredHeuristic::ComputeStartEndDistanceForVehicles(
     const std::vector<int>& vehicles) {
+  const absl::flat_hash_set<int> vehicle_set(vehicles.begin(), vehicles.end());
   std::vector<std::vector<StartEndValue>> start_end_distances_per_node(
       model()->Size());
 
@@ -486,8 +542,11 @@ CheapestInsertionFilteredHeuristic::ComputeStartEndDistanceForVehicles(
     if (Contains(node)) continue;
     std::vector<StartEndValue>& start_end_distances =
         start_end_distances_per_node[node];
+    const IntVar* const vehicle_var = model()->VehicleVar(node);
+    const int64_t num_allowed_vehicles = vehicle_var->Size();
 
-    for (const int vehicle : vehicles) {
+    const auto add_distance = [this, node, num_allowed_vehicles,
+                               &start_end_distances](int vehicle) {
       const int64_t start = model()->Start(vehicle);
       const int64_t end = model()->End(vehicle);
 
@@ -495,7 +554,23 @@ CheapestInsertionFilteredHeuristic::ComputeStartEndDistanceForVehicles(
       const int64_t distance =
           CapAdd(model()->GetArcCostForVehicle(start, node, vehicle),
                  model()->GetArcCostForVehicle(node, end, vehicle));
-      start_end_distances.push_back({distance, vehicle});
+      start_end_distances.push_back({num_allowed_vehicles, distance, vehicle});
+    };
+    // Iterating over an IntVar domain is faster than calling Contains.
+    // Therefore we iterate on 'vehicles' only if it's smaller than the domain
+    // size of the VehicleVar.
+    if (num_allowed_vehicles < vehicles.size()) {
+      std::unique_ptr<IntVarIterator> it(
+          vehicle_var->MakeDomainIterator(false));
+      for (const int64_t vehicle : InitAndGetValues(it.get())) {
+        if (vehicle < 0 || !vehicle_set.contains(vehicle)) continue;
+        add_distance(vehicle);
+      }
+    } else {
+      for (const int vehicle : vehicles) {
+        if (!vehicle_var->Contains(vehicle)) continue;
+        add_distance(vehicle);
+      }
     }
     // Sort the distances for the node to all start/ends of available vehicles
     // in decreasing order.
@@ -530,24 +605,38 @@ void CheapestInsertionFilteredHeuristic::InitializePriorityQueue(
 
 void CheapestInsertionFilteredHeuristic::InsertBetween(int64_t node,
                                                        int64_t predecessor,
-                                                       int64_t successor) {
+                                                       int64_t successor,
+                                                       int vehicle) {
   SetValue(predecessor, node);
   SetValue(node, successor);
   MakeDisjunctionNodesUnperformed(node);
+  if (HasSecondaryVars() && vehicle != -1) {
+    SetValue(SecondaryVarIndex(predecessor), vehicle);
+    SetValue(SecondaryVarIndex(node), vehicle);
+    SetValue(SecondaryVarIndex(successor), vehicle);
+  }
 }
 
-void CheapestInsertionFilteredHeuristic::AppendEvaluatedPositionsAfter(
+void CheapestInsertionFilteredHeuristic::AppendInsertionPositionsAfter(
     int64_t node_to_insert, int64_t start, int64_t next_after_start,
-    int64_t vehicle, std::vector<ValuedPosition>* valued_positions) {
-  CHECK(valued_positions != nullptr);
+    int vehicle, std::vector<NodeInsertion>* node_insertions) {
+  DCHECK(node_insertions != nullptr);
   int64_t insert_after = start;
   while (!model()->IsEnd(insert_after)) {
     const int64_t insert_before =
         (insert_after == start) ? next_after_start : Value(insert_after);
-    valued_positions->push_back(std::make_pair(
-        GetInsertionCostForNodeAtPosition(node_to_insert, insert_after,
-                                          insert_before, vehicle),
-        insert_after));
+    if (evaluator_ == nullptr) {
+      InsertBetween(node_to_insert, insert_after, insert_before, vehicle);
+      std::optional<int64_t> insertion_cost = Evaluate(/*commit=*/false);
+      if (insertion_cost.has_value()) {
+        node_insertions->push_back({insert_after, vehicle, *insertion_cost});
+      }
+    } else {
+      node_insertions->push_back(
+          {insert_after, vehicle,
+           GetInsertionCostForNodeAtPosition(node_to_insert, insert_after,
+                                             insert_before, vehicle)});
+    }
     insert_after = insert_before;
   }
 }
@@ -555,6 +644,7 @@ void CheapestInsertionFilteredHeuristic::AppendEvaluatedPositionsAfter(
 int64_t CheapestInsertionFilteredHeuristic::GetInsertionCostForNodeAtPosition(
     int64_t node_to_insert, int64_t insert_after, int64_t insert_before,
     int vehicle) const {
+  DCHECK(evaluator_ != nullptr);
   return CapSub(CapAdd(evaluator_(insert_after, node_to_insert, vehicle),
                        evaluator_(node_to_insert, insert_before, vehicle)),
                 evaluator_(insert_after, insert_before, vehicle));
@@ -588,18 +678,24 @@ void SortAndExtractPairSeconds(std::vector<std::pair<int64_t, T>>* pairs,
 class GlobalCheapestInsertionFilteredHeuristic::PairEntry {
  public:
   PairEntry(int pickup_to_insert, int pickup_insert_after,
-            int delivery_to_insert, int delivery_insert_after, int vehicle)
-      : heap_index_(-1),
-        value_(std::numeric_limits<int64_t>::max()),
+            int delivery_to_insert, int delivery_insert_after, int vehicle,
+            int64_t bucket)
+      : value_(std::numeric_limits<int64_t>::max()),
+        heap_index_(-1),
         pickup_to_insert_(pickup_to_insert),
         pickup_insert_after_(pickup_insert_after),
         delivery_to_insert_(delivery_to_insert),
         delivery_insert_after_(delivery_insert_after),
-        vehicle_(vehicle) {}
+        vehicle_(vehicle),
+        bucket_(bucket) {}
   // Note: for compatibility reasons, comparator follows tie-breaking rules used
   // in the first version of GlobalCheapestInsertion.
   bool operator<(const PairEntry& other) const {
-    // We first compare by value, then we favor insertions (vehicle != -1).
+    // We give higher priority to insertions from lower buckets.
+    if (bucket_ != other.bucket_) {
+      return bucket_ > other.bucket_;
+    }
+    // We then compare by value, then we favor insertions (vehicle != -1).
     // The rest of the tie-breaking is done with std::tie.
     if (value_ != other.value_) {
       return value_ > other.value_;
@@ -615,7 +711,6 @@ class GlobalCheapestInsertionFilteredHeuristic::PairEntry {
   }
   void SetHeapIndex(int h) { heap_index_ = h; }
   int GetHeapIndex() const { return heap_index_; }
-  int64_t value() const { return value_; }
   void set_value(int64_t value) { value_ = value; }
   int pickup_to_insert() const { return pickup_to_insert_; }
   int pickup_insert_after() const { return pickup_insert_after_; }
@@ -628,26 +723,31 @@ class GlobalCheapestInsertionFilteredHeuristic::PairEntry {
   void set_vehicle(int vehicle) { vehicle_ = vehicle; }
 
  private:
-  int heap_index_;
   int64_t value_;
+  int heap_index_;
   const int pickup_to_insert_;
   int pickup_insert_after_;
   const int delivery_to_insert_;
   const int delivery_insert_after_;
   int vehicle_;
+  const int64_t bucket_;
 };
 
 // Entry in priority queue containing the insertion position of a node.
 class GlobalCheapestInsertionFilteredHeuristic::NodeEntry {
  public:
-  NodeEntry(int node_to_insert, int insert_after, int vehicle)
-      : heap_index_(-1),
-        value_(std::numeric_limits<int64_t>::max()),
+  NodeEntry(int node_to_insert, int insert_after, int vehicle, int64_t bucket)
+      : value_(std::numeric_limits<int64_t>::max()),
+        heap_index_(-1),
         node_to_insert_(node_to_insert),
         insert_after_(insert_after),
-        vehicle_(vehicle) {}
+        vehicle_(vehicle),
+        bucket_(bucket) {}
   bool operator<(const NodeEntry& other) const {
     // See PairEntry::operator<(), above. This one is similar.
+    if (bucket_ != other.bucket_) {
+      return bucket_ > other.bucket_;
+    }
     if (value_ != other.value_) {
       return value_ > other.value_;
     }
@@ -659,7 +759,6 @@ class GlobalCheapestInsertionFilteredHeuristic::NodeEntry {
   }
   void SetHeapIndex(int h) { heap_index_ = h; }
   int GetHeapIndex() const { return heap_index_; }
-  int64_t value() const { return value_; }
   void set_value(int64_t value) { value_ = value; }
   int node_to_insert() const { return node_to_insert_; }
   int insert_after() const { return insert_after_; }
@@ -668,11 +767,12 @@ class GlobalCheapestInsertionFilteredHeuristic::NodeEntry {
   void set_vehicle(int vehicle) { vehicle_ = vehicle; }
 
  private:
-  int heap_index_;
   int64_t value_;
+  int heap_index_;
   const int node_to_insert_;
   int insert_after_;
   int vehicle_;
+  const int64_t bucket_;
 };
 
 // GlobalCheapestInsertionFilteredHeuristic
@@ -825,8 +925,9 @@ bool GlobalCheapestInsertionFilteredHeuristic::BuildSolutionInternal() {
   // Insert partially inserted pairs.
   const RoutingModel::IndexPairs& pickup_delivery_pairs =
       model()->GetPickupAndDeliveryPairs();
-  std::vector<int> pairs_to_insert;
-  absl::flat_hash_map<int, std::vector<int>> vehicle_to_pair_nodes;
+  std::map<int64_t, std::vector<int>> pairs_to_insert_by_bucket;
+  absl::flat_hash_map<int, std::map<int64_t, std::vector<int>>>
+      vehicle_to_pair_nodes;
   for (int index = 0; index < pickup_delivery_pairs.size(); index++) {
     const RoutingModel::IndexPair& index_pair = pickup_delivery_pairs[index];
     int pickup_vehicle = -1;
@@ -844,122 +945,161 @@ bool GlobalCheapestInsertionFilteredHeuristic::BuildSolutionInternal() {
       }
     }
     if (pickup_vehicle < 0 && delivery_vehicle < 0) {
-      pairs_to_insert.push_back(index);
+      pairs_to_insert_by_bucket[GetBucketOfPair(index_pair)].push_back(index);
     }
     if (pickup_vehicle >= 0 && delivery_vehicle < 0) {
-      std::vector<int>& pair_nodes = vehicle_to_pair_nodes[pickup_vehicle];
+      std::vector<int>& pair_nodes = vehicle_to_pair_nodes[pickup_vehicle][1];
       for (int64_t delivery : index_pair.second) {
         pair_nodes.push_back(delivery);
       }
     }
     if (pickup_vehicle < 0 && delivery_vehicle >= 0) {
-      std::vector<int>& pair_nodes = vehicle_to_pair_nodes[delivery_vehicle];
+      std::vector<int>& pair_nodes = vehicle_to_pair_nodes[delivery_vehicle][1];
       for (int64_t pickup : index_pair.first) {
         pair_nodes.push_back(pickup);
       }
     }
   }
-  for (const auto& vehicle_and_nodes : vehicle_to_pair_nodes) {
-    InsertNodesOnRoutes(vehicle_and_nodes.second, {vehicle_and_nodes.first});
+  for (const auto& [vehicle, nodes] : vehicle_to_pair_nodes) {
+    if (!InsertNodesOnRoutes(nodes, {vehicle})) return false;
   }
 
-  InsertPairsAndNodesByRequirementTopologicalOrder();
+  if (!InsertPairsAndNodesByRequirementTopologicalOrder()) return false;
 
   // TODO(user): Adapt the pair insertions to also support seed and
   // sequential insertion.
-  InsertPairs(pairs_to_insert);
-  std::vector<int> nodes;
+  if (!InsertPairs(pairs_to_insert_by_bucket)) return false;
+  std::map<int64_t, std::vector<int>> nodes_by_bucket;
   for (int node = 0; node < model()->Size(); ++node) {
     if (!Contains(node) && model()->GetPickupIndexPairs(node).empty() &&
         model()->GetDeliveryIndexPairs(node).empty()) {
-      nodes.push_back(node);
+      nodes_by_bucket[GetBucketOfNode(node)].push_back(node);
     }
   }
   InsertFarthestNodesAsSeeds();
   if (gci_params_.is_sequential) {
-    SequentialInsertNodes(nodes);
-  } else {
-    InsertNodesOnRoutes(nodes, {});
+    if (!SequentialInsertNodes(nodes_by_bucket)) return false;
+  } else if (!InsertNodesOnRoutes(nodes_by_bucket, {})) {
+    return false;
   }
   MakeUnassignedNodesUnperformed();
   DCHECK(CheckVehicleIndices());
-  return Commit();
+  return Evaluate(/*commit=*/true).has_value();
 }
 
-void GlobalCheapestInsertionFilteredHeuristic::
+bool GlobalCheapestInsertionFilteredHeuristic::
     InsertPairsAndNodesByRequirementTopologicalOrder() {
+  const RoutingModel::IndexPairs& pickup_delivery_pairs =
+      model()->GetPickupAndDeliveryPairs();
   for (const std::vector<int>& types :
        model()->GetTopologicallySortedVisitTypes()) {
     for (int type : types) {
-      InsertPairs(model()->GetPairIndicesOfType(type));
-      InsertNodesOnRoutes(model()->GetSingleNodesOfType(type), {});
+      std::map<int64_t, std::vector<int>> pairs_to_insert_by_bucket;
+      for (int index : model()->GetPairIndicesOfType(type)) {
+        pairs_to_insert_by_bucket[GetBucketOfPair(pickup_delivery_pairs[index])]
+            .push_back(index);
+      }
+      if (!InsertPairs(pairs_to_insert_by_bucket)) return false;
+      std::map<int64_t, std::vector<int>> nodes_by_bucket;
+      for (int node : model()->GetSingleNodesOfType(type)) {
+        nodes_by_bucket[GetBucketOfNode(node)].push_back(node);
+      }
+      if (!InsertNodesOnRoutes(nodes_by_bucket, {})) return false;
     }
   }
+  return true;
 }
 
-void GlobalCheapestInsertionFilteredHeuristic::InsertPairs(
-    const std::vector<int>& pair_indices) {
+bool GlobalCheapestInsertionFilteredHeuristic::InsertPairs(
+    const std::map<int64_t, std::vector<int>>& pair_indices_by_bucket) {
   AdjustablePriorityQueue<PairEntry> priority_queue;
   std::vector<PairEntries> pickup_to_entries;
   std::vector<PairEntries> delivery_to_entries;
-  InitializePairPositions(pair_indices, &priority_queue, &pickup_to_entries,
-                          &delivery_to_entries);
-  while (!priority_queue.IsEmpty()) {
-    if (StopSearch()) {
-      for (PairEntry* const entry : *priority_queue.Raw()) {
-        delete entry;
+  std::vector<int> pair_indices_to_insert;
+  for (const auto& [bucket, pair_indices] : pair_indices_by_bucket) {
+    pair_indices_to_insert.insert(pair_indices_to_insert.end(),
+                                  pair_indices.begin(), pair_indices.end());
+    if (!InitializePairPositions(pair_indices_to_insert, &priority_queue,
+                                 &pickup_to_entries, &delivery_to_entries)) {
+      return false;
+    }
+    while (!priority_queue.IsEmpty()) {
+      if (StopSearchAndCleanup(&priority_queue)) {
+        return false;
       }
-      return;
-    }
-    PairEntry* const entry = priority_queue.Top();
-    const int64_t pickup = entry->pickup_to_insert();
-    const int64_t delivery = entry->delivery_to_insert();
-    if (Contains(pickup) || Contains(delivery)) {
-      DeletePairEntry(entry, &priority_queue, &pickup_to_entries,
-                      &delivery_to_entries);
-      continue;
-    }
+      PairEntry* const entry = priority_queue.Top();
+      const int64_t pickup = entry->pickup_to_insert();
+      const int64_t delivery = entry->delivery_to_insert();
+      if (Contains(pickup) || Contains(delivery)) {
+        DeletePairEntry(entry, &priority_queue, &pickup_to_entries,
+                        &delivery_to_entries);
+        continue;
+      }
 
-    const int entry_vehicle = entry->vehicle();
-    if (entry_vehicle == -1) {
-      // Pair is unperformed.
-      SetValue(pickup, pickup);
-      SetValue(delivery, delivery);
-      if (!Commit()) {
+      const int entry_vehicle = entry->vehicle();
+      if (entry_vehicle == -1) {
+        // Pair is unperformed.
+        SetValue(pickup, pickup);
+        SetValue(delivery, delivery);
+        if (!Evaluate(/*commit=*/true).has_value()) {
+          DeletePairEntry(entry, &priority_queue, &pickup_to_entries,
+                          &delivery_to_entries);
+        }
+        continue;
+      }
+
+      // Pair is performed.
+      if (UseEmptyVehicleTypeCuratorForVehicle(entry_vehicle)) {
+        if (!InsertPairEntryUsingEmptyVehicleTypeCurator(
+                pair_indices_to_insert, entry, &priority_queue,
+                &pickup_to_entries, &delivery_to_entries)) {
+          return false;
+        }
+        // The entry corresponded to an insertion on an empty vehicle, which was
+        // handled by the call to InsertPairEntryUsingEmptyVehicleTypeCurator().
+        continue;
+      }
+
+      const int64_t pickup_insert_after = entry->pickup_insert_after();
+      const int64_t pickup_insert_before = Value(pickup_insert_after);
+      InsertBetween(pickup, pickup_insert_after, pickup_insert_before);
+
+      const int64_t delivery_insert_after = entry->delivery_insert_after();
+      const int64_t delivery_insert_before = (delivery_insert_after == pickup)
+                                                 ? pickup_insert_before
+                                                 : Value(delivery_insert_after);
+      InsertBetween(delivery, delivery_insert_after, delivery_insert_before);
+      if (Evaluate(/*commit=*/true).has_value()) {
+        if (!UpdateAfterPairInsertion(
+                pair_indices_to_insert, entry_vehicle, pickup,
+                pickup_insert_after, delivery, delivery_insert_after,
+                &priority_queue, &pickup_to_entries, &delivery_to_entries)) {
+          return false;
+        }
+      } else {
         DeletePairEntry(entry, &priority_queue, &pickup_to_entries,
                         &delivery_to_entries);
       }
-      continue;
     }
-
-    // Pair is performed.
-    if (InsertPairEntryUsingEmptyVehicleTypeCurator(
-            pair_indices, entry, &priority_queue, &pickup_to_entries,
-            &delivery_to_entries)) {
-      // The entry corresponded to an insertion on an empty vehicle, which was
-      // handled by the method.
-      continue;
-    }
-
-    const int64_t pickup_insert_after = entry->pickup_insert_after();
-    const int64_t pickup_insert_before = Value(pickup_insert_after);
-    InsertBetween(pickup, pickup_insert_after, pickup_insert_before);
-
-    const int64_t delivery_insert_after = entry->delivery_insert_after();
-    const int64_t delivery_insert_before = (delivery_insert_after == pickup)
-                                               ? pickup_insert_before
-                                               : Value(delivery_insert_after);
-    InsertBetween(delivery, delivery_insert_after, delivery_insert_before);
-    if (Commit()) {
-      UpdateAfterPairInsertion(pair_indices, entry_vehicle, pickup,
-                               pickup_insert_after, delivery,
-                               delivery_insert_after, &priority_queue,
-                               &pickup_to_entries, &delivery_to_entries);
-    } else {
-      DeletePairEntry(entry, &priority_queue, &pickup_to_entries,
-                      &delivery_to_entries);
-    }
+    // In case all pairs could not be inserted, pushing uninserted ones to the
+    // next bucket.
+    const RoutingModel::IndexPairs& pickup_delivery_pairs =
+        model()->GetPickupAndDeliveryPairs();
+    pair_indices_to_insert.erase(
+        std::remove_if(
+            pair_indices_to_insert.begin(), pair_indices_to_insert.end(),
+            [this, &pickup_delivery_pairs](int pair_index) {
+              // Checking a pickup has been inserted is enough to make sure the
+              // full pair has been inserted since a pickup cannot be inserted
+              // without its delivery (and vice versa).
+              for (int64_t pickup : pickup_delivery_pairs[pair_index].first) {
+                if (Contains(pickup)) return true;
+              }
+              return false;
+            }),
+        pair_indices_to_insert.end());
   }
+  return true;
 }
 
 bool GlobalCheapestInsertionFilteredHeuristic::
@@ -974,9 +1114,7 @@ bool GlobalCheapestInsertionFilteredHeuristic::
         std::vector<GlobalCheapestInsertionFilteredHeuristic::PairEntries>*
             delivery_to_entries) {
   const int entry_vehicle = pair_entry->vehicle();
-  if (entry_vehicle == -1 || !VehicleIsEmpty(entry_vehicle)) {
-    return false;
-  }
+  DCHECK(UseEmptyVehicleTypeCuratorForVehicle(entry_vehicle));
 
   // Trying to insert on an empty vehicle.
   // As we only have one pair_entry per empty vehicle type, we try inserting on
@@ -994,9 +1132,9 @@ bool GlobalCheapestInsertionFilteredHeuristic::
     // NOTE: Only empty vehicles should be in the vehicle_curator_.
     DCHECK(VehicleIsEmpty(vehicle));
     const int64_t end = model()->End(vehicle);
-    InsertBetween(pickup, model()->Start(vehicle), end);
-    InsertBetween(delivery, pickup, end);
-    return Commit();
+    InsertBetween(pickup, model()->Start(vehicle), end, vehicle);
+    InsertBetween(delivery, pickup, end, vehicle);
+    return Evaluate(/*commit=*/true).has_value();
   };
   // Since the vehicles of the same type are sorted by increasing fixed
   // cost by the curator, we can stop as soon as a vehicle with a fixed cost
@@ -1015,9 +1153,11 @@ bool GlobalCheapestInsertionFilteredHeuristic::
     const int num_previous_vehicle_entries =
         pickup_to_entries->at(vehicle_start).size() +
         delivery_to_entries->at(vehicle_start).size();
-    UpdateAfterPairInsertion(pair_indices, compatible_vehicle, pickup,
-                             vehicle_start, delivery, pickup, priority_queue,
-                             pickup_to_entries, delivery_to_entries);
+    if (!UpdateAfterPairInsertion(
+            pair_indices, compatible_vehicle, pickup, vehicle_start, delivery,
+            pickup, priority_queue, pickup_to_entries, delivery_to_entries)) {
+      return false;
+    }
     if (compatible_vehicle != entry_vehicle) {
       // The pair was inserted on another empty vehicle of the same type
       // and same fixed cost as entry_vehicle.
@@ -1064,65 +1204,85 @@ bool GlobalCheapestInsertionFilteredHeuristic::
   return true;
 }
 
-void GlobalCheapestInsertionFilteredHeuristic::InsertNodesOnRoutes(
-    const std::vector<int>& nodes, const absl::flat_hash_set<int>& vehicles) {
+bool GlobalCheapestInsertionFilteredHeuristic::InsertNodesOnRoutes(
+    const std::map<int64_t, std::vector<int>>& nodes_by_bucket,
+    const absl::flat_hash_set<int>& vehicles) {
   AdjustablePriorityQueue<NodeEntry> priority_queue;
   std::vector<NodeEntries> position_to_node_entries;
-  InitializePositions(nodes, vehicles, &priority_queue,
-                      &position_to_node_entries);
-  // The following boolean indicates whether or not all vehicles are being
-  // considered for insertion of the nodes simultaneously.
-  // In the sequential version of the heuristic, as well as when inserting
-  // single pickup or deliveries from pickup/delivery pairs, this will be false.
-  // In the general parallel version of the heuristic, all_vehicles is true.
-  const bool all_vehicles =
-      vehicles.empty() || vehicles.size() == model()->vehicles();
+  std::vector<int> nodes_to_insert;
+  for (const auto& [bucket, nodes] : nodes_by_bucket) {
+    nodes_to_insert.insert(nodes_to_insert.end(), nodes.begin(), nodes.end());
+    if (!InitializePositions(nodes_to_insert, vehicles, &priority_queue,
+                             &position_to_node_entries)) {
+      return false;
+    }
+    // The following boolean indicates whether or not all vehicles are being
+    // considered for insertion of the nodes simultaneously.
+    // In the sequential version of the heuristic, as well as when inserting
+    // single pickup or deliveries from pickup/delivery pairs, this will be
+    // false. In the general parallel version of the heuristic, all_vehicles is
+    // true.
+    const bool all_vehicles =
+        vehicles.empty() || vehicles.size() == model()->vehicles();
 
-  while (!priority_queue.IsEmpty()) {
-    NodeEntry* const node_entry = priority_queue.Top();
-    if (StopSearch()) {
-      for (NodeEntry* const entry : *priority_queue.Raw()) {
-        delete entry;
+    while (!priority_queue.IsEmpty()) {
+      NodeEntry* const node_entry = priority_queue.Top();
+      if (StopSearchAndCleanup(&priority_queue)) {
+        return false;
       }
-      return;
-    }
-    const int64_t node_to_insert = node_entry->node_to_insert();
-    if (Contains(node_to_insert)) {
-      DeleteNodeEntry(node_entry, &priority_queue, &position_to_node_entries);
-      continue;
-    }
+      const int64_t node_to_insert = node_entry->node_to_insert();
+      if (Contains(node_to_insert)) {
+        DeleteNodeEntry(node_entry, &priority_queue, &position_to_node_entries);
+        continue;
+      }
 
-    const int entry_vehicle = node_entry->vehicle();
-    if (entry_vehicle == -1) {
-      DCHECK(all_vehicles);
-      // Make node unperformed.
-      SetValue(node_to_insert, node_to_insert);
-      if (!Commit()) {
+      const int entry_vehicle = node_entry->vehicle();
+      if (entry_vehicle == -1) {
+        DCHECK(all_vehicles);
+        // Make node unperformed.
+        SetValue(node_to_insert, node_to_insert);
+        if (!Evaluate(/*commit=*/true).has_value()) {
+          DeleteNodeEntry(node_entry, &priority_queue,
+                          &position_to_node_entries);
+        }
+        continue;
+      }
+
+      // Make node performed.
+      if (UseEmptyVehicleTypeCuratorForVehicle(entry_vehicle, all_vehicles)) {
+        DCHECK(all_vehicles);
+        if (!InsertNodeEntryUsingEmptyVehicleTypeCurator(
+                nodes_to_insert, all_vehicles, node_entry, &priority_queue,
+                &position_to_node_entries)) {
+          return false;
+        }
+        continue;
+      }
+
+      const int64_t insert_after = node_entry->insert_after();
+      InsertBetween(node_to_insert, insert_after, Value(insert_after));
+      if (Evaluate(/*commit=*/true).has_value()) {
+        if (!UpdatePositions(nodes_to_insert, entry_vehicle, node_to_insert,
+                             all_vehicles, &priority_queue,
+                             &position_to_node_entries) ||
+            !UpdatePositions(nodes_to_insert, entry_vehicle, insert_after,
+                             all_vehicles, &priority_queue,
+                             &position_to_node_entries)) {
+          return false;
+        }
+        SetVehicleIndex(node_to_insert, entry_vehicle);
+      } else {
         DeleteNodeEntry(node_entry, &priority_queue, &position_to_node_entries);
       }
-      continue;
     }
-
-    // Make node performed.
-    if (InsertNodeEntryUsingEmptyVehicleTypeCurator(
-            nodes, all_vehicles, node_entry, &priority_queue,
-            &position_to_node_entries)) {
-      DCHECK(all_vehicles);
-      continue;
-    }
-
-    const int64_t insert_after = node_entry->insert_after();
-    InsertBetween(node_to_insert, insert_after, Value(insert_after));
-    if (Commit()) {
-      UpdatePositions(nodes, entry_vehicle, node_to_insert, all_vehicles,
-                      &priority_queue, &position_to_node_entries);
-      UpdatePositions(nodes, entry_vehicle, insert_after, all_vehicles,
-                      &priority_queue, &position_to_node_entries);
-      SetVehicleIndex(node_to_insert, entry_vehicle);
-    } else {
-      DeleteNodeEntry(node_entry, &priority_queue, &position_to_node_entries);
-    }
+    // In case all nodes could not be inserted, pushing uninserted ones to the
+    // next bucket.
+    nodes_to_insert.erase(
+        std::remove_if(nodes_to_insert.begin(), nodes_to_insert.end(),
+                       [this](int node) { return Contains(node); }),
+        nodes_to_insert.end());
   }
+  return true;
 }
 
 bool GlobalCheapestInsertionFilteredHeuristic::
@@ -1135,9 +1295,7 @@ bool GlobalCheapestInsertionFilteredHeuristic::
         std::vector<GlobalCheapestInsertionFilteredHeuristic::NodeEntries>*
             position_to_node_entries) {
   const int entry_vehicle = node_entry->vehicle();
-  if (entry_vehicle == -1 || !all_vehicles || !VehicleIsEmpty(entry_vehicle)) {
-    return false;
-  }
+  DCHECK(UseEmptyVehicleTypeCuratorForVehicle(entry_vehicle, all_vehicles));
 
   // Trying to insert on an empty vehicle, and all vehicles are being
   // considered simultaneously.
@@ -1155,8 +1313,8 @@ bool GlobalCheapestInsertionFilteredHeuristic::
     // NOTE: Only empty vehicles should be in the vehicle_curator_.
     DCHECK(VehicleIsEmpty(vehicle));
     InsertBetween(node_to_insert, model()->Start(vehicle),
-                  model()->End(vehicle));
-    return Commit();
+                  model()->End(vehicle), vehicle);
+    return Evaluate(/*commit=*/true).has_value();
   };
   // Since the vehicles of the same type are sorted by increasing fixed
   // cost by the curator, we can stop as soon as an empty vehicle with a fixed
@@ -1171,13 +1329,19 @@ bool GlobalCheapestInsertionFilteredHeuristic::
           vehicle_is_compatible, stop_and_return_vehicle);
   if (compatible_vehicle >= 0) {
     // The node was inserted on this vehicle.
-    UpdatePositions(nodes, compatible_vehicle, node_to_insert, all_vehicles,
-                    priority_queue, position_to_node_entries);
+    if (!UpdatePositions(nodes, compatible_vehicle, node_to_insert,
+                         all_vehicles, priority_queue,
+                         position_to_node_entries)) {
+      return false;
+    }
     const int64_t compatible_start = model()->Start(compatible_vehicle);
     const bool no_prior_entries_for_this_vehicle =
         position_to_node_entries->at(compatible_start).empty();
-    UpdatePositions(nodes, compatible_vehicle, compatible_start, all_vehicles,
-                    priority_queue, position_to_node_entries);
+    if (!UpdatePositions(nodes, compatible_vehicle, compatible_start,
+                         all_vehicles, priority_queue,
+                         position_to_node_entries)) {
+      return false;
+    }
     SetVehicleIndex(node_to_insert, compatible_vehicle);
     if (compatible_vehicle != entry_vehicle) {
       // The node was inserted on another empty vehicle of the same type
@@ -1199,9 +1363,11 @@ bool GlobalCheapestInsertionFilteredHeuristic::
       DCHECK(VehicleIsEmpty(new_empty_vehicle));
       // Add node entries after this vehicle start for uninserted nodes which
       // don't have entries on this empty vehicle.
-      UpdatePositions(nodes, new_empty_vehicle,
-                      model()->Start(new_empty_vehicle), all_vehicles,
-                      priority_queue, position_to_node_entries);
+      if (!UpdatePositions(nodes, new_empty_vehicle,
+                           model()->Start(new_empty_vehicle), all_vehicles,
+                           priority_queue, position_to_node_entries)) {
+        return false;
+      }
     }
   } else if (next_fixed_cost_empty_vehicle >= 0) {
     // Could not insert on this vehicle or any other vehicle of the same
@@ -1222,15 +1388,16 @@ bool GlobalCheapestInsertionFilteredHeuristic::
   return true;
 }
 
-void GlobalCheapestInsertionFilteredHeuristic::SequentialInsertNodes(
-    const std::vector<int>& nodes) {
+bool GlobalCheapestInsertionFilteredHeuristic::SequentialInsertNodes(
+    const std::map<int64_t, std::vector<int>>& nodes_by_bucket) {
   std::vector<bool> is_vehicle_used;
   absl::flat_hash_set<int> used_vehicles;
   std::vector<int> unused_vehicles;
 
   DetectUsedVehicles(&is_vehicle_used, &unused_vehicles, &used_vehicles);
-  if (!used_vehicles.empty()) {
-    InsertNodesOnRoutes(nodes, used_vehicles);
+  if (!used_vehicles.empty() &&
+      !InsertNodesOnRoutes(nodes_by_bucket, used_vehicles)) {
+    return false;
   }
 
   std::vector<std::vector<StartEndValue>> start_end_distances_per_node =
@@ -1243,10 +1410,13 @@ void GlobalCheapestInsertionFilteredHeuristic::SequentialInsertNodes(
                                &is_vehicle_used);
 
   while (vehicle >= 0) {
-    InsertNodesOnRoutes(nodes, {vehicle});
+    if (!InsertNodesOnRoutes(nodes_by_bucket, {vehicle})) {
+      return false;
+    }
     vehicle = InsertSeedNode(&start_end_distances_per_node, &first_node_queue,
                              &is_vehicle_used);
   }
+  return true;
 }
 
 void GlobalCheapestInsertionFilteredHeuristic::DetectUsedVehicles(
@@ -1291,10 +1461,11 @@ void GlobalCheapestInsertionFilteredHeuristic::InsertFarthestNodesAsSeeds() {
   InitializePriorityQueue(&start_end_distances_per_node, &farthest_node_queue);
 
   int inserted_seeds = 0;
-  while (!farthest_node_queue.empty() && inserted_seeds < num_seeds) {
-    InsertSeedNode(&start_end_distances_per_node, &farthest_node_queue,
-                   &is_vehicle_used);
-    inserted_seeds++;
+  while (inserted_seeds++ < num_seeds) {
+    if (InsertSeedNode(&start_end_distances_per_node, &farthest_node_queue,
+                       &is_vehicle_used) < 0) {
+      break;
+    }
   }
 
   // NOTE: As we don't use the empty_vehicle_type_curator_ when inserting seed
@@ -1311,7 +1482,7 @@ int GlobalCheapestInsertionFilteredHeuristic::InsertSeedNode(
     std::vector<std::vector<StartEndValue>>* start_end_distances_per_node,
     Queue* priority_queue, std::vector<bool>* is_vehicle_used) {
   while (!priority_queue->empty()) {
-    if (StopSearch()) break;
+    if (StopSearch()) return -1;
     const Seed& seed = priority_queue->top();
 
     const int seed_node = seed.second;
@@ -1332,8 +1503,8 @@ int GlobalCheapestInsertionFilteredHeuristic::InsertSeedNode(
       const int64_t start = model()->Start(seed_vehicle);
       const int64_t end = model()->End(seed_vehicle);
       DCHECK_EQ(Value(start), end);
-      InsertBetween(seed_node, start, end);
-      if (Commit()) {
+      InsertBetween(seed_node, start, end, seed_vehicle);
+      if (Evaluate(/*commit=*/true).has_value()) {
         priority_queue->pop();
         (*is_vehicle_used)[seed_vehicle] = true;
         other_start_end_values.clear();
@@ -1356,7 +1527,7 @@ int GlobalCheapestInsertionFilteredHeuristic::InsertSeedNode(
   return -1;
 }
 
-void GlobalCheapestInsertionFilteredHeuristic::InitializePairPositions(
+bool GlobalCheapestInsertionFilteredHeuristic::InitializePairPositions(
     const std::vector<int>& pair_indices,
     AdjustablePriorityQueue<
         GlobalCheapestInsertionFilteredHeuristic::PairEntry>* priority_queue,
@@ -1377,6 +1548,7 @@ void GlobalCheapestInsertionFilteredHeuristic::InitializePairPositions(
       if (Contains(pickup)) continue;
       for (int64_t delivery : index_pair.second) {
         if (Contains(delivery)) continue;
+        if (StopSearchAndCleanup(priority_queue)) return false;
         // Add insertion entry making pair unperformed. When the pair is part
         // of a disjunction we do not try to make any of its pairs unperformed
         // as it requires having an entry with all pairs being unperformed.
@@ -1397,6 +1569,7 @@ void GlobalCheapestInsertionFilteredHeuristic::InitializePairPositions(
       }
     }
   }
+  return true;
 }
 
 void GlobalCheapestInsertionFilteredHeuristic::
@@ -1410,8 +1583,12 @@ void GlobalCheapestInsertionFilteredHeuristic::
         std::vector<GlobalCheapestInsertionFilteredHeuristic::PairEntries>*
             delivery_to_entries) {
   if (!gci_params_.use_neighbors_ratio_for_initialization) {
-    std::vector<std::pair<std::pair<int64_t, int>, std::pair<int64_t, int64_t>>>
-        valued_positions;
+    struct PairInsertion {
+      int64_t insert_pickup_after;
+      int64_t insert_delivery_after;
+      int vehicle;
+    };
+    std::vector<PairInsertion> pair_insertions;
     for (int vehicle = 0; vehicle < model()->vehicles(); ++vehicle) {
       if (VehicleIsEmpty(vehicle) &&
           empty_vehicle_type_curator_->GetLowestFixedCostVehicleOfType(
@@ -1421,32 +1598,29 @@ void GlobalCheapestInsertionFilteredHeuristic::
         continue;
       }
       const int64_t start = model()->Start(vehicle);
-      std::vector<ValuedPosition> valued_pickup_positions;
-      AppendEvaluatedPositionsAfter(pickup, start, Value(start), vehicle,
-                                    &valued_pickup_positions);
-      for (const ValuedPosition& valued_pickup_position :
-           valued_pickup_positions) {
-        const int64_t pickup_position = valued_pickup_position.second;
-        CHECK(!model()->IsEnd(pickup_position));
-        std::vector<ValuedPosition> valued_delivery_positions;
-        AppendEvaluatedPositionsAfter(delivery, pickup, Value(pickup_position),
-                                      vehicle, &valued_delivery_positions);
-        for (const ValuedPosition& valued_delivery_position :
-             valued_delivery_positions) {
-          valued_positions.push_back(std::make_pair(
-              std::make_pair(CapAdd(valued_pickup_position.first,
-                                    valued_delivery_position.first),
-                             vehicle),
-              std::make_pair(pickup_position,
-                             valued_delivery_position.second)));
+      std::vector<NodeInsertion> pickup_insertions;
+      AppendInsertionPositionsAfter(pickup, start, Value(start), vehicle,
+                                    &pickup_insertions);
+      for (const auto [insert_pickup_after, pickup_vehicle,
+                       unused_pickup_value] : pickup_insertions) {
+        CHECK(!model()->IsEnd(insert_pickup_after));
+        std::vector<NodeInsertion> delivery_insertions;
+        AppendInsertionPositionsAfter(delivery, pickup,
+                                      Value(insert_pickup_after), vehicle,
+                                      &delivery_insertions);
+        for (const auto [insert_delivery_after, delivery_vehicle,
+                         unused_delivery_value] : delivery_insertions) {
+          pair_insertions.push_back(
+              {insert_pickup_after, insert_delivery_after, vehicle});
         }
       }
     }
-    for (const auto& [cost_for_vehicle, pair_positions] : valued_positions) {
-      DCHECK_NE(pair_positions.first, pair_positions.second);
-      AddPairEntry(pickup, pair_positions.first, delivery,
-                   pair_positions.second, cost_for_vehicle.second,
-                   priority_queue, pickup_to_entries, delivery_to_entries);
+    for (const auto& [insert_pickup_after, insert_delivery_after, vehicle] :
+         pair_insertions) {
+      DCHECK_NE(insert_pickup_after, insert_delivery_after);
+      AddPairEntry(pickup, insert_pickup_after, delivery, insert_delivery_after,
+                   vehicle, priority_queue, pickup_to_entries,
+                   delivery_to_entries);
     }
     return;
   }
@@ -1481,8 +1655,7 @@ void GlobalCheapestInsertionFilteredHeuristic::
       while (!model()->IsEnd(delivery_insert_after)) {
         const std::pair<int64_t, int64_t> insertion_position = {
             pickup_insert_after, delivery_insert_after};
-        DCHECK(!gtl::ContainsKey(existing_insertion_positions,
-                                 insertion_position));
+        DCHECK(!existing_insertion_positions.contains(insertion_position));
         existing_insertion_positions.insert(insertion_position);
 
         AddPairEntry(pickup, pickup_insert_after, delivery,
@@ -1513,8 +1686,7 @@ void GlobalCheapestInsertionFilteredHeuristic::
 
       int64_t pickup_insert_after = model()->Start(vehicle);
       while (pickup_insert_after != delivery_insert_after) {
-        if (!gtl::ContainsKey(
-                existing_insertion_positions,
+        if (!existing_insertion_positions.contains(
                 std::make_pair(pickup_insert_after, delivery_insert_after))) {
           AddPairEntry(pickup, pickup_insert_after, delivery,
                        delivery_insert_after, vehicle, priority_queue,
@@ -1526,27 +1698,33 @@ void GlobalCheapestInsertionFilteredHeuristic::
   }
 }
 
-void GlobalCheapestInsertionFilteredHeuristic::UpdateAfterPairInsertion(
+bool GlobalCheapestInsertionFilteredHeuristic::UpdateAfterPairInsertion(
     const std::vector<int>& pair_indices, int vehicle, int64_t pickup,
     int64_t pickup_position, int64_t delivery, int64_t delivery_position,
     AdjustablePriorityQueue<PairEntry>* priority_queue,
     std::vector<PairEntries>* pickup_to_entries,
     std::vector<PairEntries>* delivery_to_entries) {
-  UpdatePairPositions(pair_indices, vehicle, pickup_position, priority_queue,
-                      pickup_to_entries, delivery_to_entries);
-  UpdatePairPositions(pair_indices, vehicle, pickup, priority_queue,
-                      pickup_to_entries, delivery_to_entries);
-  UpdatePairPositions(pair_indices, vehicle, delivery, priority_queue,
-                      pickup_to_entries, delivery_to_entries);
-  if (delivery_position != pickup) {
-    UpdatePairPositions(pair_indices, vehicle, delivery_position,
-                        priority_queue, pickup_to_entries, delivery_to_entries);
+  if (!UpdatePairPositions(pair_indices, vehicle, pickup_position,
+                           priority_queue, pickup_to_entries,
+                           delivery_to_entries) ||
+      !UpdatePairPositions(pair_indices, vehicle, pickup, priority_queue,
+                           pickup_to_entries, delivery_to_entries) ||
+      !UpdatePairPositions(pair_indices, vehicle, delivery, priority_queue,
+                           pickup_to_entries, delivery_to_entries)) {
+    return false;
+  }
+  if (delivery_position != pickup &&
+      !UpdatePairPositions(pair_indices, vehicle, delivery_position,
+                           priority_queue, pickup_to_entries,
+                           delivery_to_entries)) {
+    return false;
   }
   SetVehicleIndex(pickup, vehicle);
   SetVehicleIndex(delivery, vehicle);
+  return true;
 }
 
-void GlobalCheapestInsertionFilteredHeuristic::UpdatePickupPositions(
+bool GlobalCheapestInsertionFilteredHeuristic::UpdatePickupPositions(
     const std::vector<int>& pair_indices, int vehicle,
     int64_t pickup_insert_after,
     AdjustablePriorityQueue<
@@ -1588,6 +1766,7 @@ void GlobalCheapestInsertionFilteredHeuristic::UpdatePickupPositions(
   const RoutingModel::IndexPairs& pickup_delivery_pairs =
       model()->GetPickupAndDeliveryPairs();
   for (int pair_index : pair_indices) {
+    if (StopSearchAndCleanup(priority_queue)) return false;
     const RoutingModel::IndexPair& index_pair =
         pickup_delivery_pairs[pair_index];
     for (int64_t pickup : index_pair.first) {
@@ -1603,7 +1782,7 @@ void GlobalCheapestInsertionFilteredHeuristic::UpdatePickupPositions(
         while (!model()->IsEnd(delivery_insert_after)) {
           const Insertion insertion = {{pickup, delivery},
                                        delivery_insert_after};
-          if (!gtl::ContainsKey(existing_insertions, insertion)) {
+          if (!existing_insertions.contains(insertion)) {
             AddPairEntry(pickup, pickup_insert_after, delivery,
                          delivery_insert_after, vehicle, priority_queue,
                          pickup_to_entries, delivery_to_entries);
@@ -1617,9 +1796,10 @@ void GlobalCheapestInsertionFilteredHeuristic::UpdatePickupPositions(
       }
     }
   }
+  return true;
 }
 
-void GlobalCheapestInsertionFilteredHeuristic::UpdateDeliveryPositions(
+bool GlobalCheapestInsertionFilteredHeuristic::UpdateDeliveryPositions(
     const std::vector<int>& pair_indices, int vehicle,
     int64_t delivery_insert_after,
     AdjustablePriorityQueue<
@@ -1660,6 +1840,7 @@ void GlobalCheapestInsertionFilteredHeuristic::UpdateDeliveryPositions(
   const RoutingModel::IndexPairs& pickup_delivery_pairs =
       model()->GetPickupAndDeliveryPairs();
   for (int pair_index : pair_indices) {
+    if (StopSearchAndCleanup(priority_queue)) return false;
     const RoutingModel::IndexPair& index_pair =
         pickup_delivery_pairs[pair_index];
     for (int64_t delivery : index_pair.second) {
@@ -1675,7 +1856,7 @@ void GlobalCheapestInsertionFilteredHeuristic::UpdateDeliveryPositions(
         int64_t pickup_insert_after = model()->Start(vehicle);
         while (pickup_insert_after != delivery_insert_after) {
           const Insertion insertion = {{pickup, delivery}, pickup_insert_after};
-          if (!gtl::ContainsKey(existing_insertions, insertion)) {
+          if (!existing_insertions.contains(insertion)) {
             AddPairEntry(pickup, pickup_insert_after, delivery,
                          delivery_insert_after, vehicle, priority_queue,
                          pickup_to_entries, delivery_to_entries);
@@ -1685,6 +1866,7 @@ void GlobalCheapestInsertionFilteredHeuristic::UpdateDeliveryPositions(
       }
     }
   }
+  return true;
 }
 
 void GlobalCheapestInsertionFilteredHeuristic::DeletePairEntry(
@@ -1712,10 +1894,31 @@ void GlobalCheapestInsertionFilteredHeuristic::AddPairEntry(
         pickup_entries,
     std::vector<GlobalCheapestInsertionFilteredHeuristic::PairEntries>*
         delivery_entries) const {
+  const IntVar* pickup_vehicle_var = model()->VehicleVar(pickup);
+  const IntVar* delivery_vehicle_var = model()->VehicleVar(delivery);
+  if (!pickup_vehicle_var->Contains(vehicle) ||
+      !delivery_vehicle_var->Contains(vehicle)) {
+    if (vehicle == -1 || !VehicleIsEmpty(vehicle)) return;
+    // We need to check there is not an equivalent empty vehicle the pair
+    // could fit on.
+    const auto vehicle_is_compatible = [pickup_vehicle_var,
+                                        delivery_vehicle_var](int vehicle) {
+      return pickup_vehicle_var->Contains(vehicle) &&
+             delivery_vehicle_var->Contains(vehicle);
+    };
+    if (!empty_vehicle_type_curator_->HasCompatibleVehicleOfType(
+            empty_vehicle_type_curator_->Type(vehicle),
+            vehicle_is_compatible)) {
+      return;
+    }
+  }
+  const int num_allowed_vehicles =
+      std::min(pickup_vehicle_var->Size(), delivery_vehicle_var->Size());
   if (pickup_insert_after == -1) {
     DCHECK_EQ(delivery_insert_after, -1);
     DCHECK_EQ(vehicle, -1);
-    PairEntry* pair_entry = new PairEntry(pickup, -1, delivery, -1, -1);
+    PairEntry* pair_entry =
+        new PairEntry(pickup, -1, delivery, -1, -1, num_allowed_vehicles);
     pair_entry->set_value(
         absl::GetFlag(FLAGS_routing_shift_insertion_cost_by_penalty)
             ? 0
@@ -1725,8 +1928,9 @@ void GlobalCheapestInsertionFilteredHeuristic::AddPairEntry(
     return;
   }
 
-  PairEntry* const pair_entry = new PairEntry(
-      pickup, pickup_insert_after, delivery, delivery_insert_after, vehicle);
+  PairEntry* const pair_entry =
+      new PairEntry(pickup, pickup_insert_after, delivery,
+                    delivery_insert_after, vehicle, num_allowed_vehicles);
   pair_entry->set_value(GetInsertionValueForPairAtPositions(
       pickup, pickup_insert_after, delivery, delivery_insert_after, vehicle));
 
@@ -1775,7 +1979,7 @@ GlobalCheapestInsertionFilteredHeuristic::GetInsertionValueForPairAtPositions(
   return CapSub(CapAdd(pickup_value, delivery_value), penalty_shift);
 }
 
-void GlobalCheapestInsertionFilteredHeuristic::InitializePositions(
+bool GlobalCheapestInsertionFilteredHeuristic::InitializePositions(
     const std::vector<int>& nodes, const absl::flat_hash_set<int>& vehicles,
     AdjustablePriorityQueue<
         GlobalCheapestInsertionFilteredHeuristic::NodeEntry>* priority_queue,
@@ -1793,6 +1997,7 @@ void GlobalCheapestInsertionFilteredHeuristic::InitializePositions(
     if (Contains(node)) {
       continue;
     }
+    if (StopSearchAndCleanup(priority_queue)) return false;
     // Add insertion entry making node unperformed.
     if (gci_params_.add_unperformed_entries &&
         GetUnperformedValue(node) != std::numeric_limits<int64_t>::max()) {
@@ -1802,6 +2007,7 @@ void GlobalCheapestInsertionFilteredHeuristic::InitializePositions(
     InitializeInsertionEntriesPerformingNode(node, vehicles, priority_queue,
                                              position_to_node_entries);
   }
+  return true;
 }
 
 void GlobalCheapestInsertionFilteredHeuristic::
@@ -1829,13 +2035,13 @@ void GlobalCheapestInsertionFilteredHeuristic::
         // entries.
         continue;
       }
-      std::vector<ValuedPosition> valued_positions;
-      AppendEvaluatedPositionsAfter(node, start, Value(start), vehicle,
-                                    &valued_positions);
-      for (const std::pair<int64_t, int64_t>& valued_position :
-           valued_positions) {
-        AddNodeEntry(node, valued_position.second, vehicle, all_vehicles,
-                     priority_queue, position_to_node_entries);
+      std::vector<NodeInsertion> insertions;
+      AppendInsertionPositionsAfter(node, start, Value(start), vehicle,
+                                    &insertions);
+      for (const auto [insert_after, insertion_vehicle, value] : insertions) {
+        DCHECK_EQ(insertion_vehicle, vehicle);
+        AddNodeEntry(node, insert_after, vehicle, all_vehicles, priority_queue,
+                     position_to_node_entries);
       }
     }
     return;
@@ -1873,7 +2079,7 @@ void GlobalCheapestInsertionFilteredHeuristic::
   }
 }
 
-void GlobalCheapestInsertionFilteredHeuristic::UpdatePositions(
+bool GlobalCheapestInsertionFilteredHeuristic::UpdatePositions(
     const std::vector<int>& nodes, int vehicle, int64_t insert_after,
     bool all_vehicles,
     AdjustablePriorityQueue<
@@ -1899,6 +2105,7 @@ void GlobalCheapestInsertionFilteredHeuristic::UpdatePositions(
   }
   const int cost_class = model()->GetCostClassIndexOfVehicle(vehicle).value();
   for (int node_to_insert : nodes) {
+    if (StopSearchAndCleanup(priority_queue)) return false;
     if (!Contains(node_to_insert) &&
         !existing_insertions.contains(node_to_insert) &&
         IsNeighborForCostClass(cost_class, insert_after, node_to_insert)) {
@@ -1906,6 +2113,7 @@ void GlobalCheapestInsertionFilteredHeuristic::UpdatePositions(
                    priority_queue, node_entries);
     }
   }
+  return true;
 }
 
 void GlobalCheapestInsertionFilteredHeuristic::DeleteNodeEntry(
@@ -1929,6 +2137,21 @@ void GlobalCheapestInsertionFilteredHeuristic::AddNodeEntry(
       absl::GetFlag(FLAGS_routing_shift_insertion_cost_by_penalty)
           ? node_penalty
           : 0;
+  const IntVar* const vehicle_var = model()->VehicleVar(node);
+  if (!vehicle_var->Contains(vehicle)) {
+    if (vehicle == -1 || !VehicleIsEmpty(vehicle)) return;
+    // We need to check there is not an equivalent empty vehicle the node
+    // could fit on.
+    const auto vehicle_is_compatible = [vehicle_var](int vehicle) {
+      return vehicle_var->Contains(vehicle);
+    };
+    if (!empty_vehicle_type_curator_->HasCompatibleVehicleOfType(
+            empty_vehicle_type_curator_->Type(vehicle),
+            vehicle_is_compatible)) {
+      return;
+    }
+  }
+  const int num_allowed_vehicles = vehicle_var->Size();
   if (insert_after == -1) {
     DCHECK_EQ(vehicle, -1);
     if (!all_vehicles) {
@@ -1937,7 +2160,8 @@ void GlobalCheapestInsertionFilteredHeuristic::AddNodeEntry(
       // unperformed.
       return;
     }
-    NodeEntry* const node_entry = new NodeEntry(node, -1, -1);
+    NodeEntry* const node_entry =
+        new NodeEntry(node, -1, -1, num_allowed_vehicles);
     node_entry->set_value(CapSub(node_penalty, penalty_shift));
     priority_queue->Add(node_entry);
     return;
@@ -1952,7 +2176,8 @@ void GlobalCheapestInsertionFilteredHeuristic::AddNodeEntry(
     return;
   }
 
-  NodeEntry* const node_entry = new NodeEntry(node, insert_after, vehicle);
+  NodeEntry* const node_entry =
+      new NodeEntry(node, insert_after, vehicle, num_allowed_vehicles);
   node_entry->set_value(CapSub(insertion_cost, penalty_shift));
   // Add entry to priority_queue and node_entries.
   DCHECK(!priority_queue->Contains(node_entry));
@@ -1985,9 +2210,14 @@ LocalCheapestInsertionFilteredHeuristic::
     LocalCheapestInsertionFilteredHeuristic(
         RoutingModel* model,
         std::function<int64_t(int64_t, int64_t, int64_t)> evaluator,
+        bool evaluate_pickup_delivery_costs_independently,
         LocalSearchFilterManager* filter_manager)
     : CheapestInsertionFilteredHeuristic(model, std::move(evaluator), nullptr,
-                                         filter_manager) {
+                                         filter_manager),
+      evaluate_pickup_delivery_costs_independently_(
+          evaluate_pickup_delivery_costs_independently) {
+  DCHECK(evaluator_ != nullptr ||
+         !evaluate_pickup_delivery_costs_independently_);
   std::vector<int> all_vehicles(model->vehicles());
   std::iota(std::begin(all_vehicles), std::end(all_vehicles), 0);
 
@@ -1998,51 +2228,89 @@ LocalCheapestInsertionFilteredHeuristic::
 bool LocalCheapestInsertionFilteredHeuristic::BuildSolutionInternal() {
   // Marking if we've tried inserting a node.
   std::vector<bool> visited(model()->Size(), false);
-  // Possible positions where the current node can inserted.
-  std::vector<int64_t> insertion_positions;
-  // Possible positions where its associated delivery node can inserted (if the
-  // current node has one).
-  std::vector<int64_t> delivery_insertion_positions;
   // Iterating on pickup and delivery pairs
   const RoutingModel::IndexPairs& index_pairs =
       model()->GetPickupAndDeliveryPairs();
-  for (const auto& index_pair : index_pairs) {
+  // Sort pairs according to number of possible vehicles.
+  struct PairDomainSize {
+    uint64_t domain_size;
+    int pair_index;
+
+    bool operator<(const PairDomainSize& other) const {
+      return std::tie(domain_size, pair_index) <
+             std::tie(other.domain_size, other.pair_index);
+    }
+  };
+  std::vector<PairDomainSize> pair_domain_sizes;
+  for (int pair_index = 0; pair_index < index_pairs.size(); ++pair_index) {
+    uint64_t domain_size = std::numeric_limits<uint64_t>::max();
+    for (int64_t pickup : index_pairs[pair_index].first) {
+      domain_size = std::min(domain_size, model()->VehicleVar(pickup)->Size());
+    }
+    for (int64_t delivery : index_pairs[pair_index].second) {
+      domain_size =
+          std::min(domain_size, model()->VehicleVar(delivery)->Size());
+    }
+    pair_domain_sizes.push_back({domain_size, pair_index});
+  }
+  std::sort(pair_domain_sizes.begin(), pair_domain_sizes.end());
+  const auto insert_pair = [this](int64_t pickup, int64_t insert_pickup_after,
+                                  int64_t delivery,
+                                  int64_t insert_delivery_after, int vehicle) {
+    const int64_t insert_pickup_before = Value(insert_pickup_after);
+    InsertBetween(pickup, insert_pickup_after, insert_pickup_before, vehicle);
+    DCHECK_NE(insert_delivery_after, insert_pickup_after);
+    const int64_t insert_delivery_before = (insert_delivery_after == pickup)
+                                               ? insert_pickup_before
+                                               : Value(insert_delivery_after);
+    InsertBetween(delivery, insert_delivery_after, insert_delivery_before,
+                  vehicle);
+    return Evaluate(/*commit=*/true).has_value();
+  };
+  for (const auto [unused_domain_size, pair_index] : pair_domain_sizes) {
+    const auto& index_pair = index_pairs[pair_index];
+    bool pair_inserted = false;
     for (int64_t pickup : index_pair.first) {
-      if (Contains(pickup)) {
-        continue;
-      }
+      if (pair_inserted || Contains(pickup)) break;
+      std::vector<NodeInsertion> pickup_insertion_positions;
       for (int64_t delivery : index_pair.second) {
         // If either is already in the solution, let it be inserted in the
         // standard node insertion loop.
-        if (Contains(delivery)) {
-          continue;
-        }
+        if (Contains(delivery)) pair_inserted = true;
+        if (pair_inserted) break;
         if (StopSearch()) return false;
         visited[pickup] = true;
         visited[delivery] = true;
-        ComputeEvaluatorSortedPositions(pickup, &insertion_positions);
-        for (const int64_t pickup_insertion : insertion_positions) {
-          const int pickup_insertion_next = Value(pickup_insertion);
-          ComputeEvaluatorSortedPositionsOnRouteAfter(
-              delivery, pickup, pickup_insertion_next,
-              &delivery_insertion_positions);
-          bool found = false;
-          for (const int64_t delivery_insertion :
-               delivery_insertion_positions) {
-            InsertBetween(pickup, pickup_insertion, pickup_insertion_next);
-            const int64_t delivery_insertion_next =
-                (delivery_insertion == pickup_insertion) ? pickup
-                : (delivery_insertion == pickup)         ? pickup_insertion_next
-                                                 : Value(delivery_insertion);
-            InsertBetween(delivery, delivery_insertion,
-                          delivery_insertion_next);
-            if (Commit()) {
-              found = true;
+        if (evaluate_pickup_delivery_costs_independently_) {
+          // Lazily fetching pickup insertion positions.
+          if (pickup_insertion_positions.empty()) {
+            pickup_insertion_positions =
+                ComputeEvaluatorSortedPositions(pickup);
+          }
+          for (const auto [insert_pickup_after, pickup_vehicle,
+                           unused_pickup_value] : pickup_insertion_positions) {
+            for (const auto [insert_delivery_after, unused_delivery_vehicle,
+                             unused_delivery_value] :
+                 ComputeEvaluatorSortedPositionsOnRouteAfter(
+                     delivery, pickup, Value(insert_pickup_after),
+                     pickup_vehicle)) {
+              if (insert_pair(pickup, insert_pickup_after, delivery,
+                              insert_delivery_after, pickup_vehicle)) {
+                pair_inserted = true;
+                break;
+              }
+            }
+            if (pair_inserted) break;
+          }
+        } else {
+          for (const auto [insert_pickup_after, insert_delivery_after,
+                           unused_value, vehicle] :
+               ComputeEvaluatorSortedPairPositions(pickup, delivery)) {
+            if (insert_pair(pickup, insert_pickup_after, delivery,
+                            insert_delivery_after, vehicle)) {
+              pair_inserted = true;
               break;
             }
-          }
-          if (found) {
-            break;
           }
         }
       }
@@ -2052,55 +2320,103 @@ bool LocalCheapestInsertionFilteredHeuristic::BuildSolutionInternal() {
   std::priority_queue<Seed> node_queue;
   InitializePriorityQueue(&start_end_distances_per_node_, &node_queue);
 
+  // Possible positions where the current node can be inserted.
   while (!node_queue.empty()) {
     const int node = node_queue.top().second;
     node_queue.pop();
     if (Contains(node) || visited[node]) continue;
-    ComputeEvaluatorSortedPositions(node, &insertion_positions);
-    for (const int64_t insertion : insertion_positions) {
+    for (const auto [insert_after, vehicle, unused_value] :
+         ComputeEvaluatorSortedPositions(node)) {
       if (StopSearch()) return false;
-      InsertBetween(node, insertion, Value(insertion));
-      if (Commit()) {
+      InsertBetween(node, insert_after, Value(insert_after), vehicle);
+      if (Evaluate(/*commit=*/true).has_value()) {
         break;
       }
     }
   }
   MakeUnassignedNodesUnperformed();
-  return Commit();
+  return Evaluate(/*commit=*/true).has_value();
 }
 
-void LocalCheapestInsertionFilteredHeuristic::ComputeEvaluatorSortedPositions(
-    int64_t node, std::vector<int64_t>* sorted_positions) {
-  CHECK(sorted_positions != nullptr);
-  CHECK(!Contains(node));
-  sorted_positions->clear();
+std::vector<LocalCheapestInsertionFilteredHeuristic::NodeInsertion>
+LocalCheapestInsertionFilteredHeuristic::ComputeEvaluatorSortedPositions(
+    int64_t node) {
+  DCHECK(!Contains(node));
+  std::vector<NodeInsertion> sorted_insertions;
   const int size = model()->Size();
   if (node < size) {
-    std::vector<std::pair<int64_t, int64_t>> valued_positions;
     for (int vehicle = 0; vehicle < model()->vehicles(); ++vehicle) {
       const int64_t start = model()->Start(vehicle);
-      AppendEvaluatedPositionsAfter(node, start, Value(start), vehicle,
-                                    &valued_positions);
+      AppendInsertionPositionsAfter(node, start, Value(start), vehicle,
+                                    &sorted_insertions);
     }
-    SortAndExtractPairSeconds(&valued_positions, sorted_positions);
+    std::sort(sorted_insertions.begin(), sorted_insertions.end());
   }
+  return sorted_insertions;
 }
 
-void LocalCheapestInsertionFilteredHeuristic::
-    ComputeEvaluatorSortedPositionsOnRouteAfter(
-        int64_t node, int64_t start, int64_t next_after_start,
-        std::vector<int64_t>* sorted_positions) {
-  CHECK(sorted_positions != nullptr);
-  CHECK(!Contains(node));
-  sorted_positions->clear();
+std::vector<LocalCheapestInsertionFilteredHeuristic::NodeInsertion>
+LocalCheapestInsertionFilteredHeuristic::
+    ComputeEvaluatorSortedPositionsOnRouteAfter(int64_t node, int64_t start,
+                                                int64_t next_after_start,
+                                                int vehicle) {
+  DCHECK(!Contains(node));
+  std::vector<NodeInsertion> sorted_insertions;
   const int size = model()->Size();
   if (node < size) {
-    // TODO(user): Take vehicle into account.
-    std::vector<std::pair<int64_t, int64_t>> valued_positions;
-    AppendEvaluatedPositionsAfter(node, start, next_after_start, 0,
-                                  &valued_positions);
-    SortAndExtractPairSeconds(&valued_positions, sorted_positions);
+    AppendInsertionPositionsAfter(node, start, next_after_start, vehicle,
+                                  &sorted_insertions);
+    std::sort(sorted_insertions.begin(), sorted_insertions.end());
   }
+  return sorted_insertions;
+}
+
+std::vector<LocalCheapestInsertionFilteredHeuristic::PickupDeliveryInsertion>
+LocalCheapestInsertionFilteredHeuristic::ComputeEvaluatorSortedPairPositions(
+    int64_t pickup, int64_t delivery) {
+  std::vector<PickupDeliveryInsertion> sorted_pickup_delivery_insertions;
+  const int size = model()->Size();
+  DCHECK_LT(pickup, size);
+  DCHECK_LT(delivery, size);
+  for (int vehicle = 0; vehicle < model()->vehicles(); ++vehicle) {
+    int64_t insert_pickup_after = model()->Start(vehicle);
+    while (!model()->IsEnd(insert_pickup_after)) {
+      const int64_t insert_pickup_before = Value(insert_pickup_after);
+      int64_t insert_delivery_after = pickup;
+      while (!model()->IsEnd(insert_delivery_after)) {
+        const int64_t insert_delivery_before =
+            insert_delivery_after == pickup ? insert_pickup_before
+                                            : Value(insert_delivery_after);
+        if (evaluator_ == nullptr) {
+          InsertBetween(pickup, insert_pickup_after, insert_pickup_before,
+                        vehicle);
+          InsertBetween(delivery, insert_delivery_after, insert_delivery_before,
+                        vehicle);
+          std::optional<int64_t> insertion_cost = Evaluate(/*commit=*/false);
+          if (insertion_cost.has_value()) {
+            sorted_pickup_delivery_insertions.push_back(
+                {insert_pickup_after, insert_delivery_after, *insertion_cost,
+                 vehicle});
+          }
+        } else {
+          sorted_pickup_delivery_insertions.push_back(
+              {insert_pickup_after, insert_delivery_after,
+               CapAdd(GetInsertionCostForNodeAtPosition(
+                          pickup, insert_pickup_after, insert_pickup_before,
+                          vehicle),
+                      GetInsertionCostForNodeAtPosition(
+                          delivery, insert_delivery_after,
+                          insert_delivery_before, vehicle)),
+               vehicle});
+        }
+        insert_delivery_after = insert_delivery_before;
+      }
+      insert_pickup_after = insert_pickup_before;
+    }
+  }
+  std::sort(sorted_pickup_delivery_insertions.begin(),
+            sorted_pickup_delivery_insertions.end());
+  return sorted_pickup_delivery_insertions;
 }
 
 // CheapestAdditionFilteredHeuristic
@@ -2218,7 +2534,7 @@ bool CheapestAdditionFilteredHeuristic::BuildSolutionInternal() {
                 MakeDisjunctionNodesUnperformed(delivery);
               }
             }
-            if (Commit()) {
+            if (Evaluate(/*commit=*/true).has_value()) {
               index = next;
               found = true;
               if (delivery != kUnassigned) {
@@ -2236,7 +2552,7 @@ bool CheapestAdditionFilteredHeuristic::BuildSolutionInternal() {
     }
   }
   MakeUnassignedNodesUnperformed();
-  return Commit();
+  return Evaluate(/*commit=*/true).has_value();
 }
 
 bool CheapestAdditionFilteredHeuristic::
@@ -2374,8 +2690,8 @@ class SavingsFilteredHeuristic::SavingsContainer {
   explicit SavingsContainer(const SavingsFilteredHeuristic* savings_db,
                             int vehicle_types)
       : savings_db_(savings_db),
-        vehicle_types_(vehicle_types),
         index_in_sorted_savings_(0),
+        vehicle_types_(vehicle_types),
         single_vehicle_type_(vehicle_types == 1),
         using_incoming_reinjected_saving_(false),
         sorted_(false),
@@ -2725,7 +3041,6 @@ class SavingsFilteredHeuristic::SavingsContainer {
   }
 
   const SavingsFilteredHeuristic* const savings_db_;
-  const int vehicle_types_;
   int64_t index_in_sorted_savings_;
   std::vector<std::vector<Saving>> sorted_savings_per_vehicle_type_;
   std::vector<SavingAndArc> sorted_savings_;
@@ -2733,7 +3048,6 @@ class SavingsFilteredHeuristic::SavingsContainer {
   std::vector<std::pair</*type*/ int, /*index*/ int>>
       next_saving_type_and_index_for_arc_;
   SavingAndArc current_saving_;
-  const bool single_vehicle_type_;
   std::vector<std::vector<std::pair</*cost*/ int64_t, Saving>>>
       costs_and_savings_per_arc_;
   std::vector<absl::flat_hash_map</*after_node*/ int, /*arc_index*/ int>>
@@ -2742,9 +3056,11 @@ class SavingsFilteredHeuristic::SavingsContainer {
   std::vector<std::deque<SavingAndArc>> skipped_savings_ending_at_;
   std::deque<SavingAndArc>* outgoing_reinjected_savings_;
   std::deque<SavingAndArc>* incoming_reinjected_savings_;
-  bool using_incoming_reinjected_saving_;
   std::deque<SavingAndArc>* outgoing_new_reinjected_savings_;
   std::deque<SavingAndArc>* incoming_new_reinjected_savings_;
+  const int vehicle_types_;
+  const bool single_vehicle_type_;
+  bool using_incoming_reinjected_saving_;
   bool sorted_;
   bool to_update_;
 };
@@ -2752,11 +3068,10 @@ class SavingsFilteredHeuristic::SavingsContainer {
 // SavingsFilteredHeuristic
 
 SavingsFilteredHeuristic::SavingsFilteredHeuristic(
-    RoutingModel* model, const RoutingIndexManager* manager,
-    SavingsParameters parameters, LocalSearchFilterManager* filter_manager)
+    RoutingModel* model, SavingsParameters parameters,
+    LocalSearchFilterManager* filter_manager)
     : RoutingFilteredHeuristic(model, filter_manager),
       vehicle_type_curator_(nullptr),
-      manager_(manager),
       savings_params_(parameters) {
   DCHECK_GT(savings_params_.neighbors_ratio, 0);
   DCHECK_LE(savings_params_.neighbors_ratio, 1);
@@ -2781,9 +3096,9 @@ bool SavingsFilteredHeuristic::BuildSolutionInternal() {
   // Free all the space used to store the Savings in the container.
   savings_container_.reset();
   MakeUnassignedNodesUnperformed();
-  if (!Commit()) return false;
+  if (!Evaluate(/*commit=*/true).has_value()) return false;
   MakePartiallyPerformedPairsUnperformed();
-  return Commit();
+  return Evaluate(/*commit=*/true).has_value();
 }
 
 int SavingsFilteredHeuristic::StartNewRouteWithBestVehicleOfType(
@@ -2800,7 +3115,7 @@ int SavingsFilteredHeuristic::StartNewRouteWithBestVehicleOfType(
     SetValue(start, before_node);
     SetValue(before_node, after_node);
     SetValue(after_node, end);
-    return Commit();
+    return Evaluate(/*commit=*/true).has_value();
   };
 
   return vehicle_type_curator_
@@ -3079,7 +3394,7 @@ void SequentialSavingsFilteredHeuristic::BuildRoutesFromSavings() {
             if (!Contains(after_after_node)) {
               SetValue(after_node, after_after_node);
               SetValue(after_after_node, end);
-              if (Commit()) {
+              if (Evaluate(/*commit=*/true).has_value()) {
                 in_index = 0;
                 after_node = after_after_node;
               } else {
@@ -3094,7 +3409,7 @@ void SequentialSavingsFilteredHeuristic::BuildRoutesFromSavings() {
             if (!Contains(before_before_node)) {
               SetValue(start, before_before_node);
               SetValue(before_before_node, before_node);
-              if (Commit()) {
+              if (Evaluate(/*commit=*/true).has_value()) {
                 out_index = 0;
                 before_node = before_before_node;
               } else {
@@ -3215,7 +3530,7 @@ void ParallelSavingsFilteredHeuristic::BuildRoutesFromSavings() {
         // Try adding after_node on route of before_node.
         SetValue(before_node, after_node);
         SetValue(after_node, end);
-        if (Commit()) {
+        if (Evaluate(/*commit=*/true).has_value()) {
           if (first_node_on_route_[vehicle] != before_node) {
             // before_node is no longer the start or end of its route
             DCHECK_NE(Value(model()->Start(vehicle)), before_node);
@@ -3248,7 +3563,7 @@ void ParallelSavingsFilteredHeuristic::BuildRoutesFromSavings() {
         // Try adding before_node on route of after_node.
         SetValue(before_node, after_node);
         SetValue(start, before_node);
-        if (Commit()) {
+        if (Evaluate(/*commit=*/true).has_value()) {
           if (last_node_on_route_[vehicle] != after_node) {
             // after_node is no longer the start or end of its route
             DCHECK_NE(Value(after_node), model()->End(vehicle));
@@ -3292,7 +3607,7 @@ void ParallelSavingsFilteredHeuristic::MergeRoutes(int first_vehicle,
   } else {
     SetValue(model()->Start(used_vehicle), new_first_node);
   }
-  bool committed = Commit();
+  bool committed = Evaluate(/*commit=*/true).has_value();
   if (!committed &&
       model()->GetVehicleClassIndexOfVehicle(first_vehicle).value() !=
           model()->GetVehicleClassIndexOfVehicle(second_vehicle).value()) {
@@ -3305,7 +3620,7 @@ void ParallelSavingsFilteredHeuristic::MergeRoutes(int first_vehicle,
     } else {
       SetValue(model()->Start(used_vehicle), new_first_node);
     }
-    committed = Commit();
+    committed = Evaluate(/*commit=*/true).has_value();
   }
   if (committed) {
     // Make unused_vehicle available
@@ -3402,14 +3717,14 @@ bool ChristofidesFilteredHeuristic::BuildSolutionInternal() {
       if (!Contains(next)) {
         SetValue(prev, next);
         SetValue(next, end);
-        if (Commit()) {
+        if (Evaluate(/*commit=*/true).has_value()) {
           prev = next;
         }
       }
     }
   }
   MakeUnassignedNodesUnperformed();
-  return Commit();
+  return Evaluate(/*commit=*/true).has_value();
 }
 
 // Sweep heuristic
@@ -3601,13 +3916,13 @@ class RouteConstructor {
     // linear and that given we managed to build a solution would be stupid to
     // drop it now.
     for (int chain_index = 0; chain_index < chains_.size(); ++chain_index) {
-      if (!gtl::ContainsKey(deleted_chains_, chain_index)) {
+      if (!deleted_chains_.contains(chain_index)) {
         final_chains_.push_back(chains_[chain_index]);
       }
     }
     std::sort(final_chains_.begin(), final_chains_.end(), ChainComparator);
     for (int route_index = 0; route_index < routes_.size(); ++route_index) {
-      if (!gtl::ContainsKey(deleted_routes_, route_index)) {
+      if (!deleted_routes_.contains(route_index)) {
         final_routes_.push_back(routes_[route_index]);
       }
     }
@@ -3664,10 +3979,6 @@ class RouteConstructor {
         }
       }
     }
-  }
-
-  const std::vector<std::vector<int>>& final_routes() const {
-    return final_routes_;
   }
 
  private:
@@ -3778,7 +4089,7 @@ class RouteConstructor {
     feasible_route =
         FeasibleRoute(route2, new_available_cumul_head2, dimension_index);
     const int64_t new_possible_cumul_tail2 =
-        gtl::ContainsKey(new_possible_cumuls_[dimension_index], tail2)
+        new_possible_cumuls_[dimension_index].contains(tail2)
             ? new_possible_cumuls_[dimension_index][tail2]
             : cumuls_[dimension_index][tail2];
 
@@ -3841,7 +4152,7 @@ class RouteConstructor {
     for (int chain_index = 0; chain_index < chains_.size(); ++chain_index) {
       if ((chain_index != new_chain_index) &&
           (chain_index != old_chain_index) &&
-          (!gtl::ContainsKey(deleted_chains_, chain_index))) {
+          (!deleted_chains_.contains(chain_index))) {
         const int start = chains_[chain_index].head;
         const int end = chains_[chain_index].tail;
         temp_assignment->Add(model_->NextVar(model_->Start(chain_index)));

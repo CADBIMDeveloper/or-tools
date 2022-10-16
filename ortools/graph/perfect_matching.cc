@@ -13,8 +13,11 @@
 
 #include "ortools/graph/perfect_matching.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <string>
+#include <utility>
 
 #include "absl/memory/memory.h"
 #include "ortools/util/saturated_arithmetic.h"
@@ -772,7 +775,7 @@ void BlossomGraph::Shrink(EdgeIndex e) {
           continue;
         }
 
-        // This is a new-internal edge that we didn't proccess yet.
+        // This is a new-internal edge that we didn't process yet.
         //
         // TODO(user): It would be nicer to not to have to read the memory of
         // the other node at all. It might be possible once we store the

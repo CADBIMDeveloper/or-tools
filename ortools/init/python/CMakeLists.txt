@@ -3,16 +3,14 @@ set_property(SOURCE init.i PROPERTY SWIG_MODULE_NAME pywrapinit)
 set_property(SOURCE init.i PROPERTY COMPILE_DEFINITIONS
   ${OR_TOOLS_COMPILE_DEFINITIONS} ABSL_MUST_USE_RESULT)
 swig_add_library(pywrapinit
-  TYPE SHARED
+  TYPE MODULE
   LANGUAGE python
-  OUTPUT_DIR  ${PROJECT_BINARY_DIR}/python/${PROJECT_NAME}/init
+  OUTPUT_DIR  ${PYTHON_PROJECT_DIR}/init
   SOURCES init.i)
 
-target_include_directories(pywrapinit PRIVATE ${Python_INCLUDE_DIRS})
+target_include_directories(pywrapinit PRIVATE ${Python3_INCLUDE_DIRS})
 set_property(TARGET pywrapinit PROPERTY SWIG_USE_TARGET_INCLUDE_DIRECTORIES ON)
-if(Python_VERSION VERSION_GREATER_EQUAL 3)
-  target_compile_definitions(pywrapinit PUBLIC "PY3")
-endif()
+target_compile_definitions(pywrapinit PUBLIC "PY3")
 
 # note: macOS is APPLE and also UNIX !
 if(APPLE)
@@ -32,5 +30,5 @@ target_link_libraries(pywrapinit PRIVATE ortools::ortools)
 # i.e. we can't use: $<$<PLATFORM_ID:Windows>:${PYTHON_LIBRARIES}>
 # see: https://cmake.org/cmake/help/git-stage/command/target_link_libraries.html#command:target_link_libraries
 if(MSVC)
-  target_link_libraries(pywrapinit PRIVATE ${Python_LIBRARIES})
+  target_link_libraries(pywrapinit PRIVATE ${Python3_LIBRARIES})
 endif()

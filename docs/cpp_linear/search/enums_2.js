@@ -1,4 +1,5 @@
 var searchData=
 [
-  ['generalconstraintcase_1678',['GeneralConstraintCase',['../classoperations__research_1_1_p_r_o_t_o_b_u_f___f_i_n_a_l.html#a62ad97ce87eebedbf02689673fdd7ba8',1,'operations_research::PROTOBUF_FINAL']]]
+  ['incrementalityvalues_0',['IncrementalityValues',['../classoperations__research_1_1_m_p_solver_parameters.html#a215b66c2ff063ffbf5b538ee402304cb',1,'operations_research::MPSolverParameters']]],
+  ['integerparam_1',['IntegerParam',['../classoperations__research_1_1_m_p_solver_parameters.html#a7319655592ea63d50ef2a6645e309784',1,'operations_research::MPSolverParameters']]]
 ];

@@ -344,27 +344,22 @@ class DecrementValue : public ChangeValue {
 
 PathOperator::PathOperator(const std::vector<IntVar*>& next_vars,
                            const std::vector<IntVar*>& path_vars,
-                           int number_of_base_nodes,
-                           bool skip_locally_optimal_paths,
-                           bool accept_path_end_base,
-                           std::function<int(int64_t)> start_empty_path_class)
+                           IterationParameters iteration_parameters)
     : IntVarLocalSearchOperator(next_vars, true),
       number_of_nexts_(next_vars.size()),
       ignore_path_vars_(path_vars.empty()),
-      next_base_to_increment_(number_of_base_nodes),
-      base_nodes_(number_of_base_nodes),
-      base_alternatives_(number_of_base_nodes),
-      base_sibling_alternatives_(number_of_base_nodes),
-      end_nodes_(number_of_base_nodes),
-      base_paths_(number_of_base_nodes),
+      next_base_to_increment_(iteration_parameters.number_of_base_nodes),
+      base_nodes_(iteration_parameters.number_of_base_nodes),
+      base_alternatives_(iteration_parameters.number_of_base_nodes),
+      base_sibling_alternatives_(iteration_parameters.number_of_base_nodes),
+      end_nodes_(iteration_parameters.number_of_base_nodes),
+      base_paths_(iteration_parameters.number_of_base_nodes),
       just_started_(false),
       first_start_(true),
-      accept_path_end_base_(accept_path_end_base),
-      start_empty_path_class_(std::move(start_empty_path_class)),
-      skip_locally_optimal_paths_(skip_locally_optimal_paths),
+      iteration_parameters_(std::move(iteration_parameters)),
       optimal_paths_enabled_(false),
       alternative_index_(next_vars.size(), -1) {
-  DCHECK_GT(number_of_base_nodes, 0);
+  DCHECK_GT(iteration_parameters_.number_of_base_nodes, 0);
   if (!ignore_path_vars_) {
     AddVars(path_vars);
   }
@@ -377,7 +372,7 @@ PathOperator::PathOperator(const std::vector<IntVar*>& next_vars,
                                   ->solver()
                                   ->parameters()
                                   .skip_locally_optimal_paths())) {
-    skip_locally_optimal_paths_ = false;
+    iteration_parameters_.skip_locally_optimal_paths = false;
   }
 }
 
@@ -494,7 +489,7 @@ bool PathOperator::SwapActiveAndInactive(int64_t active, int64_t inactive) {
 }
 
 bool PathOperator::IncrementPosition() {
-  const int base_node_size = base_nodes_.size();
+  const int base_node_size = iteration_parameters_.number_of_base_nodes;
 
   if (!just_started_) {
     const int number_of_paths = path_starts_.size();
@@ -533,7 +528,9 @@ bool PathOperator::IncrementPosition() {
         base_alternatives_[i] = 0;
         base_sibling_alternatives_[i] = 0;
         base_nodes_[i] = OldNext(base_nodes_[i]);
-        if (accept_path_end_base_ || !IsPathEnd(base_nodes_[i])) break;
+        if (iteration_parameters_.accept_path_end_base ||
+            !IsPathEnd(base_nodes_[i]))
+          break;
       }
       base_alternatives_[i] = 0;
       base_sibling_alternatives_[i] = 0;
@@ -561,7 +558,8 @@ bool PathOperator::IncrementPosition() {
     // If all base nodes have been restarted, base nodes are moved to new paths.
     // First we mark the current paths as locally optimal if they have been
     // completely explored.
-    if (optimal_paths_enabled_ && skip_locally_optimal_paths_) {
+    if (optimal_paths_enabled_ &&
+        iteration_parameters_.skip_locally_optimal_paths) {
       if (path_basis_.size() > 1) {
         for (int i = 1; i < path_basis_.size(); ++i) {
           optimal_paths_[num_paths_ *
@@ -598,7 +596,7 @@ bool PathOperator::IncrementPosition() {
           base_nodes_[i] = path_starts_[0];
         }
       }
-      if (!skip_locally_optimal_paths_) return CheckEnds();
+      if (!iteration_parameters_.skip_locally_optimal_paths) return CheckEnds();
       // If the new paths have already been completely explored, we can
       // skip them from now on.
       if (path_basis_.size() > 1) {
@@ -648,7 +646,8 @@ void PathOperator::InitializePathStarts() {
     max_next = std::max(max_next, next);
   }
   // Update locally optimal paths.
-  if (optimal_paths_.empty() && skip_locally_optimal_paths_) {
+  if (optimal_paths_.empty() &&
+      iteration_parameters_.skip_locally_optimal_paths) {
     num_paths_ = 0;
     start_to_path_.clear();
     start_to_path_.resize(number_of_nexts_, -1);
@@ -660,7 +659,7 @@ void PathOperator::InitializePathStarts() {
     }
     optimal_paths_.resize(num_paths_ * num_paths_, false);
   }
-  if (skip_locally_optimal_paths_) {
+  if (iteration_parameters_.skip_locally_optimal_paths) {
     for (int i = 0; i < number_of_nexts_; ++i) {
       if (!has_prevs[i]) {
         int current = i;
@@ -686,9 +685,10 @@ void PathOperator::InitializePathStarts() {
   for (int i = 0; i < number_of_nexts_; ++i) {
     if (!has_prevs[i]) {
       if (use_empty_path_symmetry_breaker && IsPathEnd(OldNext(i))) {
-        if (start_empty_path_class_ != nullptr) {
-          if (empty_found[start_empty_path_class_(i)]) continue;
-          empty_found[start_empty_path_class_(i)] = true;
+        if (iteration_parameters_.start_empty_path_class != nullptr) {
+          if (empty_found[iteration_parameters_.start_empty_path_class(i)])
+            continue;
+          empty_found[iteration_parameters_.start_empty_path_class(i)] = true;
         }
       }
       new_path_starts.push_back(i);
@@ -708,7 +708,7 @@ void PathOperator::InitializePathStarts() {
       }
       node_paths[node] = i;
     }
-    for (int j = 0; j < base_nodes_.size(); ++j) {
+    for (int j = 0; j < iteration_parameters_.number_of_base_nodes; ++j) {
       // Always restart from first alternative.
       base_alternatives_[j] = 0;
       base_sibling_alternatives_[j] = 0;
@@ -737,8 +737,8 @@ void PathOperator::InitializePathStarts() {
       if (found) {
         new_index = index;
       }
-      for (int j = 0; j < base_nodes_.size(); ++j) {
-        if (base_paths_[j] == i && !gtl::ContainsKey(found_bases, j)) {
+      for (int j = 0; j < iteration_parameters_.number_of_base_nodes; ++j) {
+        if (base_paths_[j] == i && !found_bases.contains(j)) {
           found_bases.insert(j);
           base_paths_[j] = new_index;
           // If the current position of the base node is a removed empty path,
@@ -767,13 +767,13 @@ void PathOperator::InitializeBaseNodes() {
   if (first_start_ || InitPosition()) {
     // Only do this once since the following starts will continue from the
     // preceding position
-    for (int i = 0; i < base_nodes_.size(); ++i) {
+    for (int i = 0; i < iteration_parameters_.number_of_base_nodes; ++i) {
       base_paths_[i] = 0;
       base_nodes_[i] = path_starts_[0];
     }
     first_start_ = false;
   }
-  for (int i = 0; i < base_nodes_.size(); ++i) {
+  for (int i = 0; i < iteration_parameters_.number_of_base_nodes; ++i) {
     // If base node has been made inactive, restart from path start.
     int64_t base_node = base_nodes_[i];
     if (RestartAtPathStartOnSynchronize() || IsInactive(base_node)) {
@@ -784,7 +784,7 @@ void PathOperator::InitializeBaseNodes() {
   }
   // Repair end_nodes_ in case some must be on the same path and are not anymore
   // (due to other operators moving these nodes).
-  for (int i = 1; i < base_nodes_.size(); ++i) {
+  for (int i = 1; i < iteration_parameters_.number_of_base_nodes; ++i) {
     if (OnSamePathAsPreviousBase(i) &&
         !OnSamePath(base_nodes_[i - 1], base_nodes_[i])) {
       const int64_t base_node = base_nodes_[i - 1];
@@ -793,7 +793,7 @@ void PathOperator::InitializeBaseNodes() {
       base_paths_[i] = base_paths_[i - 1];
     }
   }
-  for (int i = 0; i < base_nodes_.size(); ++i) {
+  for (int i = 0; i < iteration_parameters_.number_of_base_nodes; ++i) {
     base_alternatives_[i] = 0;
     base_sibling_alternatives_[i] = 0;
   }
@@ -1532,7 +1532,7 @@ bool TSPLns::MakeNeighbor() {
   int64_t node_path = Path(node);
   while (!IsPathEnd(node)) {
     int64_t next = Next(node);
-    if (gtl::ContainsKey(breaks_set, node)) {
+    if (breaks_set.contains(node)) {
       breaks.push_back(node);
       meta_node_costs.push_back(cost);
       cost = 0;
@@ -2162,7 +2162,9 @@ class MultiArmedBanditCompoundOperator : public LocalSearchOperator {
   // Sets how often we explore rarely used and unsuccessful in the past
   // operators. Operators are sorted by
   //  avg_improvement_[i] + exploration_coefficient_ *
-  //   sqrt(2 * log(1 + num_neighbors_) / (1 + num_neighbors_per_operator_[i]));
+  //   sqrt(2 * log(1 + num_neighbors_) / (1 + num_neighbors_per_operator_[i])).
+  // This definition uses the UCB1 exploration bonus for unstructured
+  // multi-armed bandits.
   const double exploration_coefficient_;
 };
 
@@ -2598,7 +2600,6 @@ PathState::PathState(int num_nodes, std::vector<int> path_start,
     committed_index_[node] = committed_nodes_.size();
     committed_nodes_.push_back({node, -1});
   }
-  path_has_changed_.assign(num_paths_, false);
 }
 
 PathState::ChainRange PathState::Chains(int path) const {
@@ -2615,144 +2616,19 @@ PathState::NodeRange PathState::Nodes(int path) const {
                               committed_nodes_.data());
 }
 
-void PathState::MakeChainsFromChangedPathsAndArcsWithSelectionAlgorithm() {
-  int num_visited_changed_arcs = 0;
-  const int num_changed_arcs = tail_head_indices_.size();
-  const int num_committed_nodes = committed_nodes_.size();
-  // For every path, find all its chains.
-  for (const int path : changed_paths_) {
-    const int old_chain_size = chains_.size();
-    const ChainBounds bounds = chains_[paths_[path].begin_index];
-    const int start_index = bounds.begin_index;
-    const int end_index = bounds.end_index - 1;
-    int current_index = start_index;
-    while (true) {
-      // Look for smallest non-visited tail_index that is no smaller than
-      // current_index.
-      int selected_arc = -1;
-      int selected_tail_index = num_committed_nodes;
-      for (int i = num_visited_changed_arcs; i < num_changed_arcs; ++i) {
-        const int tail_index = tail_head_indices_[i].tail_index;
-        if (current_index <= tail_index && tail_index < selected_tail_index) {
-          selected_arc = i;
-          selected_tail_index = tail_index;
-        }
-      }
-      // If there is no such tail index, or more generally if the next chain
-      // would be cut by end of path,
-      // stack {current_index, end_index + 1} in chains_, and go to next path.
-      // Otherwise, stack {current_index, tail_index+1} in chains_,
-      // set current_index = head_index, set pair to visited.
-      if (start_index <= current_index && current_index <= end_index &&
-          end_index < selected_tail_index) {
-        chains_.emplace_back(current_index, end_index + 1);
-        break;
-      } else {
-        chains_.emplace_back(current_index, selected_tail_index + 1);
-        current_index = tail_head_indices_[selected_arc].head_index;
-        std::swap(tail_head_indices_[num_visited_changed_arcs],
-                  tail_head_indices_[selected_arc]);
-        ++num_visited_changed_arcs;
-      }
-    }
-    const int new_chain_size = chains_.size();
-    paths_[path] = {old_chain_size, new_chain_size};
-  }
+void PathState::ChangePath(int path, const std::vector<ChainBounds>& chains) {
+  changed_paths_.push_back(path);
+  const int path_begin_index = chains_.size();
+  chains_.insert(chains_.end(), chains.begin(), chains.end());
+  const int path_end_index = chains_.size();
+  paths_[path] = {path_begin_index, path_end_index};
   chains_.emplace_back(0, 0);  // Sentinel.
 }
 
-void PathState::MakeChainsFromChangedPathsAndArcsWithGenericAlgorithm() {
-  // TRICKY: For each changed path, we want to generate a sequence of chains
-  // that represents the path in the changed state.
-  // First, notice that if we add a fake end->start arc for each changed path,
-  // then all chains will be from the head of an arc to the tail of an arc.
-  // A way to generate the changed chains and paths would be, for each path,
-  // to start from a fake arc's head (the path start), go down the path until
-  // the tail of an arc, and go to the next arc until we return on the fake arc,
-  // enqueuing the [head, tail] chains as we go.
-  // In turn, to do that, we need to know which arc to go to.
-  // If we sort all heads and tails by index in two separate arrays,
-  // the head_index and tail_index at the same rank are such that
-  // [head_index, tail_index] is a chain. Moreover, the arc that must be visited
-  // after head_index's arc is tail_index's arc.
-
-  // Add a fake end->start arc for each path.
-  for (const int path : changed_paths_) {
-    const PathStartEnd start_end = path_start_end_[path];
-    tail_head_indices_.push_back(
-        {committed_index_[start_end.end], committed_index_[start_end.start]});
-  }
-
-  // Generate pairs (tail_index, arc) and (head_index, arc) for all arcs,
-  // sort those pairs by index.
-  const int num_arc_indices = tail_head_indices_.size();
-  arcs_by_tail_index_.resize(num_arc_indices);
-  arcs_by_head_index_.resize(num_arc_indices);
-  for (int i = 0; i < num_arc_indices; ++i) {
-    arcs_by_tail_index_[i] = {tail_head_indices_[i].tail_index, i};
-    arcs_by_head_index_[i] = {tail_head_indices_[i].head_index, i};
-  }
-  std::sort(arcs_by_tail_index_.begin(), arcs_by_tail_index_.end());
-  std::sort(arcs_by_head_index_.begin(), arcs_by_head_index_.end());
-  // Generate the map from arc to next arc in path.
-  next_arc_.resize(num_arc_indices);
-  for (int i = 0; i < num_arc_indices; ++i) {
-    next_arc_[arcs_by_head_index_[i].arc] = arcs_by_tail_index_[i].arc;
-  }
-
-  // Generate chains: for every changed path, start from its fake arc,
-  // jump to next_arc_ until going back to fake arc,
-  // enqueuing chains as we go.
-  const int first_fake_arc = num_arc_indices - changed_paths_.size();
-  for (int fake_arc = first_fake_arc; fake_arc < num_arc_indices; ++fake_arc) {
-    const int new_path_begin = chains_.size();
-    int32_t arc = fake_arc;
-    do {
-      const int chain_begin = tail_head_indices_[arc].head_index;
-      arc = next_arc_[arc];
-      const int chain_end = tail_head_indices_[arc].tail_index + 1;
-      chains_.emplace_back(chain_begin, chain_end);
-    } while (arc != fake_arc);
-    const int path = changed_paths_[fake_arc - first_fake_arc];
-    const int new_path_end = chains_.size();
-    paths_[path] = {new_path_begin, new_path_end};
-  }
-  chains_.emplace_back(0, 0);  // Sentinel.
-}
-
-void PathState::CutChains() {
-  if (is_invalid_) return;
-  // Filter out unchanged arcs from changed_arcs_,
-  // translate changed arcs to changed arc indices.
-  // Fill changed_paths_ while we hold node_path.
-  DCHECK_EQ(chains_.size(), num_paths_ + 1);  // One per path + sentinel.
-  DCHECK(changed_paths_.empty());
-  tail_head_indices_.clear();
-  int num_changed_arcs = 0;
-  for (const auto& arc : changed_arcs_) {
-    int node, next;
-    std::tie(node, next) = arc;
-    const int node_index = committed_index_[node];
-    const int next_index = committed_index_[next];
-    const int node_path = committed_nodes_[node_index].path;
-    if (next != node &&
-        (next_index != node_index + 1 || node_path == -1)) {  // New arc.
-      tail_head_indices_.push_back({node_index, next_index});
-      changed_arcs_[num_changed_arcs++] = {node, next};
-      if (node_path != -1 && !path_has_changed_[node_path]) {
-        path_has_changed_[node_path] = true;
-        changed_paths_.push_back(node_path);
-      }
-    } else if (node == next && node_path != -1) {  // New loop.
-      changed_arcs_[num_changed_arcs++] = {node, node};
-    }
-  }
-  changed_arcs_.resize(num_changed_arcs);
-
-  if (tail_head_indices_.size() + changed_paths_.size() <= 8) {
-    MakeChainsFromChangedPathsAndArcsWithSelectionAlgorithm();
-  } else {
-    MakeChainsFromChangedPathsAndArcsWithGenericAlgorithm();
+void PathState::ChangeLoops(const std::vector<int>& new_loops) {
+  for (const int loop : new_loops) {
+    if (Path(loop) == -1) continue;
+    changed_loops_.push_back(loop);
   }
 }
 
@@ -2770,10 +2646,9 @@ void PathState::Revert() {
   chains_.resize(num_paths_ + 1);  // One per path + sentinel.
   for (const int path : changed_paths_) {
     paths_[path] = {path, path + 1};
-    path_has_changed_[path] = false;
   }
   changed_paths_.clear();
-  changed_arcs_.clear();
+  changed_loops_.clear();
 }
 
 void PathState::CopyNewPathAtEndOfNodes(int path) {
@@ -2810,11 +2685,8 @@ void PathState::IncrementalCommit() {
   }
   // New loops stay in place: only change their path to -1,
   // committed_index_ does not change.
-  for (const auto& arc : ChangedArcs()) {
-    int node, next;
-    std::tie(node, next) = arc;
-    if (node != next) continue;
-    const int index = committed_index_[node];
+  for (const int loop : ChangedLoops()) {
+    const int index = committed_index_[loop];
     committed_nodes_[index].path = -1;
   }
   // Committed part of the state is set up, erase incremental changes.
@@ -2869,12 +2741,44 @@ class PathStateFilter : public LocalSearchFilter {
   void Reset() override;
 
  private:
+  // Used in arc to chain translation, see below.
+  struct TailHeadIndices {
+    int tail_index;
+    int head_index;
+  };
+  struct IndexArc {
+    int index;
+    int arc;
+    bool operator<(const IndexArc& other) const { return index < other.index; }
+  };
+
+  // Translate changed_arcs_ to chains, pass to underlying PathState.
+  void CutChains();
+  // From changed_paths_ and changed_arcs_, fill chains_ and paths_.
+  // Selection-based algorithm in O(n^2), to use for small change sets.
+  void MakeChainsFromChangedPathsAndArcsWithSelectionAlgorithm();
+  // From changed_paths_ and changed_arcs_, fill chains_ and paths_.
+  // Generic algorithm in O(std::sort(n)+n), to use for larger change sets.
+  void MakeChainsFromChangedPathsAndArcsWithGenericAlgorithm();
+
   const std::unique_ptr<PathState> path_state_;
   // Map IntVar* index to node, offset by the min index in nexts.
   std::vector<int> variable_index_to_node_;
   int index_offset_;
-  // Used only in Reset(), this is a member variable to avoid reallocation.
+  // Used only in Reset(), class member status avoids reallocations.
   std::vector<bool> node_is_assigned_;
+  std::vector<int> loops_;
+
+  // Used in CutChains(), class member status avoids reallocations.
+  std::vector<int> changed_paths_;
+  std::vector<bool> path_has_changed_;
+  std::vector<std::pair<int, int>> changed_arcs_;
+  std::vector<int> changed_loops_;
+  std::vector<TailHeadIndices> tail_head_indices_;
+  std::vector<IndexArc> arcs_by_tail_index_;
+  std::vector<IndexArc> arcs_by_head_index_;
+  std::vector<int> next_arc_;
+  std::vector<PathState::ChainBounds> path_chains_;
 };
 
 PathStateFilter::PathStateFilter(std::unique_ptr<PathState> path_state,
@@ -2896,11 +2800,13 @@ PathStateFilter::PathStateFilter(std::unique_ptr<PathState> path_state,
     const int index = nexts[node]->index() - index_offset_;
     variable_index_to_node_[index] = node;
   }
+  path_has_changed_.assign(path_state_->NumPaths(), false);
 }
 
 void PathStateFilter::Relax(const Assignment* delta,
                             const Assignment* deltadelta) {
   path_state_->Revert();
+  changed_arcs_.clear();
   for (const IntVarElement& var_value : delta->IntVarContainer().elements()) {
     if (var_value.Var() == nullptr) continue;
     const int index = var_value.Var()->index() - index_offset_;
@@ -2908,14 +2814,14 @@ void PathStateFilter::Relax(const Assignment* delta,
     const int node = variable_index_to_node_[index];
     if (node == -1) continue;
     if (var_value.Bound()) {
-      path_state_->ChangeNext(node, var_value.Value());
+      changed_arcs_.emplace_back(node, var_value.Value());
     } else {
       path_state_->Revert();
       path_state_->SetInvalid();
-      break;
+      return;
     }
   }
-  path_state_->CutChains();
+  CutChains();
 }
 
 void PathStateFilter::Reset() {
@@ -2924,18 +2830,19 @@ void PathStateFilter::Reset() {
   // and all nonstart/nonend nodes to node -> node loops.
   const int num_nodes = path_state_->NumNodes();
   node_is_assigned_.assign(num_nodes, false);
+  loops_.clear();
   const int num_paths = path_state_->NumPaths();
   for (int path = 0; path < num_paths; ++path) {
-    const int start = path_state_->Start(path);
-    const int end = path_state_->End(path);
-    path_state_->ChangeNext(start, end);
-    node_is_assigned_[start] = true;
-    node_is_assigned_[end] = true;
+    const auto [start_index, end_index] = path_state_->CommittedPathRange(path);
+    path_state_->ChangePath(
+        path, {{start_index, start_index + 1}, {end_index - 1, end_index}});
+    node_is_assigned_[path_state_->Start(path)] = true;
+    node_is_assigned_[path_state_->End(path)] = true;
   }
   for (int node = 0; node < num_nodes; ++node) {
-    if (!node_is_assigned_[node]) path_state_->ChangeNext(node, node);
+    if (!node_is_assigned_[node]) loops_.push_back(node);
   }
-  path_state_->CutChains();
+  path_state_->ChangeLoops(loops_);
   path_state_->Commit();
 }
 
@@ -2955,6 +2862,139 @@ void PathStateFilter::Commit(const Assignment* assignment,
 
 void PathStateFilter::Revert() { path_state_->Revert(); }
 
+void PathStateFilter::CutChains() {
+  // Filter out unchanged arcs from changed_arcs_,
+  // translate changed arcs to changed arc indices.
+  // Fill changed_paths_ while we hold node_path.
+  for (const int path : changed_paths_) path_has_changed_[path] = false;
+  changed_paths_.clear();
+  tail_head_indices_.clear();
+  changed_loops_.clear();
+  int num_changed_arcs = 0;
+  for (const auto [node, next] : changed_arcs_) {
+    const int node_index = path_state_->CommittedIndex(node);
+    const int next_index = path_state_->CommittedIndex(next);
+    const int node_path = path_state_->Path(node);
+    if (next != node &&
+        (next_index != node_index + 1 || node_path == -1)) {  // New arc.
+      tail_head_indices_.push_back({node_index, next_index});
+      changed_arcs_[num_changed_arcs++] = {node, next};
+      if (node_path != -1 && !path_has_changed_[node_path]) {
+        path_has_changed_[node_path] = true;
+        changed_paths_.push_back(node_path);
+      }
+    } else if (node == next && node_path != -1) {  // New loop.
+      changed_loops_.push_back(node);
+    }
+  }
+  changed_arcs_.resize(num_changed_arcs);
+
+  path_state_->ChangeLoops(changed_loops_);
+  if (tail_head_indices_.size() + changed_paths_.size() <= 8) {
+    MakeChainsFromChangedPathsAndArcsWithSelectionAlgorithm();
+  } else {
+    MakeChainsFromChangedPathsAndArcsWithGenericAlgorithm();
+  }
+}
+
+void PathStateFilter::
+    MakeChainsFromChangedPathsAndArcsWithSelectionAlgorithm() {
+  int num_visited_changed_arcs = 0;
+  const int num_changed_arcs = tail_head_indices_.size();
+  // For every path, find all its chains.
+  for (const int path : changed_paths_) {
+    path_chains_.clear();
+    const auto [start_index, end_index] = path_state_->CommittedPathRange(path);
+    int current_index = start_index;
+    while (true) {
+      // Look for smallest non-visited tail_index that is no smaller than
+      // current_index.
+      int selected_arc = -1;
+      int selected_tail_index = std::numeric_limits<int>::max();
+      for (int i = num_visited_changed_arcs; i < num_changed_arcs; ++i) {
+        const int tail_index = tail_head_indices_[i].tail_index;
+        if (current_index <= tail_index && tail_index < selected_tail_index) {
+          selected_arc = i;
+          selected_tail_index = tail_index;
+        }
+      }
+      // If there is no such tail index, or more generally if the next chain
+      // would be cut by end of path,
+      // stack {current_index, end_index + 1} in chains_, and go to next path.
+      // Otherwise, stack {current_index, tail_index+1} in chains_,
+      // set current_index = head_index, set pair to visited.
+      if (start_index <= current_index && current_index < end_index &&
+          end_index <= selected_tail_index) {
+        path_chains_.emplace_back(current_index, end_index);
+        break;
+      } else {
+        path_chains_.emplace_back(current_index, selected_tail_index + 1);
+        current_index = tail_head_indices_[selected_arc].head_index;
+        std::swap(tail_head_indices_[num_visited_changed_arcs],
+                  tail_head_indices_[selected_arc]);
+        ++num_visited_changed_arcs;
+      }
+    }
+    path_state_->ChangePath(path, path_chains_);
+  }
+}
+
+void PathStateFilter::MakeChainsFromChangedPathsAndArcsWithGenericAlgorithm() {
+  // TRICKY: For each changed path, we want to generate a sequence of chains
+  // that represents the path in the changed state.
+  // First, notice that if we add a fake end->start arc for each changed path,
+  // then all chains will be from the head of an arc to the tail of an arc.
+  // A way to generate the changed chains and paths would be, for each path,
+  // to start from a fake arc's head (the path start), go down the path until
+  // the tail of an arc, and go to the next arc until we return on the fake arc,
+  // enqueuing the [head, tail] chains as we go.
+  // In turn, to do that, we need to know which arc to go to.
+  // If we sort all heads and tails by index in two separate arrays,
+  // the head_index and tail_index at the same rank are such that
+  // [head_index, tail_index] is a chain. Moreover, the arc that must be visited
+  // after head_index's arc is tail_index's arc.
+
+  // Add a fake end->start arc for each path.
+  for (const int path : changed_paths_) {
+    const auto [start_index, end_index] = path_state_->CommittedPathRange(path);
+    tail_head_indices_.push_back({end_index - 1, start_index});
+  }
+
+  // Generate pairs (tail_index, arc) and (head_index, arc) for all arcs,
+  // sort those pairs by index.
+  const int num_arc_indices = tail_head_indices_.size();
+  arcs_by_tail_index_.resize(num_arc_indices);
+  arcs_by_head_index_.resize(num_arc_indices);
+  for (int i = 0; i < num_arc_indices; ++i) {
+    arcs_by_tail_index_[i] = {tail_head_indices_[i].tail_index, i};
+    arcs_by_head_index_[i] = {tail_head_indices_[i].head_index, i};
+  }
+  std::sort(arcs_by_tail_index_.begin(), arcs_by_tail_index_.end());
+  std::sort(arcs_by_head_index_.begin(), arcs_by_head_index_.end());
+  // Generate the map from arc to next arc in path.
+  next_arc_.resize(num_arc_indices);
+  for (int i = 0; i < num_arc_indices; ++i) {
+    next_arc_[arcs_by_head_index_[i].arc] = arcs_by_tail_index_[i].arc;
+  }
+
+  // Generate chains: for every changed path, start from its fake arc,
+  // jump to next_arc_ until going back to fake arc,
+  // enqueuing chains as we go.
+  const int first_fake_arc = num_arc_indices - changed_paths_.size();
+  for (int fake_arc = first_fake_arc; fake_arc < num_arc_indices; ++fake_arc) {
+    path_chains_.clear();
+    int32_t arc = fake_arc;
+    do {
+      const int chain_begin = tail_head_indices_[arc].head_index;
+      arc = next_arc_[arc];
+      const int chain_end = tail_head_indices_[arc].tail_index + 1;
+      path_chains_.emplace_back(chain_begin, chain_end);
+    } while (arc != fake_arc);
+    const int path = changed_paths_[fake_arc - first_fake_arc];
+    path_state_->ChangePath(path, path_chains_);
+  }
+}
+
 }  // namespace
 
 LocalSearchFilter* MakePathStateFilter(Solver* solver,
@@ -2966,18 +3006,20 @@ LocalSearchFilter* MakePathStateFilter(Solver* solver,
 
 UnaryDimensionChecker::UnaryDimensionChecker(
     const PathState* path_state, std::vector<Interval> path_capacity,
-    std::vector<int> path_class, std::vector<std::vector<Interval>> demand,
+    std::vector<int> path_class,
+    std::vector<std::function<Interval(int64_t)>> min_max_demand_per_path_class,
     std::vector<Interval> node_capacity)
     : path_state_(path_state),
       path_capacity_(std::move(path_capacity)),
       path_class_(std::move(path_class)),
-      demand_(std::move(demand)),
+      min_max_demand_per_path_class_(std::move(min_max_demand_per_path_class)),
       node_capacity_(std::move(node_capacity)),
       index_(path_state_->NumNodes(), 0),
       maximum_partial_demand_layer_size_(
           std::max(16, 4 * path_state_->NumNodes()))  // 16 and 4 are arbitrary.
 {
   const int num_nodes = path_state_->NumNodes();
+  cached_demand_.resize(num_nodes);
   const int num_paths = path_state_->NumPaths();
   DCHECK_EQ(num_paths, path_capacity_.size());
   DCHECK_EQ(num_paths, path_class_.size());
@@ -3016,8 +3058,8 @@ bool UnaryDimensionChecker::Check() const {
       // the optimal value was found with the associated benchmark in tests,
       // in particular BM_UnaryDimensionChecker<ChangeSparsity::kSparse, *>.
       constexpr int kMinRangeSizeForRMQ = 4;
-      if (last_index - first_index > kMinRangeSizeForRMQ &&
-          path_class == chain_path_class &&
+      const bool chain_is_cached = chain_path_class == path_class;
+      if (last_index - first_index > kMinRangeSizeForRMQ && chain_is_cached &&
           SubpathOnlyHasTrivialNodes(first_index, last_index)) {
         // Compute feasible values of capacity_used that will not violate
         // path_capacity. This is done by considering the worst cases
@@ -3044,7 +3086,10 @@ bool UnaryDimensionChecker::Check() const {
           capacity_used = {std::max(capacity_used.min, node_capacity.min),
                            std::min(capacity_used.max, node_capacity.max)};
           if (capacity_used.min > capacity_used.max) return false;
-          const Interval demand = demand_[path_class][node];
+          const Interval demand =
+              chain_is_cached
+                  ? cached_demand_[node]
+                  : min_max_demand_per_path_class_[path_class](node);
           capacity_used = {CapAdd(capacity_used.min, demand.min),
                            CapAdd(capacity_used.max, demand.max)};
           capacity_used = {std::max(capacity_used.min, path_capacity.min),
@@ -3109,7 +3154,8 @@ void UnaryDimensionChecker::AppendPathDemandsToSums(int path) {
 
   for (const int node : path_state_->Nodes(path)) {
     index_[node] = index;
-    const Interval demand = demand_[path_class][node];
+    const Interval demand = min_max_demand_per_path_class_[path_class](node);
+    cached_demand_[node] = demand;
     demand_sum = {CapAdd(demand_sum.min, demand.min),
                   CapAdd(demand_sum.max, demand.max)};
     partial_demand_sums_rmq_[0].push_back(demand_sum);
@@ -3182,9 +3228,11 @@ namespace {
 
 class UnaryDimensionFilter : public LocalSearchFilter {
  public:
-  std::string DebugString() const override { return "UnaryDimensionFilter"; }
-  explicit UnaryDimensionFilter(std::unique_ptr<UnaryDimensionChecker> checker)
-      : checker_(std::move(checker)) {}
+  std::string DebugString() const override { return name_; }
+  UnaryDimensionFilter(std::unique_ptr<UnaryDimensionChecker> checker,
+                       const std::string& dimension_name)
+      : checker_(std::move(checker)),
+        name_(absl::StrCat("UnaryDimensionFilter(", dimension_name, ")")) {}
 
   bool Accept(const Assignment* delta, const Assignment* deltadelta,
               int64_t objective_min, int64_t objective_max) override {
@@ -3198,13 +3246,16 @@ class UnaryDimensionFilter : public LocalSearchFilter {
 
  private:
   std::unique_ptr<UnaryDimensionChecker> checker_;
+  const std::string name_;
 };
 
 }  // namespace
 
 LocalSearchFilter* MakeUnaryDimensionFilter(
-    Solver* solver, std::unique_ptr<UnaryDimensionChecker> checker) {
-  UnaryDimensionFilter* filter = new UnaryDimensionFilter(std::move(checker));
+    Solver* solver, std::unique_ptr<UnaryDimensionChecker> checker,
+    const std::string& dimension_name) {
+  UnaryDimensionFilter* filter =
+      new UnaryDimensionFilter(std::move(checker), dimension_name);
   return solver->RevAlloc(filter);
 }
 
@@ -3645,6 +3696,14 @@ class LocalSearchProfiler : public LocalSearchMonitor {
   }
   LocalSearchStatistics ExportToLocalSearchStatistics() const {
     LocalSearchStatistics statistics_proto;
+    for (ProfiledDecisionBuilder* db : profiled_decision_builders_) {
+      if (db->seconds() == 0) continue;
+      LocalSearchStatistics::FirstSolutionStatistics* const
+          first_solution_statistics =
+              statistics_proto.add_first_solution_statistics();
+      first_solution_statistics->set_strategy(db->name());
+      first_solution_statistics->set_duration_seconds(db->seconds());
+    }
     std::vector<const LocalSearchOperator*> operators;
     for (const auto& stat : operator_stats_) {
       operators.push_back(stat.first);
@@ -3809,6 +3868,10 @@ class LocalSearchProfiler : public LocalSearchMonitor {
       stats.rejects++;
     }
   }
+  void AddFirstSolutionProfiledDecisionBuilder(
+      ProfiledDecisionBuilder* profiled_db) {
+    profiled_decision_builders_.push_back(profiled_db);
+  }
   void Install() override { SearchMonitor::Install(); }
 
  private:
@@ -3838,7 +3901,21 @@ class LocalSearchProfiler : public LocalSearchMonitor {
   absl::flat_hash_map<const LocalSearchOperator*, OperatorStats>
       operator_stats_;
   absl::flat_hash_map<const LocalSearchFilter*, FilterStats> filter_stats_;
+  // Profiled decision builders.
+  std::vector<ProfiledDecisionBuilder*> profiled_decision_builders_;
 };
+
+DecisionBuilder* Solver::MakeProfiledDecisionBuilderWrapper(
+    DecisionBuilder* db) {
+  if (IsLocalSearchProfilingEnabled()) {
+    ProfiledDecisionBuilder* profiled_db =
+        RevAlloc(new ProfiledDecisionBuilder(db));
+    local_search_profiler_->AddFirstSolutionProfiledDecisionBuilder(
+        profiled_db);
+    return profiled_db;
+  }
+  return db;
+}
 
 void InstallLocalSearchProfiler(LocalSearchProfiler* monitor) {
   monitor->Install();
@@ -4029,6 +4106,8 @@ class FindOneNeighbor : public DecisionBuilder {
   Assignment* const assignment_;
   IntVar* const objective_;
   std::unique_ptr<Assignment> reference_assignment_;
+  std::unique_ptr<Assignment> last_synchronized_assignment_;
+  Assignment* const filter_assignment_delta_;
   SolutionPool* const pool_;
   LocalSearchOperator* const ls_operator_;
   DecisionBuilder* const sub_decision_builder_;
@@ -4045,6 +4124,9 @@ class FindOneNeighbor : public DecisionBuilder {
 // reference_assignment_ is used to keep track of the last assignment on which
 // operators were started, assignment_ corresponding to the last successful
 // neighbor.
+// last_synchronized_assignment_ keeps track of the last assignment on which
+// filters were synchronized and is used to compute the filter_assignment_delta_
+// when synchronizing again.
 FindOneNeighbor::FindOneNeighbor(Assignment* const assignment,
                                  IntVar* objective, SolutionPool* const pool,
                                  LocalSearchOperator* const ls_operator,
@@ -4054,6 +4136,7 @@ FindOneNeighbor::FindOneNeighbor(Assignment* const assignment,
     : assignment_(assignment),
       objective_(objective),
       reference_assignment_(new Assignment(assignment_)),
+      filter_assignment_delta_(assignment->solver()->MakeAssignment()),
       pool_(pool),
       ls_operator_(ls_operator),
       sub_decision_builder_(sub_decision_builder),
@@ -4289,14 +4372,52 @@ bool FindOneNeighbor::FilterAccept(Solver* solver, Assignment* delta,
                                  objective_max);
 }
 
+namespace {
+
+template <typename Container>
+void AddDeltaElements(const Container& old_container,
+                      const Container& new_container, Assignment* delta) {
+  for (const auto& new_element : new_container.elements()) {
+    const auto var = new_element.Var();
+    const auto old_element_ptr = old_container.ElementPtrOrNull(var);
+    if (old_element_ptr == nullptr || *old_element_ptr != new_element) {
+      delta->FastAdd(var)->Copy(new_element);
+    }
+  }
+}
+
+void MakeDelta(const Assignment* old_assignment,
+               const Assignment* new_assignment, Assignment* delta) {
+  DCHECK_NE(delta, nullptr);
+  delta->Clear();
+  AddDeltaElements(old_assignment->IntVarContainer(),
+                   new_assignment->IntVarContainer(), delta);
+  AddDeltaElements(old_assignment->IntervalVarContainer(),
+                   new_assignment->IntervalVarContainer(), delta);
+  AddDeltaElements(old_assignment->SequenceVarContainer(),
+                   new_assignment->SequenceVarContainer(), delta);
+}
+}  // namespace
+
 void FindOneNeighbor::SynchronizeAll(Solver* solver) {
-  pool_->GetNextSolution(reference_assignment_.get());
+  Assignment* const reference_assignment = reference_assignment_.get();
+  pool_->GetNextSolution(reference_assignment);
   neighbor_found_ = false;
   limit_->Init();
   solver->GetLocalSearchMonitor()->BeginOperatorStart();
-  ls_operator_->Start(reference_assignment_.get());
+  ls_operator_->Start(reference_assignment);
   if (filter_manager_ != nullptr) {
-    filter_manager_->Synchronize(reference_assignment_.get(), nullptr);
+    Assignment* delta = nullptr;
+    if (last_synchronized_assignment_ == nullptr) {
+      last_synchronized_assignment_ =
+          absl::make_unique<Assignment>(reference_assignment);
+    } else {
+      MakeDelta(last_synchronized_assignment_.get(), reference_assignment,
+                filter_assignment_delta_);
+      delta = filter_assignment_delta_;
+      last_synchronized_assignment_->Copy(reference_assignment);
+    }
+    filter_manager_->Synchronize(reference_assignment_.get(), delta);
   }
   solver->GetLocalSearchMonitor()->EndOperatorStart();
 }
@@ -4716,7 +4837,8 @@ void LocalSearch::PushFirstSolutionDecision(DecisionBuilder* first_solution) {
   Solver* const solver = assignment_->solver();
   DecisionBuilder* store = solver->MakeStoreAssignment(assignment_);
   DecisionBuilder* first_solution_and_store = solver->Compose(
-      first_solution, first_solution_sub_decision_builder_, store);
+      solver->MakeProfiledDecisionBuilderWrapper(first_solution),
+      first_solution_sub_decision_builder_, store);
   std::vector<SearchMonitor*> monitor;
   monitor.push_back(limit_);
   nested_decisions_.push_back(solver->RevAlloc(

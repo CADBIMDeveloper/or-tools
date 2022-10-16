@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <string>
 
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
@@ -123,7 +124,7 @@ void DynamicPartition::Refine(const std::vector<int>& distinguished_subset) {
   }
 
   // Sort affected parts. This is important to behave as advertised in the .h.
-  // TODO(user,user): automatically switch to an O(N) sort when it's faster
+  // TODO(user): automatically switch to an O(N) sort when it's faster
   // than this one, which is O(K log K) with K = tmp_affected_parts_.size().
   std::sort(tmp_affected_parts_.begin(), tmp_affected_parts_.end());
 

@@ -13,8 +13,10 @@
 
 #include "ortools/bop/bop_ls.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <string>
 
 #include "absl/memory/memory.h"
 #include "absl/strings/str_format.h"
@@ -35,12 +37,14 @@ using ::operations_research::sat::LinearObjective;
 
 LocalSearchOptimizer::LocalSearchOptimizer(const std::string& name,
                                            int max_num_decisions,
+                                           absl::BitGenRef random,
                                            sat::SatSolver* sat_propagator)
     : BopOptimizerBase(name),
       state_update_stamp_(ProblemState::kInitialStampValue),
       max_num_decisions_(max_num_decisions),
       sat_wrapper_(sat_propagator),
-      assignment_iterator_() {}
+      assignment_iterator_(),
+      random_(random) {}
 
 LocalSearchOptimizer::~LocalSearchOptimizer() {}
 
@@ -59,7 +63,7 @@ BopOptimizerBase::Status LocalSearchOptimizer::Optimize(
   if (assignment_iterator_ == nullptr) {
     assignment_iterator_ = absl::make_unique<LocalSearchAssignmentIterator>(
         problem_state, max_num_decisions_,
-        parameters.max_num_broken_constraints_in_ls(), &sat_wrapper_);
+        parameters.max_num_broken_constraints_in_ls(), random_, &sat_wrapper_);
   }
 
   if (state_update_stamp_ != problem_state.update_stamp()) {
@@ -181,7 +185,7 @@ template class BacktrackableIntegerSet<ConstraintIndex>;
 
 AssignmentAndConstraintFeasibilityMaintainer::
     AssignmentAndConstraintFeasibilityMaintainer(
-        const LinearBooleanProblem& problem)
+        const LinearBooleanProblem& problem, absl::BitGenRef random)
     : by_variable_matrix_(problem.num_variables()),
       constraint_lower_bounds_(),
       constraint_upper_bounds_(),
@@ -189,7 +193,8 @@ AssignmentAndConstraintFeasibilityMaintainer::
       reference_(problem, "Assignment"),
       constraint_values_(),
       flipped_var_trail_backtrack_levels_(),
-      flipped_var_trail_() {
+      flipped_var_trail_(),
+      constraint_set_hasher_(random) {
   // Add the objective constraint as the first constraint.
   const LinearObjective& objective = problem.objective();
   CHECK_EQ(objective.literals_size(), objective.coefficients_size());
@@ -678,10 +683,11 @@ double SatWrapper::deterministic_time() const {
 
 LocalSearchAssignmentIterator::LocalSearchAssignmentIterator(
     const ProblemState& problem_state, int max_num_decisions,
-    int max_num_broken_constraints, SatWrapper* sat_wrapper)
+    int max_num_broken_constraints, absl::BitGenRef random,
+    SatWrapper* sat_wrapper)
     : max_num_decisions_(max_num_decisions),
       max_num_broken_constraints_(max_num_broken_constraints),
-      maintainer_(problem_state.original_problem()),
+      maintainer_(problem_state.original_problem(), random),
       sat_wrapper_(sat_wrapper),
       repairer_(problem_state.original_problem(), maintainer_,
                 sat_wrapper->SatAssignment()),

@@ -14,6 +14,8 @@
 #ifndef OR_TOOLS_GLOP_DUAL_EDGE_NORMS_H_
 #define OR_TOOLS_GLOP_DUAL_EDGE_NORMS_H_
 
+#include <string>
+
 #include "ortools/glop/basis_representation.h"
 #include "ortools/glop/parameters.pb.h"
 #include "ortools/lp_data/lp_data.h"
@@ -64,7 +66,7 @@ class DualEdgeNorms {
   // recompute the norms from scratch and therefore needs a hightened precision
   // and speed. This also indicates if GetEdgeSquaredNorms() will trigger a
   // recomputation.
-  bool NeedsBasisRefactorization();
+  bool NeedsBasisRefactorization() const;
 
   // Returns the dual edge squared norms. This is only valid if the caller
   // properly called UpdateBeforeBasisPivot() before each basis pivot, or just

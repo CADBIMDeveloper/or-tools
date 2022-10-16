@@ -49,7 +49,7 @@ inline int64_t TwosComplementSubtraction(int64_t x, int64_t y) {
                                  static_cast<uint64_t>(y));
 }
 
-// Helper function that returns true if an overflow has occured in computing
+// Helper function that returns true if an overflow has occurred in computing
 // sum = x + y. sum is expected to be computed elsewhere.
 inline bool AddHadOverflow(int64_t x, int64_t y, int64_t sum) {
   // Overflow cannot occur if operands have different signs.
@@ -130,6 +130,8 @@ inline int64_t CapAdd(int64_t x, int64_t y) {
   return CapAddGeneric(x, y);
 #endif
 }
+
+inline void CapAddTo(int64_t x, int64_t* y) { *y = CapAdd(*y, x); }
 
 inline int64_t CapSubGeneric(int64_t x, int64_t y) {
   const int64_t result = TwosComplementSubtraction(x, y);

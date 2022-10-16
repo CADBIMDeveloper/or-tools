@@ -24,10 +24,10 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
-#include "ortools/base/int_type.h"
 #include "ortools/base/integral_types.h"
 #include "ortools/base/logging.h"
 #include "ortools/base/map_util.h"
+#include "ortools/base/strong_int.h"
 #include "ortools/constraint_solver/constraint_solver.h"
 #include "ortools/constraint_solver/routing.h"
 #include "ortools/constraint_solver/routing_lp_scheduling.h"
@@ -58,7 +58,7 @@ bool RoutingModel::IsMatchingModel() const {
   absl::flat_hash_set<int> disjunction_nodes;
   for (DisjunctionIndex i(0); i < GetNumberOfDisjunctions(); ++i) {
     if (GetDisjunctionMaxCardinality(i) > 1) return false;
-    for (int64_t node : GetDisjunctionIndices(i)) {
+    for (int64_t node : GetDisjunctionNodeIndices(i)) {
       if (!disjunction_nodes.insert(node).second) return false;
     }
   }
@@ -155,6 +155,11 @@ struct FlowArc {
 
 bool RoutingModel::SolveMatchingModel(
     Assignment* assignment, const RoutingSearchParameters& parameters) {
+  if (parameters.disable_scheduling_beware_this_may_degrade_performance()) {
+    // We need to use LocalDimensionCumulOptimizers below, so we return false if
+    // LP scheduling is disabled.
+    return false;
+  }
   VLOG(2) << "Solving with flow";
   assignment->Clear();
 
@@ -225,7 +230,7 @@ bool RoutingModel::SolveMatchingModel(
       disjunction_to_flow_nodes.back().push_back(num_flow_nodes);
       num_flow_nodes++;
     } else {
-      for (int n : GetDisjunctionIndices(disjunctions.back())) {
+      for (int n : GetDisjunctionNodeIndices(disjunctions.back())) {
         in_disjunction[n] = true;
         flow_to_non_pd[num_flow_nodes] = n;
         disjunction_to_flow_nodes.back().push_back(num_flow_nodes);

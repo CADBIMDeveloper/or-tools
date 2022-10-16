@@ -141,8 +141,8 @@ class KnapsackSolver {
     /** Dynamic Programming approach for single dimension problems
      *
      * Limited to one dimension, this solver is based on a dynamic programming
-     * algorithm. The time complexity is O(capacity * number_of_items^2) and 
-     * the space complexity is O(capacity + number_of_items).
+     * algorithm. The time and space complexity is O(capacity *
+     * number_of_items).
      */
     KNAPSACK_DYNAMIC_PROGRAMMING_SOLVER = 2,
 
@@ -289,8 +289,8 @@ class KnapsackSolver {
 // TODO(user): Add a new propagator class used as a guide when the problem has
 // several dimensions.
 
-// ----- KnapsackAssignement -----
-// KnapsackAssignement is a small struct used to pair an item with its
+// ----- KnapsackAssignment -----
+// KnapsackAssignment is a small struct used to pair an item with its
 // assignment. It is mainly used for search nodes and updates.
 struct KnapsackAssignment {
   KnapsackAssignment(int _item_id, bool _is_in)
@@ -332,7 +332,7 @@ typedef KnapsackItem* KnapsackItemPtr;
 // KnapsackSearchNode is a class used to describe a decision in the decision
 // search tree.
 // The node is defined by a pointer to the parent search node and an
-// assignment (see KnapsackAssignement).
+// assignment (see KnapsackAssignment).
 // As the current state is not explicitly stored in a search node, one should
 // go through the search tree to incrementally build a partial solution from
 // a previous search node.

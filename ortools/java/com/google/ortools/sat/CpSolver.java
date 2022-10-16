@@ -126,9 +126,14 @@ public final class CpSolver {
     return solveResponse.getBestObjectiveBound();
   }
 
-  /** Returns the value of a variable in the last solution found. */
-  public long value(IntVar var) {
-    return solveResponse.getSolution(var.getIndex());
+  /** Returns the value of a linear expression in the last solution found. */
+  public long value(LinearArgument expr) {
+    final LinearExpr e = expr.build();
+    long result = e.getOffset();
+    for (int i = 0; i < e.numElements(); ++i) {
+      result += solveResponse.getSolution(e.getVariableIndex(i)) * e.getCoefficient(i);
+    }
+    return result;
   }
 
   /** Returns the Boolean value of a literal in the last solution found. */
@@ -183,6 +188,14 @@ public final class CpSolver {
   /** Returns some statistics on the solution found as a string. */
   public String responseStats() {
     return CpSatHelper.solverResponseStats(solveResponse);
+  }
+
+  /**
+   * Returns some information on how the solution was found, or the reason why the model or the
+   * parameters are invalid.
+   */
+  public String getSolutionInfo() {
+    return solveResponse.getSolutionInfo();
   }
 
   private CpSolverResponse solveResponse;

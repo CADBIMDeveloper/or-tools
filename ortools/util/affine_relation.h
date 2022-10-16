@@ -14,6 +14,7 @@
 #ifndef OR_TOOLS_UTIL_AFFINE_RELATION_H_
 #define OR_TOOLS_UTIL_AFFINE_RELATION_H_
 
+#include <algorithm>
 #include <vector>
 
 #include "ortools/base/iterator_adaptors.h"
@@ -77,8 +78,11 @@ class AffineRelation {
     int representative;
     int64_t coeff;
     int64_t offset;
+
     Relation(int r, int64_t c, int64_t o)
         : representative(r), coeff(c), offset(o) {}
+    explicit Relation(int r) : representative(r) {}
+
     const bool operator==(const Relation& other) const {
       return representative == other.representative && coeff == other.coeff &&
              offset == other.offset;
@@ -154,7 +158,7 @@ class AffineRelation {
   //
   // TODO(user): Using a "rank" might be faster, but because we sometimes
   // need to merge the bad subtree into the better one, it is trickier to
-  // maintain than in the classic union-find algorihtm.
+  // maintain than in the classic union-find algorithm.
   std::vector<int> size_;
 
   // Used by CompressPath() to maintain the coeff/offset during compression.

@@ -1,5 +1,5 @@
 var searchData=
 [
-  ['swig_25012',['Swig',['../namespace_swig.html',1,'']]],
-  ['swig_25013',['swig',['../namespaceswig.html',1,'']]]
+  ['std_0',['std',['../namespacestd.html',1,'']]],
+  ['strings_1',['strings',['../namespacestrings.html',1,'']]]
 ];

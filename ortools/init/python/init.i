@@ -10,9 +10,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//
-// TODO(user): test all the APIs that are currently marked as 'untested'.
-//swiglint: disable full-signature
 
 %include "ortools/base/base.i"
 
@@ -41,6 +38,12 @@
 %unignore operations_research::CppBridge::ShutdownLogging;
 %unignore operations_research::CppBridge::SetFlags;
 %unignore operations_research::CppBridge::LoadGurobiSharedLibrary;
+
+%unignore operations_research::OrToolsVersion;
+%unignore operations_research::OrToolsVersion::MajorNumber;
+%unignore operations_research::OrToolsVersion::MinorNumber;
+%unignore operations_research::OrToolsVersion::PatchNumber;
+%unignore operations_research::OrToolsVersion::VersionString;
 
 %include "ortools/init/init.h"
 

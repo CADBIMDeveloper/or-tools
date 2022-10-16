@@ -16,21 +16,102 @@
 
 #include <cstdint>
 #include <deque>
+#include <vector>
 
+#include "ortools/base/logging.h"
+#if !defined(__PORTABLE_PLATFORM__)
+#include "google/protobuf/descriptor.h"
+#endif  // __PORTABLE_PLATFORM__
+#include "absl/container/btree_set.h"
 #include "absl/random/bit_gen_ref.h"
 #include "absl/random/random.h"
+#include "absl/types/span.h"
 #include "ortools/sat/model.h"
 #include "ortools/sat/sat_base.h"
 #include "ortools/sat/sat_parameters.pb.h"
 #include "ortools/util/random_engine.h"
 #include "ortools/util/time_limit.h"
 
-#if !defined(__PORTABLE_PLATFORM__)
-#include "google/protobuf/descriptor.h"
-#endif  // __PORTABLE_PLATFORM__
-
 namespace operations_research {
 namespace sat {
+
+// Returns a in [0, m) such that a * x = 1 modulo m.
+// If gcd(x, m) != 1, there is no inverse, and it returns 0.
+//
+// This DCHECK that x is in [0, m).
+// This is integer overflow safe.
+//
+// Note(user): I didn't find this in a easily usable standard library.
+int64_t ModularInverse(int64_t x, int64_t m);
+
+// Just returns x % m but with a result always in [0, m).
+int64_t PositiveMod(int64_t x, int64_t m);
+
+// If we know that X * coeff % mod = rhs % mod, this returns c such that
+// PositiveMod(X, mod) = c.
+//
+// This requires coeff != 0, mod !=0 and gcd(coeff, mod) == 1.
+// The result will be in [0, mod) but there is no other condition on the sign or
+// magnitude of a and b.
+//
+// This is overflow safe, and when rhs == 0 or abs(mod) == 1, it returns 0.
+int64_t ProductWithModularInverse(int64_t coeff, int64_t mod, int64_t rhs);
+
+// Returns true if the equation a * X + b * Y = cte has some integer solutions.
+// For now, we check that a and b are different from 0 and from int64_t min.
+//
+// There is actually always a solution if cte % gcd(|a|, |b|) == 0. And because
+// a, b and cte fit on an int64_t, if there is a solution, there is one with X
+// and Y fitting on an int64_t.
+//
+// We will divide everything by gcd(a, b) first, so it is why we take reference
+// and the equation can change.
+//
+// If there are solutions, we return one of them (x0, y0).
+// From any such solution, the set of all solutions is given for Z integer by:
+// X = x0 + b * Z;
+// Y = y0 - a * Z;
+//
+// Given a domain for X and Y, it is possible to compute the "exact" domain of Z
+// with our Domain functions. Note however that this will only compute solution
+// where both x-x0 and y-y0 do fit on an int64_t:
+// DomainOf(x).SubtractionWith(x0).InverseMultiplicationBy(b).IntersectionWith(
+//     DomainOf(y).SubtractionWith(y0).InverseMultiplicationBy(-a))
+bool SolveDiophantineEquationOfSizeTwo(int64_t& a, int64_t& b, int64_t& cte,
+                                       int64_t& x0, int64_t& y0);
+
+// The argument must be non-negative.
+int64_t FloorSquareRoot(int64_t a);
+int64_t CeilSquareRoot(int64_t a);
+
+// Converts a double to int64_t and cap large magnitudes at kint64min/max.
+// We also arbitrarily returns 0 for NaNs.
+//
+// Note(user): This is similar to SaturatingFloatToInt(), but we use our own
+// since we need to open source it and the code is simple enough.
+int64_t SafeDoubleToInt64(double value);
+
+// Returns the multiple of base closest to value. If there is a tie, we return
+// the one closest to zero. This way we have ClosestMultiple(x) =
+// -ClosestMultiple(-x) which is important for how this is used.
+int64_t ClosestMultiple(int64_t value, int64_t base);
+
+// Given a linear equation "sum coeff_i * X_i <= rhs. We can rewrite it using
+// ClosestMultiple() as "base * new_terms + error <= rhs" where error can be
+// bounded using the provided bounds on each variables. This will return true if
+// the error can be ignored and this equation is completely equivalent to
+// new_terms <= new_rhs.
+//
+// This is useful for cases like 9'999 X + 10'0001 Y <= 155'000 where we have
+// weird coefficient (maybe due to scaling). With a base of 10K, this is
+// equivalent to X + Y <= 15.
+//
+// Preconditions: All coeffs are assumed to be positive. You can easily negate
+// all the negative coeffs and corresponding bounds before calling this.
+bool LinearInequalityCanBeReducedWithClosestMultiple(
+    int64_t base, const std::vector<int64_t>& coeffs,
+    const std::vector<int64_t>& lbs, const std::vector<int64_t>& ubs,
+    int64_t rhs, int64_t* new_rhs);
 
 // The model "singleton" random engine used in the solver.
 //
@@ -74,8 +155,8 @@ class ModelSharedTimeLimit : public SharedTimeLimit {
 };
 
 // Randomizes the decision heuristic of the given SatParameters.
-template <typename URBG>
-void RandomizeDecisionHeuristic(URBG* random, SatParameters* parameters);
+void RandomizeDecisionHeuristic(absl::BitGenRef random,
+                                SatParameters* parameters);
 
 // Context: this function is not really generic, but required to be unit-tested.
 // It is used in a clause minimization algorithm when we try to detect if any of
@@ -97,40 +178,44 @@ void RandomizeDecisionHeuristic(URBG* random, SatParameters* parameters);
 // relevant_prefix_size is used as a hint when keeping more that this prefix
 // size do not matter. The returned value will always be lower or equal to
 // relevant_prefix_size.
-int MoveOneUnprocessedLiteralLast(const std::set<LiteralIndex>& processed,
-                                  int relevant_prefix_size,
-                                  std::vector<Literal>* literals);
+int MoveOneUnprocessedLiteralLast(
+    const absl::btree_set<LiteralIndex>& processed, int relevant_prefix_size,
+    std::vector<Literal>* literals);
 
-// ============================================================================
-// Implementation.
-// ============================================================================
+// Simple DP to compute the maximum reachable value of a "subset sum" under
+// a given bound (inclusive). Note that we abort as soon as the computation
+// become too important.
+//
+// Precondition: Both bound and all added values must be >= 0.
+//
+// TODO(user): Compute gcd of all value so we can return a better bound for
+// large sets?
+class MaxBoundedSubsetSum {
+ public:
+  MaxBoundedSubsetSum() { Reset(0); }
+  explicit MaxBoundedSubsetSum(int64_t bound) { Reset(bound); }
 
-template <typename URBG>
-inline void RandomizeDecisionHeuristic(URBG* random,
-                                       SatParameters* parameters) {
-#if !defined(__PORTABLE_PLATFORM__)
-  // Random preferred variable order.
-  const google::protobuf::EnumDescriptor* order_d =
-      SatParameters::VariableOrder_descriptor();
-  parameters->set_preferred_variable_order(
-      static_cast<SatParameters::VariableOrder>(
-          order_d->value(absl::Uniform(*random, 0, order_d->value_count()))
-              ->number()));
+  // Resets to an empty set of values.
+  // We look for the maximum sum <= bound.
+  void Reset(int64_t bound);
 
-  // Random polarity initial value.
-  const google::protobuf::EnumDescriptor* polarity_d =
-      SatParameters::Polarity_descriptor();
-  parameters->set_initial_polarity(static_cast<SatParameters::Polarity>(
-      polarity_d->value(absl::Uniform(*random, 0, polarity_d->value_count()))
-          ->number()));
-#endif  // __PORTABLE_PLATFORM__
-  // Other random parameters.
-  parameters->set_use_phase_saving(absl::Bernoulli(*random, 0.5));
-  parameters->set_random_polarity_ratio(absl::Bernoulli(*random, 0.5) ? 0.01
-                                                                      : 0.0);
-  parameters->set_random_branches_ratio(absl::Bernoulli(*random, 0.5) ? 0.01
-                                                                      : 0.0);
-}
+  // Add a value to the base set for which subset sums will be taken.
+  void Add(int64_t value);
+
+  // Returns an upper bound (inclusive) on the maximum sum <= bound_.
+  // This might return bound_ if we aborted the computation.
+  int64_t CurrentMax() const { return current_max_; }
+
+  int64_t Bound() const { return bound_; }
+
+ private:
+  static constexpr int kMaxComplexityPerAdd = 50;
+
+  int64_t bound_;
+  int64_t current_max_;
+  std::vector<int64_t> sums_;
+  std::vector<bool> expanded_sums_;
+};
 
 // Manages incremental averages.
 class IncrementalAverage {
@@ -213,6 +298,21 @@ class Percentile {
 // This method is exposed for testing purposes.
 void CompressTuples(absl::Span<const int64_t> domain_sizes, int64_t any_value,
                     std::vector<std::vector<int64_t>>* tuples);
+
+// ============================================================================
+// Implementation.
+// ============================================================================
+
+inline int64_t SafeDoubleToInt64(double value) {
+  if (std::isnan(value)) return 0;
+  if (value >= static_cast<double>(std::numeric_limits<int64_t>::max())) {
+    return std::numeric_limits<int64_t>::max();
+  }
+  if (value <= static_cast<double>(std::numeric_limits<int64_t>::min())) {
+    return std::numeric_limits<int64_t>::min();
+  }
+  return static_cast<int64_t>(value);
+}
 
 }  // namespace sat
 }  // namespace operations_research

@@ -13,6 +13,8 @@
 
 #include "ortools/glop/update_row.h"
 
+#include <string>
+
 #include "ortools/lp_data/lp_utils.h"
 
 namespace operations_research {
@@ -43,7 +45,6 @@ void UpdateRow::Invalidate() {
 }
 
 const ScatteredRow& UpdateRow::GetUnitRowLeftInverse() const {
-  DCHECK(!compute_update_row_);
   return unit_row_left_inverse_;
 }
 

@@ -163,6 +163,7 @@
 #include <new>
 #include <vector>
 
+#include "absl/base/port.h"
 #include "absl/debugging/leak_check.h"
 #include "ortools/base/integral_types.h"
 #include "ortools/base/logging.h"
@@ -176,7 +177,7 @@ template <typename T>
 class SVector;
 
 // Base class of all Graphs implemented here. The default value for the graph
-// index types is int32_t since allmost all graphs that fit into memory do not
+// index types is int32_t since almost all graphs that fit into memory do not
 // need bigger indices.
 //
 // Note: The type can be unsigned, except for the graphs with reverse arcs
@@ -793,9 +794,7 @@ class SVector {
     }
     // Perform the actual copy of the payload.
     size_ = other.size_;
-    for (int i = -size_; i < size_; ++i) {
-      new (base_ + i) T(other.base_[i]);
-    }
+    CopyInternal(other, std::is_integral<T>());
     return *this;
   }
 
@@ -906,6 +905,22 @@ class SVector {
   }
 
  private:
+  // Copies other.base_ to base_ in this SVector. Avoids iteration by copying
+  // entire memory range in a single shot for the most commonly used integral
+  // types which should be safe to copy in this way.
+  void CopyInternal(const SVector& other, std::true_type) {
+    std::memcpy(base_ - other.size_, other.base_ - other.size_,
+                2LL * other.size_ * sizeof(T));
+  }
+
+  // Copies other.base_ to base_ in this SVector. Safe for all types as it uses
+  // constructor for each entry.
+  void CopyInternal(const SVector& other, std::false_type) {
+    for (int i = -size_; i < size_; ++i) {
+      new (base_ + i) T(other.base_[i]);
+    }
+  }
+
   T* Allocate(int capacity) const {
     return absl::IgnoreLeak(
         static_cast<T*>(malloc(2LL * capacity * sizeof(T))));
@@ -978,7 +993,7 @@ void BaseGraph<NodeIndexType, ArcIndexType,
   arc_capacity_ = std::max(arc_capacity_, num_arcs_);
 }
 
-// Computes the cummulative sum of the entry in v. We only use it with
+// Computes the cumulative sum of the entry in v. We only use it with
 // in/out degree distribution, hence the Check() at the end.
 template <typename NodeIndexType, typename ArcIndexType, bool HasReverseArcs>
 void BaseGraph<NodeIndexType, ArcIndexType, HasReverseArcs>::

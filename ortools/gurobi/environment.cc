@@ -22,6 +22,7 @@
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/synchronization/mutex.h"
+#include "ortools/base/file.h"
 #include "ortools/base/logging.h"
 #include "ortools/base/status_macros.h"
 
@@ -42,7 +43,6 @@ bool GurobiIsCorrectlyInstalled() {
 // See the comment at the top of the script.
 
 // This is the 'define' section.
-
 std::function<int(GRBenv**, const char*, const char*, const char*, int,
                   const char*)>
     GRBisqp = nullptr;
@@ -357,8 +357,6 @@ std::function<int(GRBmodel* model, int index, int priority, double weight,
                   double constant, int lnz, int* lind, double* lval)>
     GRBsetobjectiven = nullptr;
 std::function<void(GRBenv* env, const char* message)> GRBmsg = nullptr;
-std::function<int(GRBenv* env, FILE** logfileP)> GRBgetlogfile = nullptr;
-std::function<int(GRBenv* env, FILE* logfile)> GRBsetlogfile = nullptr;
 std::function<int(GRBenv* env, const char* paramname, int* valueP)>
     GRBgetintparam = nullptr;
 std::function<int(GRBenv* env, const char* paramname, double* valueP)>
@@ -434,8 +432,6 @@ std::function<int(int nummodels, GRBmodel** models, GRBmodel* ignore,
     GRBtunemodels = nullptr;
 std::function<int(GRBmodel* model, int i)> GRBgettuneresult = nullptr;
 std::function<int(GRBmodel* model, int i, char** logP)> GRBgettunelog = nullptr;
-std::function<int(GRBmodel* model, GRBmodel* ignore, GRBmodel* hint)>
-    GRBtunemodeladv = nullptr;
 std::function<int(GRBmodel* model)> GRBsync = nullptr;
 
 void LoadGurobiFunctions(DynamicLibrary* gurobi_dynamic_library) {
@@ -608,8 +604,6 @@ void LoadGurobiFunctions(DynamicLibrary* gurobi_dynamic_library) {
   gurobi_dynamic_library->GetFunction(&GRBsetobjective, "GRBsetobjective");
   gurobi_dynamic_library->GetFunction(&GRBsetobjectiven, "GRBsetobjectiven");
   gurobi_dynamic_library->GetFunction(&GRBmsg, "GRBmsg");
-  gurobi_dynamic_library->GetFunction(&GRBgetlogfile, "GRBgetlogfile");
-  gurobi_dynamic_library->GetFunction(&GRBsetlogfile, "GRBsetlogfile");
   gurobi_dynamic_library->GetFunction(&GRBgetintparam, "GRBgetintparam");
   gurobi_dynamic_library->GetFunction(&GRBgetdblparam, "GRBgetdblparam");
   gurobi_dynamic_library->GetFunction(&GRBgetstrparam, "GRBgetstrparam");
@@ -659,14 +653,13 @@ void LoadGurobiFunctions(DynamicLibrary* gurobi_dynamic_library) {
   gurobi_dynamic_library->GetFunction(&GRBtunemodels, "GRBtunemodels");
   gurobi_dynamic_library->GetFunction(&GRBgettuneresult, "GRBgettuneresult");
   gurobi_dynamic_library->GetFunction(&GRBgettunelog, "GRBgettunelog");
-  gurobi_dynamic_library->GetFunction(&GRBtunemodeladv, "GRBtunemodeladv");
   gurobi_dynamic_library->GetFunction(&GRBsync, "GRBsync");
 }
 
 std::vector<std::string> GurobiDynamicLibraryPotentialPaths() {
   std::vector<std::string> potential_paths;
-  const std::vector<std::string> kGurobiVersions = {"911", "910", "903", "902",
-                                                    "811", "801", "752"};
+  const std::vector<std::string> kGurobiVersions = {
+      "952", "951", "950", "911", "910", "903", "902", "811", "801", "752"};
 
   // Look for libraries pointed by GUROBI_HOME first.
   const char* gurobi_home_from_env = getenv("GUROBI_HOME");
@@ -701,6 +694,9 @@ std::vector<std::string> GurobiDynamicLibraryPotentialPaths() {
 #elif defined(__APPLE__)  // OS X
     potential_paths.push_back(absl::StrCat(
         "/Library/gurobi", version, "/mac64/lib/libgurobi", lib, ".dylib"));
+    potential_paths.push_back(absl::StrCat("/Library/gurobi", version,
+                                           "/macos_universal2/lib/libgurobi",
+                                           lib, ".dylib"));
 #elif defined(__GNUC__)   // Linux
     potential_paths.push_back(absl::StrCat(
         "/opt/gurobi", version, "/linux64/lib/libgurobi", lib, ".so"));

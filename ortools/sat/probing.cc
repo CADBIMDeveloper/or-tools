@@ -13,19 +13,28 @@
 
 #include "ortools/sat/probing.h"
 
+#include <algorithm>
 #include <cstdint>
-#include <set>
+#include <utility>
+#include <vector>
 
-#include "ortools/base/iterator_adaptors.h"
+#include "absl/container/inlined_vector.h"
+#include "absl/types/span.h"
+#include "ortools/base/logging.h"
 #include "ortools/base/strong_vector.h"
 #include "ortools/base/timer.h"
 #include "ortools/sat/clause.h"
 #include "ortools/sat/implied_bounds.h"
 #include "ortools/sat/integer.h"
+#include "ortools/sat/model.h"
 #include "ortools/sat/sat_base.h"
+#include "ortools/sat/sat_parameters.pb.h"
 #include "ortools/sat/sat_solver.h"
 #include "ortools/sat/util.h"
+#include "ortools/util/bitset.h"
 #include "ortools/util/logging.h"
+#include "ortools/util/sorted_interval_list.h"
+#include "ortools/util/strong_integers.h"
 #include "ortools/util/time_limit.h"
 
 namespace operations_research {
@@ -179,11 +188,6 @@ bool Prober::ProbeOneVariableInternal(BooleanVariable b) {
 }
 
 bool Prober::ProbeOneVariable(BooleanVariable b) {
-  // Reset statistics.
-  num_new_binary_ = 0;
-  num_new_holes_ = 0;
-  num_new_integer_bounds_ = 0;
-
   // Resize the propagated sparse bitset.
   const int num_variables = sat_solver_->NumVariables();
   propagated_.ClearAndResize(LiteralIndex(2 * num_variables));
@@ -192,7 +196,13 @@ bool Prober::ProbeOneVariable(BooleanVariable b) {
   sat_solver_->SetAssumptionLevel(0);
   if (!sat_solver_->RestoreSolverToAssumptionLevel()) return false;
 
-  return ProbeOneVariableInternal(b);
+  const int initial_num_fixed = sat_solver_->LiteralTrail().Index();
+  if (!ProbeOneVariableInternal(b)) return false;
+
+  // Statistics
+  const int num_fixed = sat_solver_->LiteralTrail().Index();
+  num_new_literals_fixed_ += num_fixed - initial_num_fixed;
+  return true;
 }
 
 bool Prober::ProbeBooleanVariables(
@@ -205,6 +215,7 @@ bool Prober::ProbeBooleanVariables(
   num_new_binary_ = 0;
   num_new_holes_ = 0;
   num_new_integer_bounds_ = 0;
+  num_new_literals_fixed_ = 0;
 
   // Resize the propagated sparse bitset.
   const int num_variables = sat_solver_->NumVariables();
@@ -243,19 +254,22 @@ bool Prober::ProbeBooleanVariables(
     }
   }
 
+  // Update stats.
+  const int num_fixed = sat_solver_->LiteralTrail().Index();
+  num_new_literals_fixed_ = num_fixed - initial_num_fixed;
+
   // Display stats.
   if (logger_->LoggingIsEnabled()) {
     const double time_diff =
         time_limit_->GetElapsedDeterministicTime() - initial_deterministic_time;
-    const int num_fixed = sat_solver_->LiteralTrail().Index();
-    const int num_newly_fixed = num_fixed - initial_num_fixed;
     SOLVER_LOG(logger_, "[Probing] deterministic_time: ", time_diff,
                " (limit: ", deterministic_time_limit,
                ") wall_time: ", wall_timer.Get(), " (",
                (limit_reached ? "Aborted " : ""), num_probed, "/",
                bool_vars.size(), ")");
-    if (num_newly_fixed > 0) {
-      SOLVER_LOG(logger_, "[Probing]  - new fixed Boolean: ", num_newly_fixed,
+    if (num_new_literals_fixed_ > 0) {
+      SOLVER_LOG(logger_,
+                 "[Probing]  - new fixed Boolean: ", num_new_literals_fixed_,
                  " (", num_fixed, "/", sat_solver_->NumVariables(), ")");
     }
     if (num_new_holes_ > 0) {
@@ -326,7 +340,7 @@ bool LookForTrivialSatSolution(double deterministic_time_limit, Model* model) {
 
     // We randomize at the end so that the default params is executed
     // at least once.
-    RandomizeDecisionHeuristic(random, &new_params);
+    RandomizeDecisionHeuristic(*random, &new_params);
     new_params.set_random_seed(i);
     new_params.set_max_deterministic_time(deterministic_time_limit -
                                           elapsed_dtime);
@@ -690,12 +704,14 @@ bool FailedLiteralProbingRound(ProbingOptions options, Model* model) {
           // even better reasony. Maybe it is just better to change all the
           // reason above to a binary one so we don't have an issue here.
           if (trail.AssignmentType(w.blocking_literal.Variable()) != id) {
-            ++num_new_binary;
-            implication_graph->AddBinaryClause(last_decision.Negated(),
-                                               w.blocking_literal);
-
+            // If the variable was true at level zero, there is no point
+            // adding the clause.
             const auto& info = trail.Info(w.blocking_literal.Variable());
             if (info.level > 0) {
+              ++num_new_binary;
+              implication_graph->AddBinaryClause(last_decision.Negated(),
+                                                 w.blocking_literal);
+
               const Literal d = sat_solver->Decisions()[info.level - 1].literal;
               if (d != w.blocking_literal) {
                 implication_graph->ChangeReason(info.trail_index, d);

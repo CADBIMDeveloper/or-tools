@@ -20,12 +20,14 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/optional.h"
 #include "ortools/base/accurate_sum.h"
 #include "ortools/base/commandlineflags.h"
+#include "ortools/base/map_util.h"
 #include "ortools/linear_solver/linear_solver.pb.h"
 #include "ortools/port/file.h"
 #include "ortools/port/proto_utils.h"
@@ -47,11 +49,13 @@ bool IsNanOrAbsGreaterThanOrEqual(double value, double abs_value_threshold) {
 // must have "lower_bound" and "upper_bound" fields.
 template <typename BoundedElement>
 std::string FindErrorInBounds(const BoundedElement& element,
-                              double abs_value_threshold) {
+                              double abs_value_threshold,
+                              const bool accept_trivially_infeasible_bounds) {
   if (std::isnan(element.lower_bound()) || std::isnan(element.upper_bound()) ||
       element.lower_bound() >= abs_value_threshold ||
       element.upper_bound() <= -abs_value_threshold ||
-      element.lower_bound() > element.upper_bound()) {
+      (!accept_trivially_infeasible_bounds &&
+       element.lower_bound() > element.upper_bound())) {
     return absl::StrFormat("Infeasible bounds: [%f, %f]", element.lower_bound(),
                            element.upper_bound());
   }
@@ -59,13 +63,14 @@ std::string FindErrorInBounds(const BoundedElement& element,
 }
 
 // Internal method to detect errors in a single variable.
-std::string FindErrorInMPVariable(const MPVariableProto& variable,
-                                  double abs_value_threshold) {
-  const std::string bound_error =
-      FindErrorInBounds(variable, abs_value_threshold);
+std::string FindErrorInMPVariable(
+    const MPVariableProto& variable, double abs_value_threshold,
+    const bool accept_trivially_infeasible_bounds) {
+  const std::string bound_error = FindErrorInBounds(
+      variable, abs_value_threshold, accept_trivially_infeasible_bounds);
   if (!bound_error.empty()) return bound_error;
 
-  if (variable.is_integer() &&
+  if (!accept_trivially_infeasible_bounds && variable.is_integer() &&
       ceil(variable.lower_bound()) > floor(variable.upper_bound())) {
     return absl::StrCat(
         "Infeasible bounds for integer variable: [", (variable.lower_bound()),
@@ -102,11 +107,11 @@ std::string FindDuplicateVarIndex(const Iterable& var_indices,
 // Internal method to detect errors in a single constraint.
 // "var_mask" is a vector<bool> whose size is the number of variables in
 // the model, and it will be all set to false before and after the call.
-std::string FindErrorInMPConstraint(const MPConstraintProto& constraint,
-                                    std::vector<bool>* var_mask,
-                                    double abs_value_threshold) {
-  const std::string bound_error =
-      FindErrorInBounds(constraint, abs_value_threshold);
+std::string FindErrorInMPConstraint(
+    const MPConstraintProto& constraint, std::vector<bool>* var_mask,
+    double abs_value_threshold, const bool accept_trivially_infeasible_bounds) {
+  const std::string bound_error = FindErrorInBounds(
+      constraint, abs_value_threshold, accept_trivially_infeasible_bounds);
   if (!bound_error.empty()) return bound_error;
 
   // TODO(user): clarify explicitly, at least in a comment, whether we want
@@ -167,7 +172,8 @@ bool IsBoolean(const MPVariableProto& variable) {
 
 std::string FindErrorInMPIndicatorConstraint(
     const MPModelProto& model, const MPIndicatorConstraint& indicator,
-    std::vector<bool>* var_mask, double abs_value_threshold) {
+    std::vector<bool>* var_mask, double abs_value_threshold,
+    bool accept_trivially_infeasible_bounds) {
   if (!indicator.has_var_index()) {
     return "var_index is required.";
   }
@@ -184,7 +190,8 @@ std::string FindErrorInMPIndicatorConstraint(
   }
   const MPConstraintProto& constraint = indicator.constraint();
   std::string error =
-      FindErrorInMPConstraint(constraint, var_mask, abs_value_threshold);
+      FindErrorInMPConstraint(constraint, var_mask, abs_value_threshold,
+                              accept_trivially_infeasible_bounds);
   if (!error.empty()) {
     // Constraint protos can be huge, theoretically. So we guard against
     // that.
@@ -222,17 +229,18 @@ std::string FindErrorInMPSosConstraint(const MPModelProto& model,
   return "";
 }
 
-std::string FindErrorInMPQuadraticConstraint(const MPModelProto& model,
-                                             const MPQuadraticConstraint& qcst,
-                                             std::vector<bool>* var_mask,
-                                             double abs_value_threshold) {
+std::string FindErrorInMPQuadraticConstraint(
+    const MPModelProto& model, const MPQuadraticConstraint& qcst,
+    std::vector<bool>* var_mask, double abs_value_threshold,
+    bool accept_trivially_infeasible_bounds) {
   const int num_vars = model.variable_size();
 
   if (qcst.var_index_size() != qcst.coefficient_size()) {
     return "var_index_size() != coefficient_size()";
   }
 
-  const std::string bound_error = FindErrorInBounds(qcst, abs_value_threshold);
+  const std::string bound_error = FindErrorInBounds(
+      qcst, abs_value_threshold, accept_trivially_infeasible_bounds);
   if (!bound_error.empty()) return bound_error;
 
   for (int i = 0; i < qcst.var_index_size(); ++i) {
@@ -411,10 +419,139 @@ std::string FindErrorInSolutionHint(
   }
   return std::string();
 }
+
+namespace {
+// Maps the names of variables (or constraints, or other entities) to their
+// index in the MPModelProto. Non-unique names are supported, but are singled
+// out as such, by setting their index (the 'value' of the map entry) to -1.
+template <class NamedEntity>
+absl::flat_hash_map<std::string, int> BuildNameToIndexMap(
+    const google::protobuf::RepeatedPtrField<NamedEntity>& entities) {
+  absl::flat_hash_map<std::string, int> out;
+  for (int i = 0; i < entities.size(); ++i) {
+    int& index = gtl::LookupOrInsert(&out, entities.Get(i).name(), i);
+    if (index != i) index = -1;
+  }
+  return out;
+}
+
+class LazyMPModelNameToIndexMaps {
+ public:
+  explicit LazyMPModelNameToIndexMaps(const MPModelProto& model)
+      : model_(model) {}
+
+  absl::StatusOr<int> LookupName(
+      MPModelProto::Annotation::TargetType target_type,
+      const std::string& name) {
+    const absl::flat_hash_map<std::string, int>* map = nullptr;
+    switch (target_type) {
+      case MPModelProto::Annotation::VARIABLE_DEFAULT:
+        if (!variable_name_to_index_) {
+          variable_name_to_index_ = BuildNameToIndexMap(model_.variable());
+        }
+        map = &variable_name_to_index_.value();
+        break;
+      case MPModelProto::Annotation::CONSTRAINT:
+        if (!constraint_name_to_index_) {
+          constraint_name_to_index_ = BuildNameToIndexMap(model_.constraint());
+        }
+        map = &constraint_name_to_index_.value();
+        break;
+      case MPModelProto::Annotation::GENERAL_CONSTRAINT:
+        if (!general_constraint_name_to_index_) {
+          general_constraint_name_to_index_ =
+              BuildNameToIndexMap(model_.general_constraint());
+        }
+        map = &general_constraint_name_to_index_.value();
+        break;
+    }
+    const int index = gtl::FindWithDefault(*map, name, -2);
+    if (index == -2) return absl::NotFoundError("name not found");
+    if (index == -1) return absl::InvalidArgumentError("name is not unique");
+    return index;
+  }
+
+ private:
+  const MPModelProto& model_;
+  std::optional<absl::flat_hash_map<std::string, int>> variable_name_to_index_;
+  std::optional<absl::flat_hash_map<std::string, int>>
+      constraint_name_to_index_;
+  std::optional<absl::flat_hash_map<std::string, int>>
+      general_constraint_name_to_index_;
+};
 }  // namespace
 
-std::string FindErrorInMPModelProto(const MPModelProto& model,
-                                    double abs_value_threshold) {
+std::string FindErrorInAnnotation(const MPModelProto::Annotation& annotation,
+                                  const MPModelProto& model,
+                                  LazyMPModelNameToIndexMaps* name_maps) {
+  // Checks related to the 'target' fields.
+  if (!annotation.has_target_index() && !annotation.has_target_name()) {
+    return "One of target_index or target_name must be set";
+  }
+  if (!MPModelProto::Annotation::TargetType_IsValid(annotation.target_type())) {
+    return "Invalid target_type";
+  }
+  int num_entitities = -1;
+  switch (annotation.target_type()) {
+    case MPModelProto::Annotation::VARIABLE_DEFAULT:
+      num_entitities = model.variable_size();
+      break;
+    case MPModelProto::Annotation::CONSTRAINT:
+      num_entitities = model.constraint_size();
+      break;
+    case MPModelProto::Annotation::GENERAL_CONSTRAINT:
+      num_entitities = model.general_constraint_size();
+      break;
+  }
+  int target_index = -1;
+  if (annotation.has_target_index()) {
+    target_index = annotation.target_index();
+    if (target_index < 0 || target_index >= num_entitities) {
+      return "Invalid target_index";
+    }
+  }
+  if (annotation.has_target_name()) {
+    if (annotation.has_target_index()) {
+      // No need to build the name lookup maps to verify consistency: we can
+      // even accept a name that is not unique, as long as the pointed entity
+      // (identified by its index) has the right name.
+      std::string name;
+      switch (annotation.target_type()) {
+        case MPModelProto::Annotation::VARIABLE_DEFAULT:
+          name = model.variable(target_index).name();
+          break;
+        case MPModelProto::Annotation::CONSTRAINT:
+          name = model.constraint(target_index).name();
+          break;
+        case MPModelProto::Annotation::GENERAL_CONSTRAINT:
+          name = model.general_constraint(target_index).name();
+          break;
+      }
+      if (annotation.target_name() != name) {
+        return absl::StrFormat(
+            "target_name='%s' doesn't match the name '%s' of target_index=%d",
+            annotation.target_name(), name, target_index);
+      }
+    } else {  // !annotation.has_target_index()
+      const absl::StatusOr<int> index_or = name_maps->LookupName(
+          annotation.target_type(), annotation.target_name());
+      if (!index_or.ok()) {
+        return absl::StrCat("Bad target_name: ", index_or.status().message());
+      }
+      target_index = index_or.value();
+    }
+  }
+
+  // As of 2022-02, there are no checks related to the 'payload' fields. They
+  // can be set, unset, everything goes.
+  return "";
+}
+
+}  // namespace
+
+std::string FindErrorInMPModelProto(
+    const MPModelProto& model, double abs_value_threshold,
+    const bool accept_trivially_infeasible_bounds) {
   // NOTE(user): Empty models are considered fine by this function, although
   // it is not clear whether MPSolver::Solve() will always respond in the same
   // way, depending on the solvers.
@@ -433,7 +570,8 @@ std::string FindErrorInMPModelProto(const MPModelProto& model,
   // Validate variables.
   std::string error;
   for (int i = 0; i < num_vars; ++i) {
-    error = FindErrorInMPVariable(model.variable(i), abs_value_threshold);
+    error = FindErrorInMPVariable(model.variable(i), abs_value_threshold,
+                                  accept_trivially_infeasible_bounds);
     if (!error.empty()) {
       return absl::StrCat("In variable #", i, ": ", error, ". Variable proto: ",
                           ProtobufShortDebugString(model.variable(i)));
@@ -445,7 +583,8 @@ std::string FindErrorInMPModelProto(const MPModelProto& model,
   for (int i = 0; i < num_cts; ++i) {
     const MPConstraintProto& constraint = model.constraint(i);
     error = FindErrorInMPConstraint(constraint, &variable_appears,
-                                    abs_value_threshold);
+                                    abs_value_threshold,
+                                    accept_trivially_infeasible_bounds);
     if (!error.empty()) {
       // Constraint protos can be huge, theoretically. So we guard against that.
       return absl::StrCat("In constraint #", i, ": ", error, ". ",
@@ -462,7 +601,7 @@ std::string FindErrorInMPModelProto(const MPModelProto& model,
       case MPGeneralConstraintProto::kIndicatorConstraint:
         error = FindErrorInMPIndicatorConstraint(
             model, gen_constraint.indicator_constraint(), &variable_appears,
-            abs_value_threshold);
+            abs_value_threshold, accept_trivially_infeasible_bounds);
         break;
 
       case MPGeneralConstraintProto::kSosConstraint:
@@ -474,7 +613,7 @@ std::string FindErrorInMPModelProto(const MPModelProto& model,
       case MPGeneralConstraintProto::kQuadraticConstraint:
         error = FindErrorInMPQuadraticConstraint(
             model, gen_constraint.quadratic_constraint(), &variable_appears,
-            abs_value_threshold);
+            abs_value_threshold, accept_trivially_infeasible_bounds);
         break;
 
       case MPGeneralConstraintProto::kAbsConstraint:
@@ -522,6 +661,17 @@ std::string FindErrorInMPModelProto(const MPModelProto& model,
                                   abs_value_threshold);
   if (!error.empty()) {
     return absl::StrCat("In solution_hint(): ", error);
+  }
+
+  // Validate the annotations.
+  {
+    LazyMPModelNameToIndexMaps name_maps(model);
+    for (int a = 0; a < model.annotation_size(); ++a) {
+      error = FindErrorInAnnotation(model.annotation(a), model, &name_maps);
+      if (!error.empty()) {
+        return absl::StrCat("In annotation #", a, ": ", error);
+      }
+    }
   }
 
   return std::string();
@@ -697,13 +847,17 @@ std::string FindErrorInMPModelDeltaProto(const MPModelDeltaProto& delta,
     } else if (var_index >= num_vars) {
       max_var_index = std::max(max_var_index, var_index);
       new_var_indices.insert(var_index);
-      error = FindErrorInMPVariable(var_override_proto, abs_value_threshold);
+      error =
+          FindErrorInMPVariable(var_override_proto, abs_value_threshold,
+                                /*accept_trivially_infeasible_bounds=*/false);
     } else {
       tmp_var_proto = model.variable(var_index);
       // NOTE(user): It is OK for the override proto to be empty, i.e. be a
       // non-override.
       tmp_var_proto.MergeFrom(var_override_proto);
-      error = FindErrorInMPVariable(tmp_var_proto, abs_value_threshold);
+      error =
+          FindErrorInMPVariable(tmp_var_proto, abs_value_threshold,
+                                /*accept_trivially_infeasible_bounds=*/false);
     }
     if (!error.empty()) {
       return absl::StrFormat(
@@ -738,8 +892,9 @@ std::string FindErrorInMPModelDeltaProto(const MPModelDeltaProto& delta,
     } else if (ct_index >= num_constraints) {
       max_ct_index = std::max(max_ct_index, ct_index);
       new_ct_indices.insert(ct_index);
-      error = FindErrorInMPConstraint(constraint_override_proto,
-                                      &variable_appears, abs_value_threshold);
+      error = FindErrorInMPConstraint(
+          constraint_override_proto, &variable_appears, abs_value_threshold,
+          /*accept_trivially_infeasible_bounds=*/false);
     } else {
       // NOTE(user): We don't need to do the merging of var_index/coefficient:
       // that part of the merged constraint will be valid iff the override is
@@ -752,8 +907,9 @@ std::string FindErrorInMPModelDeltaProto(const MPModelDeltaProto& delta,
       MergeMPConstraintProtoExceptTerms(model.constraint(ct_index),
                                         &tmp_constraint_proto);
       tmp_constraint_proto.MergeFrom(constraint_override_proto);
-      error = FindErrorInMPConstraint(tmp_constraint_proto, &variable_appears,
-                                      abs_value_threshold);
+      error = FindErrorInMPConstraint(
+          tmp_constraint_proto, &variable_appears, abs_value_threshold,
+          /*accept_trivially_infeasible_bounds=*/false);
     }
     if (!error.empty()) {
       return absl::StrFormat(

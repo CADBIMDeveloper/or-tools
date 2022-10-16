@@ -22,7 +22,11 @@ syntax = "proto2";
 
 package operations_research.glop;
 
-// next id = 64
+option java_package = "com.google.ortools.glop";
+option java_multiple_files = true;
+option csharp_namespace = "Google.OrTools.Glop";
+
+// next id = 69
 message GlopParameters {
 
   // Supported algorithms for scaling:
@@ -440,5 +444,44 @@ message GlopParameters {
   // messages can also be turned on by displaying logs at level 1 for the
   // relevant files.
   optional bool log_search_progress = 61 [default = false];
+
+  // If true, logs will be displayed to stdout instead of using Google log info.
+  optional bool log_to_stdout = 66 [default = true];
+
+  // If the starting basis contains FREE variable with bounds, we will move
+  // any such variable to their closer bounds if the distance is smaller than
+  // this parameter.
+  //
+  // The starting statuses can contains FREE variables with bounds, if a user
+  // set it like this externally. Also, any variable with an initial BASIC
+  // status that was not kept in the initial basis is marked as FREE before this
+  // step is applied.
+  //
+  // Note that by default a FREE variable is assumed to be zero unless a
+  // starting value was specified via SetStartingVariableValuesForNextSolve().
+  //
+  // Note that, at the end of the solve, some of these FREE variable with bounds
+  // and an interior point value might still be left in the final solution.
+  // Enable push_to_vertex to clean these up.
+  optional double crossover_bound_snapping_distance = 64 [default = inf];
+
+  // If the optimization phases finishes with super-basic variables (i.e.,
+  // variables that either 1) have bounds but are FREE in the basis, or 2) have
+  // no bounds and are FREE in the basis at a nonzero value), then run a "push"
+  // phase to push these variables to bounds, obtaining a vertex solution. Note
+  // this situation can happen only if a starting value was specified via
+  // SetStartingVariableValuesForNextSolve().
+  optional bool push_to_vertex = 65 [default = true];
+
+  // If presolve runs, include the pass that detects implied free variables.
+  optional bool use_implied_free_preprocessor = 67 [default = true];
+
+  // Any finite values in the input LP must be below this threshold, otherwise
+  // the model will be reported invalid. This is needed to avoid floating point
+  // overflow when evaluating bounds * coeff for instance. In practice, users
+  // shouldn't use super large values in an LP. With the default threshold, even
+  // evaluating large constraint with variables at their bound shouldn't cause
+  // any overflow.
+  optional double max_valid_magnitude = 199 [default = 1e30];
 
 }

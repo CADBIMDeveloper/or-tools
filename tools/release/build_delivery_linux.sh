@@ -41,51 +41,22 @@ function assert_defined(){
   fi
 }
 
-function build_cxx() {
-  if echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" | cmp --silent "${ROOT_DIR}/export/cxx_build" -; then
-    echo "build C++ up to date!"
-    return 0
-  fi
-
-  # Check all prerequisite
-  command -v gcc | xargs echo "gcc: " | tee -a build.log
-  command -v cmake | xargs echo "cmake: " | tee -a build.log
-  command -v make | xargs echo "make: " | tee -a build.log
-
-  # Clean everything
-  cd "${ROOT_DIR}" || exit 2
-  make clean
-  make clean_third_party
-
-  #  Build Third Party
-  echo -n "Build Third Party..." | tee -a build.log
-  make third_party UNIX_PYTHON_VER=3
-  echo "DONE" | tee -a build.log
-
-  echo -n "Build C++..." | tee -a build.log
-  make cc -l 4 UNIX_PYTHON_VER=3
-  echo "DONE" | tee -a build.log
-  #make test_cc -l 4 UNIX_PYTHON_VER=3
-  #echo "make test_cc: DONE" | tee -a build.log
-
-  echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" > "${ROOT_DIR}/export/cxx_build"
-}
-
-# Net build
+# .Net build
 function build_dotnet() {
   if echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" | cmp --silent "${ROOT_DIR}/export/dotnet_build" -; then
     echo "build .Net up to date!"
     return 0
   fi
-  build_cxx
 
+  command -v swig
   command -v swig | xargs echo "swig: " | tee -a build.log
+  command -v dotnet
   command -v dotnet | xargs echo "dotnet: " | tee -a build.log
 
   # Install .Net SNK
   echo -n "Install .Net SNK..." | tee -a build.log
   local OPENSSL_PRG=openssl
-  if [ -x "$(command -v openssl11)" ]; then
+  if [[ -x $(command -v openssl11) ]]; then
     OPENSSL_PRG=openssl11
   fi
 
@@ -96,31 +67,34 @@ function build_dotnet() {
   echo "DONE" | tee -a build.log
 
   # Clean dotnet
+  echo -n "Clean .Net..." | tee -a build.log
   cd "${ROOT_DIR}" || exit 2
-  make clean_dotnet
+  rm -rf "${ROOT_DIR}/temp_dotnet"
+  echo "DONE" | tee -a build.log
 
   echo -n "Build .Net..." | tee -a build.log
-  make dotnet -l 4 UNIX_PYTHON_VER=3
+  cmake -S. -Btemp_dotnet -DBUILD_SAMPLES=OFF -DBUILD_EXAMPLES=OFF -DBUILD_DOTNET=ON
+  cmake --build temp_dotnet -j8 -v
   echo "DONE" | tee -a build.log
-  #make test_dotnet -l 4 UNIX_PYTHON_VER=3
-  #echo "make test_dotnet: DONE" | tee -a build.log
+  #cmake --build temp_dotnet --target test
+  #echo "cmake test: DONE" | tee -a build.log
 
-  cp packages/*nupkg export/
+  cp temp_dotnet/dotnet/packages/*nupkg export/
   echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" > "${ROOT_DIR}/export/dotnet_build"
 }
 
 # Java build
 function build_java() {
   if echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" | cmp --silent "${ROOT_DIR}/export/java_build" -; then
-    echo "build Java up to date!"
+    echo "build Java up to date!" | tee -a build.log
     return 0
   fi
-  build_cxx
 
+  command -v swig
   command -v swig | xargs echo "swig: " | tee -a build.log
   # maven require JAVA_HOME
   if [[ -z "${JAVA_HOME}" ]]; then
-    echo "JAVA_HOME: not found !" | tee build.log
+    echo "JAVA_HOME: not found !" | tee -a build.log
     exit 1
   else
     echo "JAVA_HOME: ${JAVA_HOME}" | tee -a build.log
@@ -131,7 +105,7 @@ function build_java() {
   fi
   # Maven central need gpg sign and we store the release key encoded using openssl
   local OPENSSL_PRG=openssl
-  if [ -x "$(command -v openssl11)" ]; then
+  if [[ -x $(command -v openssl11) ]]; then
     OPENSSL_PRG=openssl11
   fi
   command -v $OPENSSL_PRG | xargs echo "openssl: " | tee -a build.log
@@ -151,45 +125,67 @@ function build_java() {
   echo "DONE" | tee -a build.log
 
   # Clean java
+  echo -n "Clean Java..." | tee -a build.log
   cd "${ROOT_DIR}" || exit 2
-  make clean_java
+  rm -rf "${ROOT_DIR}/temp_java"
+  echo "DONE" | tee -a build.log
 
   echo -n "Build Java..." | tee -a build.log
-  make java -l 4 UNIX_PYTHON_VER=3
-  echo "DONE" | tee -a build.log
-  #make test_java -l 4 UNIX_PYTHON_VER=3
-  #echo "make test_java: DONE" | tee -a build.log
 
-  cp temp_java/ortools-linux-x86-64/target/*.jar* export/
-  cp temp_java/ortools-java/target/*.jar* export/
+  if [[ ! -v GPG_ARGS ]]; then
+    GPG_EXTRA=""
+  else
+    GPG_EXTRA="-DGPG_ARGS=${GPG_ARGS}"
+  fi
+
+  cmake -S. -Btemp_java -DBUILD_SAMPLES=OFF -DBUILD_EXAMPLES=OFF \
+ -DBUILD_JAVA=ON -DSKIP_GPG=OFF ${GPG_EXTRA}
+  cmake --build temp_java -j8 -v
+  echo "DONE" | tee -a build.log
+  #cmake --build temp_java --target test
+  #echo "cmake test: DONE" | tee -a build.log
+
+  cp temp_java/java/ortools-linux-x86-64/target/*.jar* export/
+  cp temp_java/java/ortools-java/target/*.jar* export/
   echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" > "${ROOT_DIR}/export/java_build"
 }
 
-function build_fz() {
-  if echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" | cmp --silent "${ROOT_DIR}/export/fz_build" -; then
-    echo "build Flatzinc up to date!"
+# Python 3
+# todo(mizux) Use `make --directory tools/docker python` instead
+function build_python() {
+  if echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" | cmp --silent "${ROOT_DIR}/export/python_build" -; then
+    echo "build python up to date!" | tee -a build.log
     return 0
   fi
-  build_cxx
 
-  # Clean fz
-  cd "${ROOT_DIR}" || exit 2
-  make clean_fz
+  command -v swig
+  command -v swig | xargs echo "swig: " | tee -a build.log
+  command -v python3 | xargs echo "python3: " | tee -a build.log
+  command -v protoc-gen-mypy | xargs echo "protoc-gen-mypy: " | tee -a build.log
+  protoc-gen-mypy --version | xargs echo "protoc-gen-mypy version: " | tee -a build.log
+  protoc-gen-mypy --version | grep "3\.2\.0"
 
-  echo -n "Build flatzinc..." | tee -a build.log
-  make fz -l 4 UNIX_PYTHON_VER=3
+  echo -n "Cleaning Python 3..." | tee -a build.log
+  rm -rf temp_python
   echo "DONE" | tee -a build.log
 
-  echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" > "${ROOT_DIR}/export/fz_build"
+  echo -n "Build Python 3..." | tee -a build.log
+  cmake -S . -B temp_python -DBUILD_SAMPLES=OFF -DBUILD_EXAMPLES=OFF -DBUILD_PYTHON=ON
+  cmake --build temp_python -j8 -v
+  echo "DONE" | tee -a build.log
+  #cmake --build test_python --target test
+  #echo "cmake test_python: DONE" | tee -a build.log
+
+  cp temp_python/python/dist/*.whl export/
+  echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" > "${ROOT_DIR}/export/python_build"
 }
 
 # Create Archive
 function build_archive() {
   if echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" | cmp --silent "${ROOT_DIR}/export/archive_build" -; then
-    echo "build archive up to date!"
+    echo "build archive up to date!" | tee -a build.log
     return 0
   fi
-  build_fz
 
   # Clean archive
   cd "${ROOT_DIR}" || exit 2
@@ -216,7 +212,7 @@ function build_archive() {
 # Build Examples
 function build_examples() {
   if echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" | cmp --silent "${ROOT_DIR}/export/examples_build" -; then
-    echo "build examples up to date!"
+    echo "build examples up to date!" | tee -a build.log
     return 0
   fi
 
@@ -238,35 +234,6 @@ function build_examples() {
   echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" > "${ROOT_DIR}/export/examples_build"
 }
 
-# Python 3
-# todo(mizux) Use `make --directory tools/docker python` instead
-function build_python() {
-  build_cxx
-
-  command -v swig | xargs echo "swig: " | tee -a build.log
-  command -v python3 | xargs echo "python3: " | tee -a build.log
-  command -v protoc-gen-mypy | xargs echo "protoc-gen-mypy: " | tee -a build.log
-
-  echo -n "Cleaning Python 3..." | tee -a build.log
-  make clean_python UNIX_PYTHON_VER=3
-  echo "DONE" | tee -a build.log
-
-  echo -n "Build Python 3..." | tee -a build.log
-  make python -l 4 UNIX_PYTHON_VER=3
-  echo "DONE" | tee -a build.log
-  #make test_python UNIX_PYTHON_VER=3
-  #echo "make test_python3: DONE" | tee -a build.log
-  echo -n "Build Python 3 wheel archive..." | tee -a build.log
-  make package_python UNIX_PYTHON_VER=3
-  echo "DONE" | tee -a build.log
-  echo -n "Test Python 3 wheel archive..." | tee -a build.log
-  make test_package_python UNIX_PYTHON_VER=3
-  echo "DONE" | tee -a build.log
-
-  cp temp_python3/ortools/dist/*.whl export/
-  echo "${ORTOOLS_BRANCH} ${ORTOOLS_SHA1}" > "${ROOT_DIR}/export/python_build"
-}
-
 # Main
 function main() {
   case ${1} in
@@ -275,21 +242,21 @@ function main() {
   esac
 
   assert_defined ORTOOLS_TOKEN
-  echo "ORTOOLS_TOKEN: FOUND" | tee build.log
+  echo "ORTOOLS_TOKEN: FOUND" | tee -a build.log
   make print-OR_TOOLS_VERSION | tee -a build.log
 
   local -r ROOT_DIR="$(cd -P -- "$(dirname -- "$0")/../.." && pwd -P)"
-  echo "ROOT_DIR: '${ROOT_DIR}'"
+  echo "ROOT_DIR: '${ROOT_DIR}'" | tee -a build.log
 
   local -r RELEASE_DIR="$(cd -P -- "$(dirname -- "$0")" && pwd -P)"
-  echo "RELEASE_DIR: '${RELEASE_DIR}'"
+  echo "RELEASE_DIR: '${RELEASE_DIR}'" | tee -a build.log
 
   local -r ORTOOLS_BRANCH=$(git rev-parse --abbrev-ref HEAD)
   local -r ORTOOLS_SHA1=$(git rev-parse --verify HEAD)
   mkdir -p export
 
   case ${1} in
-    cxx|dotnet|java|python|archive|examples)
+    dotnet|java|python|archive|examples)
       "build_$1"
       exit ;;
     all)
@@ -300,7 +267,7 @@ function main() {
       build_examples
       exit ;;
     *)
-      >&2 echo "Target '${1}' unknown"
+      >&2 echo "Target '${1}' unknown" | tee -a build.log
       exit 1
   esac
   exit 0

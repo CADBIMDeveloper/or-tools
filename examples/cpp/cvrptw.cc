@@ -17,19 +17,18 @@
 // http://en.wikipedia.org/wiki/Vehicle_routing_problem.
 // The variant which is tackled by this model includes a capacity dimension,
 // time windows and optional orders, with a penalty cost if orders are not
-// performed. For the sake of simplicty, orders are randomly located and
+// performed. For the sake of simplicity, orders are randomly located and
 // distances are computed using the Manhattan distance. Distances are assumed
 // to be in meters and times in seconds.
 
 #include <cstdint>
 #include <vector>
 
-#include "absl/flags/parse.h"
-#include "absl/flags/usage.h"
 #include "absl/random/random.h"
 #include "examples/cpp/cvrptw_lib.h"
 #include "google/protobuf/text_format.h"
 #include "ortools/base/commandlineflags.h"
+#include "ortools/base/init_google.h"
 #include "ortools/base/integral_types.h"
 #include "ortools/base/logging.h"
 #include "ortools/constraint_solver/routing.h"
@@ -49,11 +48,10 @@ using operations_research::RoutingNodeIndex;
 using operations_research::RoutingSearchParameters;
 using operations_research::ServiceTimePlusTransition;
 
-ABSL_FLAG(int, vrp_orders, 100, "Nodes in the problem.");
-ABSL_FLAG(int, vrp_vehicles, 20,
-          "Size of Traveling Salesman Problem instance.");
+ABSL_FLAG(int, vrp_orders, 100, "Number of nodes in the problem");
+ABSL_FLAG(int, vrp_vehicles, 20, "Number of vehicles in the problem");
 ABSL_FLAG(bool, vrp_use_deterministic_random_seed, false,
-          "Use deterministic random seeds.");
+          "Use deterministic random seeds");
 ABSL_FLAG(bool, vrp_use_same_vehicle_costs, false,
           "Use same vehicle costs in the routing model");
 ABSL_FLAG(std::string, routing_search_parameters, "",
@@ -66,8 +64,7 @@ const int64_t kMaxNodesPerGroup = 10;
 const int64_t kSameVehicleCost = 1000;
 
 int main(int argc, char** argv) {
-  google::InitGoogleLogging(argv[0]);
-  absl::ParseCommandLine(argc, argv);
+  InitGoogle(argv[0], &argc, &argv, true);
   CHECK_LT(0, absl::GetFlag(FLAGS_vrp_orders))
       << "Specify an instance size greater than 0.";
   CHECK_LT(0, absl::GetFlag(FLAGS_vrp_vehicles))

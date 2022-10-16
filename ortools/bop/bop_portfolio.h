@@ -15,6 +15,7 @@
 #define OR_TOOLS_BOP_BOP_PORTFOLIO_H_
 
 #include <cstdint>
+#include <string>
 
 #include "ortools/base/strong_vector.h"
 #include "ortools/bop/bop_base.h"
@@ -25,13 +26,15 @@
 #include "ortools/glop/lp_solver.h"
 #include "ortools/sat/boolean_problem.pb.h"
 #include "ortools/sat/sat_solver.h"
+#include "ortools/util/random_engine.h"
 #include "ortools/util/stats.h"
+#include "ortools/util/strong_integers.h"
 #include "ortools/util/time_limit.h"
 
 namespace operations_research {
 namespace bop {
 
-DEFINE_INT_TYPE(OptimizerIndex, int);
+DEFINE_STRONG_INDEX_TYPE(OptimizerIndex);
 const OptimizerIndex kInvalidOptimizerIndex(-1);
 
 // Forward declaration.
@@ -85,7 +88,7 @@ class PortfolioOptimizer : public BopOptimizerBase {
                         const BopParameters& parameters,
                         const BopSolverOptimizerSet& optimizer_set);
 
-  std::unique_ptr<MTRandom> random_;
+  random_engine_t random_;
   int64_t state_update_stamp_;
   BopConstraintTerms objective_terms_;
   std::unique_ptr<OptimizerSelector> selector_;

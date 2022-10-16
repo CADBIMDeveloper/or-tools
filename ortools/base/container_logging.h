@@ -14,7 +14,6 @@
 // Utilities for container logging.
 // TODO(user): Broaden the scope and rename to "stream_util.h"
 //
-// Maintainers: This file is part of portable google3 (go/pg3).
 //
 // The typical use looks like this:
 //
@@ -41,6 +40,7 @@
 #include <string>
 #include <type_traits>
 
+#include "absl/base/port.h"
 #include "ortools/base/integral_types.h"
 
 namespace gtl {

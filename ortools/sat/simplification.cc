@@ -15,22 +15,31 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <limits>
-#include <set>
+#include <memory>
 #include <utility>
+#include <vector>
 
-#include "absl/memory/memory.h"
+#include "absl/types/span.h"
 #include "ortools/algorithms/dynamic_partition.h"
 #include "ortools/base/adjustable_priority_queue-inl.h"
+#include "ortools/base/adjustable_priority_queue.h"
 #include "ortools/base/logging.h"
-#include "ortools/base/random.h"
+#include "ortools/base/macros.h"
 #include "ortools/base/stl_util.h"
 #include "ortools/base/strong_vector.h"
 #include "ortools/base/timer.h"
 #include "ortools/graph/strongly_connected_components.h"
+#include "ortools/sat/drat_proof_handler.h"
+#include "ortools/sat/model.h"
 #include "ortools/sat/probing.h"
+#include "ortools/sat/sat_base.h"
 #include "ortools/sat/sat_inprocessing.h"
-#include "ortools/sat/util.h"
+#include "ortools/sat/sat_parameters.pb.h"
+#include "ortools/sat/sat_solver.h"
+#include "ortools/util/logging.h"
+#include "ortools/util/strong_integers.h"
 #include "ortools/util/time_limit.h"
 
 namespace operations_research {
@@ -226,7 +235,7 @@ void SatPresolver::AddClauseInternal(std::vector<Literal>* clause) {
   if (drat_proof_handler_ != nullptr) drat_proof_handler_->AddClause(*clause);
 
   DCHECK(std::is_sorted(clause->begin(), clause->end()));
-  DCHECK_GT(clause->size(), 0) << "TODO(fdid): Unsat during presolve?";
+  DCHECK_GT(clause->size(), 0) << "TODO(user): Unsat during presolve?";
   const ClauseIndex ci(clauses_.size());
   clauses_.push_back(std::vector<Literal>());
   clauses_.back().swap(*clause);
@@ -381,7 +390,7 @@ void SatPresolver::PresolveWithBva() {
   }
 }
 
-// We use the same notation as in the article mentionned in the .h
+// We use the same notation as in the article mentioned in the .h
 void SatPresolver::SimpleBva(LiteralIndex l) {
   literal_to_p_size_.resize(literal_to_clauses_.size(), 0);
   DCHECK(std::all_of(literal_to_p_size_.begin(), literal_to_p_size_.end(),
@@ -451,7 +460,7 @@ void SatPresolver::SimpleBva(LiteralIndex l) {
 
     // Set m_cls_ to p_[lmax].
     m_cls_.clear();
-    for (const auto entry : flattened_p_) {
+    for (const auto& entry : flattened_p_) {
       literal_to_p_size_[entry.first] = 0;
       if (entry.first == lmax) m_cls_.push_back(entry.second);
     }
@@ -459,7 +468,7 @@ void SatPresolver::SimpleBva(LiteralIndex l) {
   }
 
   // Make sure literal_to_p_size_ is all zero.
-  for (const auto entry : flattened_p_) literal_to_p_size_[entry.first] = 0;
+  for (const auto& entry : flattened_p_) literal_to_p_size_[entry.first] = 0;
   flattened_p_.clear();
 
   // A strictly positive reduction means that applying the BVA transform will
@@ -1354,7 +1363,7 @@ SatSolver::Status SolveWithPresolve(std::unique_ptr<SatSolver>* solver,
       VLOG(1) << "UNSAT during presolve.";
 
       // This is just here to reset the SatSolver::Solve() statistics.
-      (*solver) = absl::make_unique<SatSolver>();
+      (*solver) = std::make_unique<SatSolver>();
       return SatSolver::INFEASIBLE;
     }
 
@@ -1364,7 +1373,7 @@ SatSolver::Status SolveWithPresolve(std::unique_ptr<SatSolver>* solver,
     }
 
     // Load the presolved problem in a new solver.
-    (*solver) = absl::make_unique<SatSolver>();
+    (*solver) = std::make_unique<SatSolver>();
     (*solver)->SetDratProofHandler(drat_proof_handler);
     (*solver)->SetParameters(parameters);
     presolver.LoadProblemIntoSatSolver((*solver).get());

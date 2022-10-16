@@ -63,22 +63,6 @@ from ortools.linear_solver.linear_solver_natural_api import SumArray
 from ortools.linear_solver.linear_solver_natural_api import SumCst
 from ortools.linear_solver.linear_solver_natural_api import LinearConstraint
 from ortools.linear_solver.linear_solver_natural_api import VariableExpr
-
-# Remove the documentation of some functions.
-# See https://pdoc3.github.io/pdoc/doc/pdoc/#overriding-docstrings-with-
-__pdoc__ = {}
-__pdoc__['Solver_infinity'] = False
-__pdoc__['Solver_Infinity'] = False
-__pdoc__['Solver_SolveWithProto'] = False
-__pdoc__['Solver_SupportsProblemType'] = False
-__pdoc__['setup_variable_operator'] = False
-__pdoc__['Constraint.thisown'] = False
-__pdoc__['Constraint.thisown'] = False
-__pdoc__['MPSolverParameters.thisown'] = False
-__pdoc__['ModelExportOptions.thisown'] = False
-__pdoc__['Objective.thisown'] = False
-__pdoc__['Solver.thisown'] = False
-__pdoc__['Variable.thisown'] = False
 %}  // %pythoncode
 
 %extend operations_research::MPVariable {
@@ -104,11 +88,21 @@ __pdoc__['Variable.thisown'] = False
     return error_message;
   }
 
+  // Ditto for LoadModelFromProtoWithUniqueNamesOrDie()
+  std::string LoadModelFromProtoWithUniqueNamesOrDie(const operations_research::MPModelProto& input_model) {
+    std::string error_message;
+    $self->LoadModelFromProtoWithUniqueNamesOrDie(input_model, &error_message);
+    return error_message;
+  }
+
   // Change the API of LoadSolutionFromProto() to simply return a boolean.
   bool LoadSolutionFromProto(
       const operations_research::MPSolutionResponse& response,
-      double tolerance = operations_research::MPSolverParameters::kDefaultPrimalTolerance) {
-    return $self->LoadSolutionFromProto(response, tolerance).ok();
+      double tolerance = std::numeric_limits<double>::infinity()) {
+    const absl::Status status =
+        $self->LoadSolutionFromProto(response, tolerance);
+    LOG_IF(ERROR, !status.ok()) << "LoadSolutionFromProto() failed: " << status;
+    return status.ok();
   }
 
   std::string ExportModelAsLpFormat(bool obfuscated) {
@@ -242,6 +236,10 @@ PY_PROTO_TYPEMAP(ortools.linear_solver.linear_solver_pb2,
                  operations_research::MPModelProto);
 
 PY_PROTO_TYPEMAP(ortools.linear_solver.linear_solver_pb2,
+                 MPModelRequest,
+                 operations_research::MPModelRequest);
+
+PY_PROTO_TYPEMAP(ortools.linear_solver.linear_solver_pb2,
                  MPSolutionResponse,
                  operations_research::MPSolutionResponse);
 
@@ -265,12 +263,13 @@ PY_CONVERT(MPVariable);
 
 // Expose the MPSolver::OptimizationProblemType enum.
 %unignore operations_research::MPSolver::OptimizationProblemType;
-%unignore operations_research::MPSolver::GLOP_LINEAR_PROGRAMMING;
 %unignore operations_research::MPSolver::CLP_LINEAR_PROGRAMMING;
+%unignore operations_research::MPSolver::GLOP_LINEAR_PROGRAMMING;
 %unignore operations_research::MPSolver::GLPK_LINEAR_PROGRAMMING;
-%unignore operations_research::MPSolver::SCIP_MIXED_INTEGER_PROGRAMMING;
+%unignore operations_research::MPSolver::PDLP_LINEAR_PROGRAMMING;
 %unignore operations_research::MPSolver::CBC_MIXED_INTEGER_PROGRAMMING;
 %unignore operations_research::MPSolver::GLPK_MIXED_INTEGER_PROGRAMMING;
+%unignore operations_research::MPSolver::SCIP_MIXED_INTEGER_PROGRAMMING;
 %unignore operations_research::MPSolver::BOP_INTEGER_PROGRAMMING;
 %unignore operations_research::MPSolver::SAT_INTEGER_PROGRAMMING;
 // These aren't unit tested, as they only run on machines with a Gurobi license.

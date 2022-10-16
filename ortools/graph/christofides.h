@@ -27,6 +27,7 @@
 #define OR_TOOLS_GRAPH_CHRISTOFIDES_H_
 
 #include <cstdint>
+#include <string>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -58,7 +59,7 @@ class ChristofidesPathSolver {
   };
   ChristofidesPathSolver(NodeIndex num_nodes, CostFunction costs);
 
-  // Sets the matching algorith to use. A minimum weight perfect matching
+  // Sets the matching algorithm to use. A minimum weight perfect matching
   // (MINIMUM_WEIGHT_MATCHING) guarantees the 3/2 upper bound to the optimal
   // solution. A minimal weight perfect matching (MINIMAL_WEIGHT_MATCHING)
   // finds a locally minimal weight matching which does not offer any bound
@@ -81,15 +82,7 @@ class ChristofidesPathSolver {
   bool Solve();
 
  private:
-  // Safe addition operator to avoid overflows when possible.
-  //template <typename T>
-  //T SafeAdd(T a, T b) {
-  //  return a + b;
-  //}
-  //template <>
-  int64_t SafeAdd(int64_t a, int64_t b) {
-    return CapAdd(a, b);
-  }
+  int64_t SafeAdd(int64_t a, int64_t b) { return CapAdd(a, b); }
 
   // Matching algorithm to use.
   MatchingAlgorithm matching_;

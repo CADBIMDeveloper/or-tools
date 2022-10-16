@@ -52,6 +52,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/attributes.h"
 #include "absl/status/status.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_format.h"
@@ -64,6 +65,7 @@
 #include "ortools/linear_solver/gurobi_proto_solver.h"
 #include "ortools/linear_solver/linear_solver.h"
 #include "ortools/linear_solver/linear_solver_callback.h"
+#include "ortools/util/time_limit.h"
 
 ABSL_FLAG(int, num_gurobi_threads, 4,
           "Number of threads available for Gurobi.");
@@ -83,8 +85,7 @@ class GurobiInterface : public MPSolverInterface {
   // Solves the problem using the parameter values specified.
   MPSolver::ResultStatus Solve(const MPSolverParameters& param) override;
   absl::optional<MPSolutionResponse> DirectlySolveProto(
-      const MPModelRequest& request) override;
-
+      const MPModelRequest& request, std::atomic<bool>* interrupt) override;
   // Writes the model.
   void Write(const std::string& filename) override;
 
@@ -160,7 +161,7 @@ class GurobiInterface : public MPSolverInterface {
       return 0.0;
     }
 
-    // TODO(user,user): Not yet working.
+    // TODO(user): Not yet working.
     LOG(DFATAL) << "ComputeExactConditionNumber not implemented for"
                 << " GUROBI_LINEAR_PROGRAMMING";
     return 0.0;
@@ -717,7 +718,7 @@ bool GurobiInterface::AddIndicatorConstraint(MPConstraint* const ct) {
   return !IsContinuous();
 }
 
-void GurobiInterface::AddVariable(MPVariable* const ct) {
+void GurobiInterface::AddVariable(MPVariable* const var) {
   sync_status_ = MUST_RELOAD;
 }
 
@@ -1203,7 +1204,7 @@ MPSolver::ResultStatus GurobiInterface::Solve(const MPSolverParameters& param) {
   if (callback_ == nullptr) {
     CheckedGurobiCall(GRBsetcallbackfunc(model_, nullptr, nullptr));
   } else {
-    gurobi_context = absl::make_unique<GurobiMPCallbackContext>(
+    gurobi_context = std::make_unique<GurobiMPCallbackContext>(
         env_, &mp_var_to_gurobi_var_, num_gurobi_vars_,
         callback_->might_add_cuts(), callback_->might_add_lazy_constraints());
     mp_callback_with_context.context = gurobi_context.get();
@@ -1245,7 +1246,7 @@ MPSolver::ResultStatus GurobiInterface::Solve(const MPSolverParameters& param) {
       result_status_ = MPSolver::UNBOUNDED;
       break;
     case GRB_INF_OR_UNBD:
-      // TODO(user,user): We could introduce our own "infeasible or
+      // TODO(user): We could introduce our own "infeasible or
       // unbounded" status.
       result_status_ = MPSolver::INFEASIBLE;
       break;
@@ -1318,7 +1319,10 @@ MPSolver::ResultStatus GurobiInterface::Solve(const MPSolverParameters& param) {
 }
 
 absl::optional<MPSolutionResponse> GurobiInterface::DirectlySolveProto(
-    const MPModelRequest& request) {
+    const MPModelRequest& request, std::atomic<bool>* interrupt) {
+  // Interruption via atomic<bool> is not directly supported by Gurobi.
+  if (interrupt != nullptr) return absl::nullopt;
+
   // Here we reuse the Gurobi environment to support single-use license that
   // forbids creating a second environment if one already exists.
   const auto status_or = GurobiSolveProto(request, env_);
@@ -1362,7 +1366,7 @@ bool GurobiInterface::NextSolution() {
     var->set_solution_value(
         grb_variable_values.at(mp_var_to_gurobi_var_.at(i)));
   }
-  // TODO(user,user): This reset may not be necessary, investigate.
+  // TODO(user): This reset may not be necessary, investigate.
   GRBresetparams(GRBgetenv(model_));
   return true;
 }

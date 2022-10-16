@@ -15,23 +15,22 @@
 
 #include <cstdint>
 #include <numeric>
+#include <string>
 #include <vector>
 
 #include "absl/flags/flag.h"
-#include "absl/flags/parse.h"
-#include "absl/flags/usage.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 #include "google/protobuf/text_format.h"
 #include "ortools/base/commandlineflags.h"
-#include "ortools/base/filelineiter.h"
+#include "ortools/base/init_google.h"
 #include "ortools/base/logging.h"
 #include "ortools/base/timer.h"
 #include "ortools/sat/cp_model.h"
-#include "ortools/sat/cp_model_solver.h"
 #include "ortools/sat/model.h"
+#include "ortools/util/filelineiter.h"
 
 ABSL_FLAG(std::string, input, "examples/data/weighted_tardiness/wt40.txt",
           "wt data file name.");
@@ -90,26 +89,25 @@ void Solve(const std::vector<int64_t>& durations,
 
   std::vector<IntervalVar> task_intervals(num_tasks);
   std::vector<IntVar> task_starts(num_tasks);
-  std::vector<IntVar> task_durations(num_tasks);
-  std::vector<IntVar> task_ends(num_tasks);
-  std::vector<IntVar> tardiness_vars(num_tasks);
+  std::vector<LinearExpr> tardiness_expressions(num_tasks);
+  LinearExpr objective;
 
   for (int i = 0; i < num_tasks; ++i) {
     task_starts[i] = cp_model.NewIntVar(Domain(0, horizon - durations[i]));
-    task_durations[i] = cp_model.NewConstant(durations[i]);
-    task_ends[i] = cp_model.NewIntVar(Domain(durations[i], horizon));
-    task_intervals[i] = cp_model.NewIntervalVar(
-        task_starts[i], task_durations[i], task_ends[i]);
+    task_intervals[i] =
+        cp_model.NewFixedSizeIntervalVar(task_starts[i], durations[i]);
+
     if (due_dates[i] == 0) {
-      tardiness_vars[i] = task_ends[i];
+      tardiness_expressions[i] = task_starts[i] + durations[i];
     } else {
-      tardiness_vars[i] = cp_model.NewIntVar(
+      tardiness_expressions[i] = cp_model.NewIntVar(
           Domain(0, std::max<int64_t>(0, horizon - due_dates[i])));
 
       // tardiness_vars >= end - due_date
-      cp_model.AddGreaterOrEqual(tardiness_vars[i],
-                                 task_ends[i].AddConstant(-due_dates[i]));
+      cp_model.AddGreaterOrEqual(tardiness_expressions[i],
+                                 task_starts[i] + durations[i] - due_dates[i]);
     }
+    objective += weights[i] * tardiness_expressions[i];
   }
 
   // Decision heuristic. Note that we don't instantiate all the variables. As a
@@ -135,7 +133,7 @@ void Solve(const std::vector<int64_t>& durations,
   //
   // Note however than for big problem, this will drastically augment the time
   // to get a first feasible solution (but then the heuristic gave one to us).
-  cp_model.Minimize(LinearExpr::ScalProd(tardiness_vars, weights));
+  cp_model.Minimize(objective);
 
   // Optional preprocessing: add precedences that don't change the optimal
   // solution value.
@@ -158,7 +156,7 @@ void Solve(const std::vector<int64_t>& durations,
         }
 
         ++num_added_precedences;
-        cp_model.AddLessOrEqual(task_ends[i], task_starts[j]);
+        cp_model.AddLessOrEqual(task_starts[i] + durations[i], task_starts[j]);
       }
     }
   }
@@ -170,14 +168,8 @@ void Solve(const std::vector<int64_t>& durations,
   // Note that we only fully instantiate the start/end and only look at the
   // lower bound for the objective and the tardiness variables.
   Model model;
-  SatParameters parameters;
-  // Parse the --params flag.
-  if (!absl::GetFlag(FLAGS_params).empty()) {
-    CHECK(google::protobuf::TextFormat::MergeFromString(
-        absl::GetFlag(FLAGS_params), &parameters))
-        << absl::GetFlag(FLAGS_params);
-    model.Add(NewSatParameters(parameters));
-  }
+  model.Add(NewSatParameters(absl::GetFlag(FLAGS_params)));
+  model.GetOrCreate<SatParameters>()->set_log_search_progress(true);
   model.Add(NewFeasibleSolutionObserver([&](const CpSolverResponse& r) {
     // Note that we compute the "real" cost here and do not use the tardiness
     // variables. This is because in the core based approach, the tardiness
@@ -186,10 +178,9 @@ void Solve(const std::vector<int64_t>& durations,
 
     int64_t objective = 0;
     for (int i = 0; i < num_tasks; ++i) {
-      const int64_t end = SolutionIntegerMin(r, task_ends[i]);
-      CHECK_EQ(end, SolutionIntegerMax(r, task_ends[i]));
-      objective +=
-          weights[i] * std::max<int64_t>(int64_t{0}, end - due_dates[i]);
+      const int64_t end =
+          SolutionIntegerValue(r, task_starts[i]) + durations[i];
+      objective += weights[i] * std::max<int64_t>(0, end - due_dates[i]);
     }
     LOG(INFO) << "Cost " << objective;
 
@@ -197,36 +188,28 @@ void Solve(const std::vector<int64_t>& durations,
     std::vector<int> sorted_tasks(num_tasks);
     std::iota(sorted_tasks.begin(), sorted_tasks.end(), 0);
     std::sort(sorted_tasks.begin(), sorted_tasks.end(), [&](int v1, int v2) {
-      CHECK_EQ(SolutionIntegerMin(r, task_starts[v1]),
-               SolutionIntegerMax(r, task_starts[v1]));
-      CHECK_EQ(SolutionIntegerMin(r, task_starts[v2]),
-               SolutionIntegerMax(r, task_starts[v2]));
-      return SolutionIntegerMin(r, task_starts[v1]) <
-             SolutionIntegerMin(r, task_starts[v2]);
+      return SolutionIntegerValue(r, task_starts[v1]) <
+             SolutionIntegerValue(r, task_starts[v2]);
     });
     std::string solution = "0";
     int end = 0;
     for (const int i : sorted_tasks) {
       const int64_t cost =
-          weights[i] * SolutionIntegerMin(r, tardiness_vars[i]);
+          weights[i] * SolutionIntegerValue(r, tardiness_expressions[i]);
       absl::StrAppend(&solution, "| #", i, " ");
       if (cost > 0) {
         // Display the cost in red.
         absl::StrAppend(&solution, "\033[1;31m(+", cost, ") \033[0m");
       }
-      absl::StrAppend(&solution, "|", SolutionIntegerMin(r, task_ends[i]));
-      CHECK_EQ(end, SolutionIntegerMin(r, task_starts[i]));
+      absl::StrAppend(&solution, "|",
+                      SolutionIntegerValue(r, task_starts[i]) + durations[i]);
       end += durations[i];
-      CHECK_EQ(end, SolutionIntegerMin(r, task_ends[i]));
     }
     LOG(INFO) << "solution: " << solution;
   }));
 
   // Solve.
   const CpSolverResponse response = SolveCpModel(cp_model.Build(), &model);
-  if (!parameters.log_search_progress()) {
-    LOG(INFO) << CpSolverResponseStats(response);
-  }
 }
 
 void ParseAndSolve() {
@@ -269,8 +252,7 @@ void ParseAndSolve() {
 
 int main(int argc, char** argv) {
   absl::SetFlag(&FLAGS_logtostderr, true);
-  google::InitGoogleLogging(argv[0]);
-  absl::ParseCommandLine(argc, argv);
+  InitGoogle(argv[0], &argc, &argv, true);
   if (absl::GetFlag(FLAGS_input).empty()) {
     LOG(FATAL) << "Please supply a data file with --input=";
   }

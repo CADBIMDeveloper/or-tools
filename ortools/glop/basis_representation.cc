@@ -13,6 +13,8 @@
 
 #include "ortools/glop/basis_representation.h"
 
+#include <algorithm>
+
 #include "ortools/base/stl_util.h"
 #include "ortools/glop/status.h"
 #include "ortools/lp_data/lp_utils.h"
@@ -208,6 +210,15 @@ Status BasisFactorization::Initialize() {
   Clear();
   if (IsIdentityBasis()) return Status::OK();
   return ComputeFactorization();
+}
+
+RowToColMapping BasisFactorization::ComputeInitialBasis(
+    const std::vector<ColIndex>& candidates) {
+  const RowToColMapping basis =
+      lu_factorization_.ComputeInitialBasis(compact_matrix_, candidates);
+  deterministic_time_ +=
+      lu_factorization_.DeterministicTimeOfLastFactorization();
+  return basis;
 }
 
 bool BasisFactorization::IsRefactorized() const { return num_updates_ == 0; }

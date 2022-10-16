@@ -16,11 +16,10 @@
 from absl import app
 from absl import flags
 
-from ortools.sat.python import cp_model
 from google.protobuf import text_format
+from ortools.sat.python import cp_model
 
 FLAGS = flags.FLAGS
-
 flags.DEFINE_string('output_proto', '',
                     'Output file to write the cp_model proto to.')
 flags.DEFINE_string('params', 'max_time_in_seconds:10.0',
@@ -215,11 +214,13 @@ def solve_shift_scheduling(params, output_proto):
     # Request: (employee, shift, day, weight)
     # A negative weight indicates that the employee desire this assignment.
     requests = [
-        # Employee 3 wants the first Saturday off.
+        # Employee 3 does not want to work on the first Saturday (negative weight
+        # for the Off shift).
         (3, 0, 5, -2),
-        # Employee 5 wants a night shift on the second Thursday.
+        # Employee 5 wants a night shift on the second Thursday (negative weight).
         (5, 3, 10, -2),
-        # Employee 2 does not want a night shift on the first Friday.
+        # Employee 2 does not want a night shift on the first Friday (positive
+        # weight).
         (2, 3, 4, 4)
     ]
 
@@ -229,7 +230,7 @@ def solve_shift_scheduling(params, output_proto):
     shift_constraints = [
         # One or two consecutive days of rest, this is a hard constraint.
         (0, 1, 1, 0, 2, 2, 0),
-        # betweem 2 and 3 consecutive days of night shifts, 1 and 4 are
+        # between 2 and 3 consecutive days of night shifts, 1 and 4 are
         # possible but penalized.
         (3, 1, 2, 20, 3, 4, 5),
     ]
@@ -288,7 +289,7 @@ def solve_shift_scheduling(params, output_proto):
     # Exactly one shift per day.
     for e in range(num_employees):
         for d in range(num_days):
-            model.Add(sum(work[e, s, d] for s in range(num_shifts)) == 1)
+            model.AddExactlyOne(work[e, s, d] for s in range(num_shifts))
 
     # Fixed assignments.
     for e, s, d in fixed_assignments:
@@ -418,7 +419,7 @@ def solve_shift_scheduling(params, output_proto):
     print('  - wall time       : %f s' % solver.WallTime())
 
 
-def main(_):
+def main(_=None):
     solve_shift_scheduling(FLAGS.params, FLAGS.output_proto)
 
 

@@ -14,13 +14,17 @@
 #include "ortools/sat/cumulative.h"
 
 #include <algorithm>
-#include <memory>
+#include <functional>
+#include <vector>
 
-#include "ortools/base/int_type.h"
 #include "ortools/base/logging.h"
 #include "ortools/sat/cumulative_energy.h"
 #include "ortools/sat/disjunctive.h"
+#include "ortools/sat/integer.h"
+#include "ortools/sat/integer_expr.h"
+#include "ortools/sat/intervals.h"
 #include "ortools/sat/linear_constraint.h"
+#include "ortools/sat/model.h"
 #include "ortools/sat/pb_constraint.h"
 #include "ortools/sat/precedences.h"
 #include "ortools/sat/sat_base.h"
@@ -28,6 +32,7 @@
 #include "ortools/sat/sat_solver.h"
 #include "ortools/sat/timetable.h"
 #include "ortools/sat/timetable_edgefinding.h"
+#include "ortools/util/strong_integers.h"
 
 namespace operations_research {
 namespace sat {
@@ -88,14 +93,35 @@ std::function<void(Model*)> Cumulative(
       // does. That is, the interval [2,2) will be assumed to be in
       // disjunction with [1, 3) for instance. We need to uniformize the
       // handling of interval with size zero.
-      //
-      // TODO(user): improve the condition (see CL147454185).
       std::vector<IntervalVariable> in_disjunction;
+      IntegerValue min_of_demands = kMaxIntegerValue;
+      const IntegerValue capa_max = integer_trail->UpperBound(capacity);
       for (int i = 0; i < vars.size(); ++i) {
-        if (intervals->MinSize(vars[i]) > 0 &&
-            2 * integer_trail->LowerBound(demands[i]) >
-                integer_trail->UpperBound(capacity)) {
+        const IntegerValue size_min = intervals->MinSize(vars[i]);
+        if (size_min == 0) continue;
+        const IntegerValue demand_min = integer_trail->LowerBound(demands[i]);
+        if (2 * demand_min > capa_max) {
           in_disjunction.push_back(vars[i]);
+          min_of_demands = std::min(min_of_demands, demand_min);
+        }
+      }
+
+      // Liftable? We might be able to add one more interval!
+      if (!in_disjunction.empty()) {
+        IntervalVariable lift_var;
+        IntegerValue lift_size(0);
+        for (int i = 0; i < vars.size(); ++i) {
+          const IntegerValue size_min = intervals->MinSize(vars[i]);
+          if (size_min == 0) continue;
+          const IntegerValue demand_min = integer_trail->LowerBound(demands[i]);
+          if (2 * demand_min > capa_max) continue;
+          if (min_of_demands + demand_min > capa_max && size_min > lift_size) {
+            lift_var = vars[i];
+            lift_size = size_min;
+          }
+        }
+        if (lift_size > 0) {
+          in_disjunction.push_back(lift_var);
         }
       }
 
@@ -120,8 +146,75 @@ std::function<void(Model*)> Cumulative(
     }
 
     if (helper == nullptr) {
-      helper = new SchedulingConstraintHelper(vars, model);
-      model->TakeOwnership(helper);
+      helper = intervals->GetOrCreateHelper(vars);
+    }
+
+    // For each variables that is after a subset of task ends (i.e. like a
+    // makespan objective), we detect it and add a special constraint to
+    // propagate it.
+    //
+    // TODO(user): Models that include the makespan as a special interval might
+    // be better, but then not everyone does that. In particular this code
+    // allows to have decent lower bound on the large cumulative minizinc
+    // instances.
+    //
+    // TODO(user): this require the precedence constraints to be already loaded,
+    // and there is no guarantee of that currently. Find a more robust way.
+    //
+    // TODO(user): There is a bit of code duplication with the disjunctive
+    // precedence propagator. Abstract more?
+    //
+    // TODO(user): We compute this only once, so we should explore the full
+    // precedence graph, not just task in direct precedence. Make sure not to
+    // create to many such constraints though.
+    if (parameters.use_hard_precedences_in_cumulative_constraint()) {
+      std::vector<IntegerVariable> index_to_end_vars;
+      std::vector<int> index_to_task;
+      std::vector<PrecedencesPropagator::IntegerPrecedences> before;
+      index_to_end_vars.clear();
+      for (int t = 0; t < helper->NumTasks(); ++t) {
+        const AffineExpression& end_exp = helper->Ends()[t];
+
+        // TODO(user): Handle generic affine relation?
+        if (end_exp.var == kNoIntegerVariable || end_exp.coeff != 1) continue;
+        index_to_end_vars.push_back(end_exp.var);
+        index_to_task.push_back(t);
+      }
+      model->GetOrCreate<PrecedencesPropagator>()->ComputePrecedences(
+          index_to_end_vars, &before);
+      const int size = before.size();
+      for (int i = 0; i < size;) {
+        const IntegerVariable var = before[i].var;
+        DCHECK_NE(var, kNoIntegerVariable);
+
+        IntegerValue min_offset = kMaxIntegerValue;
+        std::vector<int> subtasks;
+        IntegerValue sum_of_demand_max(0);
+        for (; i < size && before[i].var == var; ++i) {
+          const int t = index_to_task[before[i].index];
+          subtasks.push_back(t);
+          sum_of_demand_max += integer_trail->LevelZeroUpperBound(demands[t]);
+
+          // We have var >= end_exp.var + offset, so
+          // var >= (end_exp.var + end_exp.cte) + (offset - end_exp.cte)
+          // var >= task end + new_offset.
+          const AffineExpression& end_exp = helper->Ends()[t];
+          min_offset =
+              std::min(min_offset, before[i].offset - end_exp.constant);
+        }
+
+        // There is no point adding this if all tasks can fit at the same time
+        // in the minimum capacity.
+        if (subtasks.size() > 1 &&
+            sum_of_demand_max > integer_trail->LevelZeroLowerBound(capacity)) {
+          CumulativeIsAfterSubsetConstraint* constraint =
+              new CumulativeIsAfterSubsetConstraint(var, min_offset, capacity,
+                                                    demands, subtasks,
+                                                    integer_trail, helper);
+          constraint->RegisterWith(watcher);
+          model->TakeOwnership(constraint);
+        }
+      }
     }
 
     // Propagator responsible for applying Timetabling filtering rule. It

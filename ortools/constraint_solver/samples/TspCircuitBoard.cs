@@ -21,7 +21,7 @@ using Google.OrTools.ConstraintSolver;
 /// <summary>
 ///   Minimal TSP.
 ///   A description of the problem can be found here:
-///   http://en.wikipedia.org/wiki/Travelling_salesman_problem.
+///   http://en.wikipedia.org/wiki/Travelling_salesperson_problem.
 /// </summary>
 public class TspCircuitBoard
 {
@@ -146,12 +146,14 @@ public class TspCircuitBoard
         // Define cost of each arc.
         // [START transit_callback]
         long[,] distanceMatrix = ComputeEuclideanDistanceMatrix(data.Locations);
-        int transitCallbackIndex = routing.RegisterTransitCallback((long fromIndex, long toIndex) => {
-            // Convert from routing variable Index to distance matrix NodeIndex.
-            var fromNode = manager.IndexToNode(fromIndex);
-            var toNode = manager.IndexToNode(toIndex);
-            return distanceMatrix[fromNode, toNode];
-        });
+        int transitCallbackIndex = routing.RegisterTransitCallback((long fromIndex, long toIndex) =>
+                                                                   {
+                                                                       // Convert from routing variable Index to
+                                                                       // distance matrix NodeIndex.
+                                                                       var fromNode = manager.IndexToNode(fromIndex);
+                                                                       var toNode = manager.IndexToNode(toIndex);
+                                                                       return distanceMatrix[fromNode, toNode];
+                                                                   });
         // [END transit_callback]
 
         // [START arc_cost]
